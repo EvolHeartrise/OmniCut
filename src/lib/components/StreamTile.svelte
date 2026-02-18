@@ -1,22 +1,126 @@
+<script module lang="ts">
+	// Persists volume state across mount/unmount cycles per stream
+	const volumeStates = new Map<string, { volume: number; muted: boolean }>();
+</script>
+
 <script lang="ts">
-	import { onMount, onDestroy } from 'svelte';
+	import { untrack } from 'svelte';
+	import { get } from 'svelte/store';
 	import Hls from 'hls.js';
 	import type { StreamState } from '$lib/stores/streams.js';
-	import { focusedStreamId, removeStream } from '$lib/stores/streams.js';
-	import Timeline from './Timeline.svelte';
+	import { syncOffsets, streamPlaybackStates, masterControl, masterPlaying, masterPlaybackRate, masterTime, transcriptions, stopStream } from '$lib/stores/streams.js';
 
-	export let stream: StreamState;
-	export let focused: boolean = false;
+	let { stream, focused = false, trackNumber = 0 }: { stream: StreamState; focused?: boolean; trackNumber?: number } = $props();
 
 	let videoEl: HTMLVideoElement;
 	let hls: Hls | null = null;
-	let isLive = true;
-	let currentTime = 0;
-	let duration = 0;
-	let playlistUrl = '';
+	let currentTime = $state(0);
+	let duration = $state(0);
 	let retryTimeout: ReturnType<typeof setTimeout> | null = null;
+	const initVol = volumeStates.get(stream.id);
+	let volume = $state(initVol?.volume ?? 1);
+	let muted = $state(initVol?.muted ?? true);
+	let lastMasterSeq = 0;
+	let needsInitialSeek = false;
 
-	$: playlistUrl = `/hls/${stream.id}/playlist.m3u8`;
+	let playlistUrl = $derived(`/hls/${stream.id}/playlist.m3u8`);
+	let offset = $derived($syncOffsets[stream.id] || 0);
+	let allCaptions = $derived($transcriptions[stream.id] || []);
+	// Show transcription that overlaps the current local playback time
+	let visibleCaption = $derived.by(() => {
+		if (allCaptions.length === 0) return '';
+		const localTime = currentTime;
+		const match = allCaptions.find((c) => localTime >= c.startTime && localTime < c.endTime);
+		return match?.text || '';
+	});
+
+	// Sync playback rate from master
+	$effect(() => {
+		if (videoEl) videoEl.playbackRate = $masterPlaybackRate;
+	});
+
+	// Auto mute/unmute when focus changes
+	$effect(() => {
+		if (!videoEl) return;
+		if (focused) {
+			muted = false;
+			videoEl.muted = false;
+			videoEl.volume = volume;
+		} else {
+			muted = true;
+			videoEl.muted = true;
+		}
+		saveVolumeState();
+	});
+
+	// React to master timeline controls
+	$effect(() => {
+		const ctrl = $masterControl;
+		if (ctrl.seq !== lastMasterSeq) {
+			lastMasterSeq = ctrl.seq;
+			untrack(() => handleMasterControl(ctrl));
+		}
+	});
+
+	function handleMasterControl(ctrl: { action: string; time: number; direction: number }) {
+		if (!videoEl) return;
+		switch (ctrl.action) {
+			case 'seek': {
+				const anchor = stream.startedAt / 1000;
+				const target = Math.max(0, Math.min(ctrl.time - anchor + offset, videoEl.duration || 0));
+				videoEl.currentTime = target;
+
+				break;
+			}
+			case 'play':
+				videoEl.play().catch(() => {});
+				break;
+			case 'pause':
+				videoEl.pause();
+				break;
+			case 'step':
+				videoEl.pause();
+				videoEl.currentTime += ctrl.direction * (1 / 30);
+	
+				break;
+		}
+	}
+
+	function formatBytes(bytes: number): string {
+		if (bytes === 0) return '0 B';
+		const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+		const i = Math.floor(Math.log(bytes) / Math.log(1024));
+		return (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
+	}
+
+	function saveVolumeState() {
+		volumeStates.set(stream.id, { volume, muted });
+	}
+
+	function toggleMute() {
+		if (!videoEl) return;
+		muted = !muted;
+		videoEl.muted = muted;
+		saveVolumeState();
+	}
+
+	function setVolume(e: Event) {
+		if (!videoEl) return;
+		volume = +(e.target as HTMLInputElement).value;
+		videoEl.volume = volume;
+		if (volume > 0 && muted) {
+			muted = false;
+			videoEl.muted = false;
+		} else if (volume === 0) {
+			muted = true;
+			videoEl.muted = true;
+		}
+		saveVolumeState();
+	}
+
+	function shouldAutoPlay(): boolean {
+		return get(masterPlaying);
+	}
 
 	function initHls() {
 		if (!videoEl) return;
@@ -27,35 +131,45 @@
 		}
 
 		if (!Hls.isSupported()) {
-			// Fallback for Safari (native HLS support)
 			videoEl.src = playlistUrl;
-			videoEl.play().catch(() => {});
+			if (shouldAutoPlay()) videoEl.play().catch(() => {});
 			return;
 		}
 
 		hls = new Hls({
 			liveSyncDurationCount: 3,
-			liveMaxLatencyDurationCount: 6,
 			enableWorker: true,
 			lowLatencyMode: false,
-			// Keep a larger back buffer for seeking into the past
 			backBufferLength: Infinity,
 			maxBufferLength: 30,
-			maxMaxBufferLength: 600,
+			maxMaxBufferLength: 600
 		});
 
 		hls.loadSource(playlistUrl);
 		hls.attachMedia(videoEl);
 
+		// Apply persisted volume state
+		videoEl.volume = volume;
+		videoEl.muted = muted;
+
 		hls.on(Hls.Events.MANIFEST_PARSED, () => {
-			videoEl.play().catch(() => {});
+			// Reapply playback rate — attachMedia resets it to 1.0
+			videoEl.playbackRate = get(masterPlaybackRate);
+			if (shouldAutoPlay()) {
+				needsInitialSeek = true;
+				// Attempt early seek — may not work if no data buffered yet
+				const mt = get(masterTime);
+				const anchor = stream.startedAt / 1000;
+				const targetLocal = Math.max(0, mt - anchor + offset);
+				videoEl.currentTime = targetLocal;
+				videoEl.play().catch(() => {});
+			}
 		});
 
 		hls.on(Hls.Events.ERROR, (_event, data) => {
 			if (data.fatal) {
 				switch (data.type) {
 					case Hls.ErrorTypes.NETWORK_ERROR:
-						// Playlist not ready yet, retry in a bit
 						retryTimeout = setTimeout(() => {
 							hls?.loadSource(playlistUrl);
 						}, 2000);
@@ -73,99 +187,64 @@
 
 	function handleTimeUpdate() {
 		if (!videoEl) return;
+
+		// On first timeupdate after mount, seek to the master time position.
+		// At this point videoEl.duration is valid so the seek will land correctly.
+		if (needsInitialSeek) {
+			needsInitialSeek = false;
+			const mt = get(masterTime);
+			const anchor = stream.startedAt / 1000;
+			const targetLocal = Math.max(0, mt - anchor + offset);
+			if (videoEl.duration && targetLocal <= videoEl.duration) {
+				videoEl.currentTime = targetLocal;
+			}
+		}
+
 		currentTime = videoEl.currentTime;
 		duration = videoEl.duration || 0;
-		// Consider "live" if within 5 seconds of the end
-		isLive = duration > 0 && duration - currentTime < 5;
+		streamPlaybackStates.update((s) => ({
+			...s,
+			[stream.id]: { currentTime, duration, paused: videoEl.paused }
+		}));
 	}
 
-	function seekTo(time: number) {
-		if (!videoEl) return;
-		videoEl.currentTime = time;
-		isLive = false;
-	}
-
-	function snapToLive() {
-		if (!videoEl) return;
-		videoEl.currentTime = videoEl.duration || 0;
-		videoEl.play().catch(() => {});
-		isLive = true;
-	}
-
-	function toggleFocus() {
-		focusedStreamId.update((current) => (current === stream.id ? null : stream.id));
-	}
-
-	function handleRemove() {
-		removeStream(stream.id);
-	}
-
-	// Frame stepping (approximate: 1/30th of a second per frame at 30fps)
-	function stepFrame(direction: number) {
-		if (!videoEl) return;
-		videoEl.pause();
-		videoEl.currentTime += direction * (1 / 30);
-		isLive = false;
-	}
-
-	onMount(() => {
-		// Wait a moment for the stream to start producing segments
-		if (stream.status === 'capturing') {
+	// Init HLS when stream has data (capturing, stopped, or error — segments are on disk)
+	$effect(() => {
+		if (stream.status !== 'starting' && videoEl && !hls) {
 			initHls();
-		} else {
-			// Retry until capturing
-			const check = setInterval(() => {
-				if (stream.status === 'capturing') {
-					clearInterval(check);
-					initHls();
-				}
-			}, 1000);
-			return () => clearInterval(check);
 		}
 	});
 
-	onDestroy(() => {
-		if (hls) hls.destroy();
-		if (retryTimeout) clearTimeout(retryTimeout);
+	// Cleanup on unmount
+	$effect(() => {
+		return () => {
+			if (hls) hls.destroy();
+			if (retryTimeout) clearTimeout(retryTimeout);
+		};
 	});
-
-	// Re-init HLS when stream status changes to capturing
-	$: if (stream.status === 'capturing' && videoEl && !hls) {
-		initHls();
-	}
 </script>
 
 <div class="stream-tile" class:focused class:starting={stream.status === 'starting'}>
 	<div class="stream-header">
-		<span class="channel-name">{stream.channel}</span>
-		<div class="header-controls">
-			<span class="status-badge" class:live={isLive && stream.status === 'capturing'} class:behind={!isLive && stream.status === 'capturing'}>
-				{#if stream.status === 'starting'}
-					Starting...
-				{:else if stream.status === 'error'}
-					Error
-				{:else if stream.status === 'stopped'}
-					Stopped
-				{:else if isLive}
-					LIVE
-				{:else}
-					-{Math.floor(duration - currentTime)}s
-				{/if}
+		<span class="channel-name">
+			{#if trackNumber}<span class="track-number">{trackNumber}</span>{/if}<a href="https://twitch.tv/{stream.channel}" target="_blank" rel="noopener noreferrer" class="channel-link">{stream.channel}</a>{#if stream.sourceType === 'vod'}<span class="vod-badge">(VOD)</span>{/if}
+			{#if stream.streamTitle}<span class="stream-title">{stream.streamTitle}</span>{/if}
+			<span class="disk-usage">{formatBytes(stream.diskUsageBytes)}</span>
+		</span>
+		{#if stream.status === 'capturing' && stream.sourceType === 'vod'}
+			<button class="btn-stop" onclick={() => stopStream(stream.id)} title="Stop downloading">Stop</button>
+		{:else if stream.status === 'starting' || stream.status === 'error' || stream.status === 'stopped'}
+			<span class="status-badge" class:error={stream.status === 'error'}>
+				{stream.status === 'starting' ? 'Starting...' : stream.status === 'error' ? 'Error' : 'Stopped'}
 			</span>
-			<button class="btn-icon" on:click={toggleFocus} title={focused ? 'Minimize' : 'Maximize'}>
-				{focused ? '⊖' : '⊕'}
-			</button>
-			<button class="btn-icon btn-remove" on:click={handleRemove} title="Remove stream">
-				✕
-			</button>
-		</div>
+		{/if}
 	</div>
 
 	<div class="video-container">
 		<!-- svelte-ignore a11y_media_has_caption -->
 		<video
 			bind:this={videoEl}
-			on:timeupdate={handleTimeUpdate}
+			ontimeupdate={handleTimeUpdate}
 			playsinline
 			muted
 		></video>
@@ -176,24 +255,33 @@
 				<p>Connecting to {stream.channel}...</p>
 			</div>
 		{/if}
+
+		{#if visibleCaption}
+			<div class="subtitles">
+				<p>{visibleCaption}</p>
+			</div>
+		{/if}
+
 	</div>
 
 	<div class="controls">
-		<div class="seek-controls">
-			<button class="btn-sm" on:click={() => stepFrame(-1)} title="Previous frame">◄</button>
-			<button class="btn-sm" on:click={() => { videoEl?.paused ? videoEl?.play() : videoEl?.pause() }}>
-				{videoEl?.paused ? '▶' : '⏸'}
+		<div class="volume-controls">
+			<button class="btn-sm" onclick={toggleMute} title={muted ? 'Unmute' : 'Mute'}>
+				{muted ? '🔇' : volume < 0.5 ? '🔈' : '🔊'}
 			</button>
-			<button class="btn-sm" on:click={() => stepFrame(1)} title="Next frame">►</button>
+			<input
+				type="range"
+				min="0"
+				max="1"
+				step="0.05"
+				value={muted ? 0 : volume}
+				oninput={setVolume}
+				class="volume-slider"
+			/>
 		</div>
-
-		<Timeline
-			{currentTime}
-			{duration}
-			{isLive}
-			on:seek={(e) => seekTo(e.detail)}
-			on:live={snapToLive}
-		/>
+		{#if stream.viewerCount != null}
+			<span class="viewer-count">{stream.viewerCount.toLocaleString()}</span>
+		{/if}
 	</div>
 </div>
 
@@ -206,6 +294,7 @@
 		display: flex;
 		flex-direction: column;
 		transition: border-color 0.2s;
+		height: 100%;
 	}
 
 	.stream-tile:hover {
@@ -215,6 +304,7 @@
 	.stream-tile.focused {
 		border-color: #7c3aed;
 		box-shadow: 0 0 20px rgba(124, 58, 237, 0.3);
+		height: 100%;
 	}
 
 	.stream-tile.starting {
@@ -235,10 +325,65 @@
 		color: #e0e0ff;
 	}
 
-	.header-controls {
-		display: flex;
+	.track-number {
+		display: inline-flex;
 		align-items: center;
-		gap: 6px;
+		justify-content: center;
+		width: 18px;
+		height: 18px;
+		background: #2a2a4a;
+		border-radius: 3px;
+		font-size: 0.7rem;
+		color: #888;
+		margin-right: 6px;
+		flex-shrink: 0;
+	}
+
+	.channel-link {
+		color: inherit;
+		text-decoration: none;
+	}
+
+	.channel-link:hover {
+		text-decoration: underline;
+		color: #a78bfa;
+	}
+
+	.vod-badge {
+		font-weight: 600;
+		font-size: 0.65rem;
+		color: #d97706;
+		margin-left: 4px;
+	}
+
+	.stream-title {
+		font-weight: 400;
+		font-size: 0.7rem;
+		color: #888;
+		margin-left: 6px;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.viewer-count {
+		margin-left: auto;
+		font-weight: 400;
+		font-size: 0.7rem;
+		color: #dc2626;
+	}
+
+	.viewer-count::before {
+		content: '⏺ ';
+		font-size: 0.5rem;
+		vertical-align: middle;
+	}
+
+	.disk-usage {
+		font-weight: 400;
+		font-size: 0.7rem;
+		color: #666;
+		margin-left: 6px;
 	}
 
 	.status-badge {
@@ -252,49 +397,36 @@
 		letter-spacing: 0.5px;
 	}
 
-	.status-badge.live {
+	.btn-stop {
+		font-size: 0.65rem;
+		font-weight: 700;
+		padding: 2px 8px;
+		border-radius: 4px;
+		border: 1px solid #d97706;
+		background: transparent;
+		color: #d97706;
+		cursor: pointer;
+		text-transform: uppercase;
+		letter-spacing: 0.5px;
+		transition: background 0.15s, color 0.15s;
+	}
+
+	.btn-stop:hover {
+		background: #d97706;
+		color: #000;
+	}
+
+	.status-badge.error {
 		background: #dc2626;
 		color: white;
-		animation: pulse 2s infinite;
 	}
 
-	.status-badge.behind {
-		background: #d97706;
-		color: white;
-	}
-
-	@keyframes pulse {
-		0%,
-		100% {
-			opacity: 1;
-		}
-		50% {
-			opacity: 0.7;
-		}
-	}
-
-	.btn-icon {
-		background: none;
-		border: none;
-		color: #888;
-		cursor: pointer;
-		font-size: 1rem;
-		padding: 2px 4px;
-		line-height: 1;
-	}
-
-	.btn-icon:hover {
-		color: #e0e0ff;
-	}
-
-	.btn-remove:hover {
-		color: #ef4444;
-	}
 
 	.video-container {
 		position: relative;
 		width: 100%;
-		aspect-ratio: 16 / 9;
+		flex: 1;
+		min-height: 0;
 		background: #000;
 	}
 
@@ -314,6 +446,27 @@
 		background: rgba(0, 0, 0, 0.7);
 		color: #ccc;
 		gap: 12px;
+	}
+
+	.subtitles {
+		position: absolute;
+		bottom: 8px;
+		left: 8px;
+		right: 8px;
+		text-align: center;
+		pointer-events: none;
+	}
+
+	.subtitles p {
+		display: inline;
+		background: rgba(0, 0, 0, 0.75);
+		color: #fff;
+		font-size: 0.8rem;
+		line-height: 1.4;
+		padding: 2px 8px;
+		border-radius: 3px;
+		-webkit-box-decoration-break: clone;
+		box-decoration-break: clone;
 	}
 
 	.spinner {
@@ -339,11 +492,6 @@
 		background: #0f0f23;
 	}
 
-	.seek-controls {
-		display: flex;
-		gap: 2px;
-	}
-
 	.btn-sm {
 		background: #2a2a4a;
 		border: none;
@@ -357,5 +505,41 @@
 	.btn-sm:hover {
 		background: #3a3a5a;
 		color: #fff;
+	}
+
+	.volume-controls {
+		display: flex;
+		align-items: center;
+		gap: 4px;
+		flex-shrink: 0;
+	}
+
+	.volume-slider {
+		width: 60px;
+		height: 4px;
+		-webkit-appearance: none;
+		appearance: none;
+		background: #2a2a4a;
+		border-radius: 2px;
+		outline: none;
+		cursor: pointer;
+	}
+
+	.volume-slider::-webkit-slider-thumb {
+		-webkit-appearance: none;
+		width: 10px;
+		height: 10px;
+		background: #7c3aed;
+		border-radius: 50%;
+		cursor: pointer;
+	}
+
+	.volume-slider::-moz-range-thumb {
+		width: 10px;
+		height: 10px;
+		background: #7c3aed;
+		border: none;
+		border-radius: 50%;
+		cursor: pointer;
 	}
 </style>

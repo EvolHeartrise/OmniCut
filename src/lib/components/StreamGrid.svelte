@@ -1,15 +1,31 @@
 <script lang="ts">
 	import StreamTile from './StreamTile.svelte';
-	import { streams, focusedStreamId } from '$lib/stores/streams.js';
+	import { streams, focusedStreamId, soloStreamId, masterTime, syncOffsets, streamPlaybackStates } from '$lib/stores/streams.js';
 
-	$: activeStreams = $streams.filter((s) => s.status !== 'stopped');
-	$: focused = $focusedStreamId;
+	let activeStreams = $derived($streams);
 
-	// Calculate grid layout based on number of streams
-	$: gridClass = getGridClass(activeStreams.length, focused);
+	// Only show streams whose track bar intersects the master playhead
+	let visibleStreams = $derived(
+		activeStreams.filter((s) => {
+			const pb = $streamPlaybackStates[s.id];
+			if (!pb || pb.duration === 0) return true;
+			const offset = $syncOffsets[s.id] || 0;
+			const anchor = s.startedAt / 1000;
+			const trackStart = anchor - offset;
+			const trackEnd = anchor + pb.duration - offset;
+			return $masterTime >= trackStart && $masterTime <= trackEnd;
+		})
+	);
 
-	function getGridClass(count: number, focusedId: string | null): string {
-		if (focusedId) return 'grid-focused';
+	let focused = $derived($focusedStreamId);
+	let solo = $derived($soloStreamId);
+	let isSolo = $derived(!!solo && visibleStreams.some((s) => s.id === solo));
+	let hasFocus = $derived(!isSolo && !!focused && visibleStreams.some((s) => s.id === focused));
+	let sidebarCount = $derived(hasFocus ? Math.max(1, visibleStreams.length - 1) : 0);
+	let gridClass = $derived(isSolo ? 'grid-1' : hasFocus ? '' : getGridClass(visibleStreams.length));
+	let displayStreams = $derived(isSolo ? visibleStreams.filter((s) => s.id === solo) : visibleStreams);
+
+	function getGridClass(count: number): string {
 		if (count <= 1) return 'grid-1';
 		if (count <= 2) return 'grid-2';
 		if (count <= 4) return 'grid-4';
@@ -17,14 +33,22 @@
 	}
 </script>
 
-<div class="stream-grid {gridClass}">
-	{#each activeStreams as stream (stream.id)}
-		<div class="grid-item" class:is-focused={stream.id === focused} class:is-thumbnail={focused !== null && stream.id !== focused}>
-			<StreamTile {stream} focused={stream.id === focused} />
+<div
+	class="stream-grid {gridClass}"
+	class:has-focus={hasFocus}
+	style={hasFocus ? `grid-template-rows: repeat(${sidebarCount}, 1fr)` : ''}
+>
+	{#each displayStreams as stream (stream.id)}
+		<div
+			class="grid-item"
+			class:is-focused={stream.id === focused && hasFocus}
+			class:is-sidebar={hasFocus && stream.id !== focused}
+		>
+			<StreamTile {stream} focused={isSolo || (stream.id === focused && hasFocus)} trackNumber={activeStreams.indexOf(stream) + 1} />
 		</div>
 	{/each}
 
-	{#if activeStreams.length === 0}
+	{#if displayStreams.length === 0}
 		<div class="empty-state">
 			<p class="empty-icon">📡</p>
 			<p>No streams active</p>
@@ -39,41 +63,49 @@
 		gap: 12px;
 		padding: 12px;
 		flex: 1;
-		align-content: start;
+		min-height: 0;
+		height: 100%;
 	}
 
+	/* --- Unfocused grid layouts --- */
 	.grid-1 {
 		grid-template-columns: 1fr;
+		grid-template-rows: 1fr;
 	}
 
 	.grid-2 {
 		grid-template-columns: 1fr 1fr;
+		grid-template-rows: 1fr;
 	}
 
 	.grid-4 {
 		grid-template-columns: 1fr 1fr;
+		grid-template-rows: 1fr 1fr;
 	}
 
 	.grid-6 {
 		grid-template-columns: 1fr 1fr 1fr;
+		grid-template-rows: 1fr 1fr;
 	}
 
-	.grid-focused {
+	/* --- Focused layout --- */
+	.has-focus {
 		grid-template-columns: 3fr 1fr;
-		grid-template-rows: auto;
 	}
 
 	.grid-item {
 		min-width: 0;
+		min-height: 0;
+		overflow: hidden;
 	}
 
-	.grid-item.is-focused {
-		grid-row: 1 / -1;
+	.is-focused {
 		grid-column: 1;
+		grid-row: 1 / -1;
 	}
 
-	.grid-item.is-thumbnail {
-		max-height: 200px;
+	.is-sidebar {
+		grid-column: 2;
 	}
 
 	.empty-state {

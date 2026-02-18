@@ -1,4 +1,4 @@
-import { writable } from 'svelte/store';
+import { writable, get } from 'svelte/store';
 
 export interface StreamState {
 	id: string;
@@ -7,19 +7,109 @@ export interface StreamState {
 	startedAt: number;
 	error?: string;
 	segmentCount: number;
+	diskUsageBytes: number;
+	viewerCount: number | null;
+	streamTitle: string | null;
+	offset: number;
+	sourceType: 'live' | 'vod';
+	parentStreamId: string | null;
 }
+
+export type AppMode = 'sources' | 'clipping';
+export const appMode = writable<AppMode>('sources');
 
 export const streams = writable<StreamState[]>([]);
 export const focusedStreamId = writable<string | null>(null);
+export const soloStreamId = writable<string | null>(null);
+
+// Per-stream sync offsets in seconds (stream local time = master time + offset)
+export const syncOffsets = writable<Record<string, number>>({});
+
+// Each StreamTile reports its playback state here
+export interface PlaybackState {
+	currentTime: number;
+	duration: number;
+	paused: boolean;
+}
+export const streamPlaybackStates = writable<Record<string, PlaybackState>>({});
+
+// Current master time in epoch seconds (written by NLETimeline, read by StreamGrid for intersection)
+export const masterTime = writable(Date.now() / 1000);
+
+// Whether the master timeline transport is playing (independent of any stream)
+export const masterPlaying = writable(false);
+
+// Per-stream timestamped transcription captions
+export interface TranscriptionEntry {
+	text: string;
+	startTime: number; // stream-local seconds
+	endTime: number;
+}
+export const transcriptions = writable<Record<string, TranscriptionEntry[]>>({});
+
+// Clip regions marked by the user (W key hold-to-mark)
+export interface ClipRegion {
+	id: string;
+	streamId: string;
+	startTime: number; // master time
+	endTime: number;   // master time
+}
+export const clipRegions = writable<ClipRegion[]>([]);
+
+// Master playback rate (1 = normal speed)
+export const masterPlaybackRate = writable(1);
+
+// Master timeline control: streams react to seq changes
+export const masterControl = writable<{
+	action: 'seek' | 'play' | 'pause' | 'step';
+	time: number;
+	direction: number;
+	seq: number;
+}>({ action: 'seek', time: 0, direction: 0, seq: 0 });
 
 /**
  * Fetch all streams from the API and update the store.
+ * Also restores saved offsets from the server.
  */
 export async function refreshStreams() {
 	try {
 		const res = await fetch('/api/streams');
 		const data = await res.json();
 		streams.set(data.streams);
+
+		// Restore offsets from server (only set offsets we don't already have locally)
+		const currentOffsets = get(syncOffsets);
+		const restoredOffsets: Record<string, number> = { ...currentOffsets };
+		let changed = false;
+		for (const s of data.streams) {
+			if (s.offset !== 0 && !(s.id in currentOffsets)) {
+				restoredOffsets[s.id] = s.offset;
+				changed = true;
+			}
+		}
+		if (changed) {
+			syncOffsets.set(restoredOffsets);
+		}
+
+		// Restore clip regions from server
+		if (data.clipRegions) {
+			clipRegions.set(data.clipRegions);
+		}
+
+		// Restore transcriptions from server
+		if (data.transcriptions) {
+			transcriptions.update((current) => {
+				const merged = { ...current };
+				for (const [streamId, entries] of Object.entries(data.transcriptions as Record<string, TranscriptionEntry[]>)) {
+					// Server has the full history; replace if client has fewer entries
+					const existing = merged[streamId] || [];
+					if (entries.length > existing.length) {
+						merged[streamId] = entries;
+					}
+				}
+				return merged;
+			});
+		}
 	} catch (err) {
 		console.error('Failed to refresh streams:', err);
 	}
@@ -48,15 +138,128 @@ export async function addStream(channel: string): Promise<StreamState | null> {
 }
 
 /**
+ * Stop a stream's download without removing it.
+ */
+export async function stopStream(id: string): Promise<void> {
+	try {
+		await fetch(`/api/streams/${id}`, {
+			method: 'PATCH',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ stop: true })
+		});
+		await refreshStreams();
+	} catch (err) {
+		console.error('Failed to stop stream:', err);
+	}
+}
+
+/**
  * Remove/stop a stream by ID.
  */
 export async function removeStream(id: string): Promise<void> {
 	try {
 		await fetch(`/api/streams/${id}`, { method: 'DELETE' });
 		await refreshStreams();
+		streamPlaybackStates.update((s) => {
+			const { [id]: _, ...rest } = s;
+			return rest;
+		});
+		syncOffsets.update((o) => {
+			const { [id]: _, ...rest } = o;
+			return rest;
+		});
 	} catch (err) {
 		console.error('Failed to remove stream:', err);
 	}
+}
+
+// Debounced offset saving to server
+const pendingOffsetSaves = new Map<string, ReturnType<typeof setTimeout>>();
+
+/**
+ * Save a stream's offset to the server (debounced).
+ */
+export function saveOffset(id: string, offset: number) {
+	const existing = pendingOffsetSaves.get(id);
+	if (existing) clearTimeout(existing);
+
+	pendingOffsetSaves.set(
+		id,
+		setTimeout(async () => {
+			pendingOffsetSaves.delete(id);
+			try {
+				await fetch(`/api/streams/${id}`, {
+					method: 'PATCH',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ offset })
+				});
+			} catch (err) {
+				console.error(`Failed to save offset for ${id}:`, err);
+			}
+		}, 300)
+	);
+}
+
+/**
+ * Save a new clip region to the server.
+ */
+export async function saveClipRegion(region: ClipRegion) {
+	try {
+		await fetch(`/api/streams/${region.streamId}`, {
+			method: 'PATCH',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ addClipRegion: region })
+		});
+	} catch (err) {
+		console.error('Failed to save clip region:', err);
+	}
+}
+
+/**
+ * Delete a clip region from the server.
+ */
+export async function deleteClipRegion(id: string, streamId: string) {
+	try {
+		await fetch(`/api/streams/${streamId}`, {
+			method: 'PATCH',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ removeClipRegionId: id })
+		});
+	} catch (err) {
+		console.error('Failed to delete clip region:', err);
+	}
+}
+
+/**
+ * Export the current session as a JSON file download.
+ */
+export async function exportSessionFile() {
+	const res = await fetch('/api/session');
+	const blob = await res.blob();
+	const url = URL.createObjectURL(blob);
+	const a = document.createElement('a');
+	a.href = url;
+	a.download = `omnicut-session-${Date.now()}.json`;
+	a.click();
+	URL.revokeObjectURL(url);
+}
+
+/**
+ * Import a session from a JSON file. Refreshes streams after import.
+ */
+export async function importSessionFile(file: File): Promise<{ imported: number; total: number; errors: string[] }> {
+	const text = await file.text();
+	const res = await fetch('/api/session', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: text
+	});
+	const result = await res.json();
+	if (!res.ok && !result.imported) {
+		throw new Error(result.error || 'Import failed');
+	}
+	await refreshStreams();
+	return result;
 }
 
 /**
@@ -77,6 +280,17 @@ export function connectSSE(): () => void {
 					} else {
 						return [...current, data.stream];
 					}
+				});
+			} else if (data.type === 'transcription') {
+				transcriptions.update((current) => {
+					const entries = current[data.streamId] || [];
+					return {
+						...current,
+						[data.streamId]: [
+							...entries,
+							{ text: data.text, startTime: data.startTime, endTime: data.endTime }
+						]
+					};
 				});
 			}
 		} catch {

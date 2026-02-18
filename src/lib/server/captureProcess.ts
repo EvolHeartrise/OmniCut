@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { spawn } from 'node:child_process';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
@@ -7,6 +8,39 @@ export interface CaptureHandle {
 	info: StreamInfo;
 	kill: () => void;
 	segmentWatchInterval: ReturnType<typeof setInterval> | null;
+}
+
+export interface StreamMeta {
+	viewerCount: number | null;
+	title: string | null;
+	createdAt: string | null;
+	vodId: string | null;
+}
+
+export async function fetchStreamMeta(channel: string): Promise<StreamMeta> {
+	try {
+		const res = await fetch('https://gql.twitch.tv/gql', {
+			method: 'POST',
+			headers: {
+				'Client-ID': 'ue6666qo983tsx6so1t0vnawi233wa',
+				'Content-Type': 'application/json'
+			},
+			body: JSON.stringify({
+				query: 'query($login: String!) { user(login: $login) { stream { viewersCount title createdAt archiveVideo { id } } } }',
+				variables: { login: channel }
+			})
+		});
+		const data = await res.json();
+		const stream = data?.data?.user?.stream;
+		return {
+			viewerCount: stream?.viewersCount ?? null,
+			title: stream?.title ?? null,
+			createdAt: stream?.createdAt ?? null,
+			vodId: stream?.archiveVideo?.id ?? null
+		};
+	} catch {
+		return { viewerCount: null, title: null, createdAt: null, vodId: null };
+	}
 }
 
 /**
@@ -19,7 +53,8 @@ export function startCapture(
 	channel: string,
 	id: string,
 	recordingsBase: string,
-	onStatusChange: (info: StreamInfo) => void
+	onStatusChange: (info: StreamInfo) => void,
+	vodUrl?: string
 ): CaptureHandle {
 	const recordingDir = path.join(recordingsBase, id);
 	fs.mkdirSync(recordingDir, { recursive: true });
@@ -27,22 +62,36 @@ export function startCapture(
 	const playlistPath = path.join(recordingDir, 'playlist.m3u8');
 	const segmentPattern = path.join(recordingDir, 'seg%06d.ts');
 
+	const isVod = !!vodUrl;
+
 	const info: StreamInfo = {
 		id,
 		channel,
 		status: 'starting',
 		startedAt: Date.now(),
 		segmentCount: 0,
-		recordingDir
+		diskUsageBytes: 0,
+		viewerCount: null,
+		streamTitle: null,
+		recordingDir,
+		offset: 0,
+		sourceType: isVod ? 'vod' : 'live',
+		parentStreamId: null
 	};
 
 	let streamlinkProc: ReturnType<typeof spawn> | null = null;
 	let ffmpegProc: ReturnType<typeof spawn> | null = null;
 
 	// Start streamlink to get the raw stream data
-	const twitchUrl = `https://twitch.tv/${channel}`;
+	const twitchUrl = vodUrl || `https://twitch.tv/${channel}`;
+	const streamlinkArgs = [twitchUrl, 'best', '--stdout'];
 
-	streamlinkProc = spawn('streamlink', [twitchUrl, 'best', '--stdout', '--twitch-disable-ads'], {
+	const twitchToken = process.env.TWITCH_OAUTH_TOKEN;
+	if (twitchToken) {
+		streamlinkArgs.push(`--twitch-api-header=Authorization=OAuth ${twitchToken}`);
+	}
+
+	streamlinkProc = spawn('streamlink', streamlinkArgs, {
 		stdio: ['ignore', 'pipe', 'pipe']
 	});
 
@@ -86,6 +135,8 @@ export function startCapture(
 	// Pipe streamlink stdout -> ffmpeg stdin
 	if (streamlinkProc.stdout && ffmpegProc.stdin) {
 		streamlinkProc.stdout.pipe(ffmpegProc.stdin);
+		// Swallow EPIPE when ffmpeg dies before streamlink stops writing
+		ffmpegProc.stdin.on('error', () => {});
 	}
 
 	ffmpegProc.stderr?.on('data', (data: Buffer) => {
@@ -99,17 +150,42 @@ export function startCapture(
 	// Update status once FFmpeg starts producing segments
 	const segmentWatchInterval = setInterval(() => {
 		try {
-			const files = fs.readdirSync(recordingDir).filter((f) => f.endsWith('.ts'));
-			info.segmentCount = files.length;
+			const allFiles = fs.readdirSync(recordingDir);
+			const tsFiles = allFiles.filter((f) => f.endsWith('.ts'));
+			info.segmentCount = tsFiles.length;
 
-			if (files.length > 0 && info.status === 'starting') {
-				info.status = 'capturing';
-				onStatusChange(info);
+			let totalBytes = 0;
+			for (const f of allFiles) {
+				try {
+					totalBytes += fs.statSync(path.join(recordingDir, f)).size;
+				} catch { /* file may have been removed */ }
 			}
+			info.diskUsageBytes = totalBytes;
+
+			if (tsFiles.length > 0 && info.status === 'starting') {
+				info.status = 'capturing';
+			}
+			onStatusChange(info);
 		} catch {
 			// Directory may not exist yet
 		}
 	}, 1000);
+
+	// Poll stream metadata every 30 seconds (skip for VODs — no live viewer count)
+	let streamMetaInterval: ReturnType<typeof setInterval> | null = null;
+	if (!isVod) {
+		streamMetaInterval = setInterval(async () => {
+			if (info.status === 'capturing') {
+				const meta = await fetchStreamMeta(channel);
+				info.viewerCount = meta.viewerCount;
+				info.streamTitle = meta.title;
+			}
+		}, 30000);
+		fetchStreamMeta(channel).then((meta) => {
+			info.viewerCount = meta.viewerCount;
+			info.streamTitle = meta.title;
+		});
+	}
 
 	// Handle process exits
 	streamlinkProc.on('close', (code) => {
@@ -134,6 +210,11 @@ export function startCapture(
 	const kill = () => {
 		info.status = 'stopped';
 		if (segmentWatchInterval) clearInterval(segmentWatchInterval);
+		if (streamMetaInterval) clearInterval(streamMetaInterval);
+		// Unpipe before killing so no writes reach a dead stdin
+		if (streamlinkProc?.stdout && ffmpegProc?.stdin) {
+			streamlinkProc.stdout.unpipe(ffmpegProc.stdin);
+		}
 		try {
 			streamlinkProc?.kill('SIGTERM');
 		} catch {

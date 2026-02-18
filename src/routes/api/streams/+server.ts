@@ -1,13 +1,21 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types.js';
-import { addStream, listStreams } from '$lib/server/streamManager.js';
+import { addStream, listStreams, getTranscriptions, getAllClipRegions } from '$lib/server/streamManager.js';
 
 /**
- * GET /api/streams — List all active streams
+ * GET /api/streams — List all active streams (includes stored transcriptions)
  */
 export const GET: RequestHandler = async () => {
 	const streams = listStreams();
-	return json({ streams });
+	const transcriptions: Record<string, Array<{ text: string; startTime: number; endTime: number }>> = {};
+	for (const s of streams) {
+		const entries = getTranscriptions(s.id);
+		if (entries.length > 0) {
+			transcriptions[s.id] = entries;
+		}
+	}
+	const clipRegions = getAllClipRegions();
+	return json({ streams, transcriptions, clipRegions });
 };
 
 /**
@@ -34,7 +42,7 @@ export const POST: RequestHandler = async ({ request }) => {
 	}
 
 	try {
-		const streamInfo = addStream(cleanChannel);
+		const streamInfo = await addStream(cleanChannel);
 		return json({ stream: streamInfo }, { status: 201 });
 	} catch (err: unknown) {
 		const message = err instanceof Error ? err.message : 'Unknown error';
