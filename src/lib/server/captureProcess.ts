@@ -1,4 +1,3 @@
-import { spawn } from 'node:child_process';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import type { StreamInfo, CaptureHandle, StreamMeta } from './types.js';
@@ -68,9 +67,6 @@ export function startCapture(
 		parentStreamId: null
 	};
 
-	let streamlinkProc: ReturnType<typeof spawn> | null = null;
-	let ffmpegProc: ReturnType<typeof spawn> | null = null;
-
 	// Start streamlink to get the raw stream data
 	const twitchUrl = vodUrl || `https://twitch.tv/${channel}`;
 	const streamlinkArgs = [twitchUrl, 'best', '--stdout'];
@@ -80,60 +76,64 @@ export function startCapture(
 		streamlinkArgs.push(`--twitch-api-header=Authorization=OAuth ${twitchToken}`);
 	}
 
-	streamlinkProc = spawn('streamlink', streamlinkArgs, {
-		stdio: ['ignore', 'pipe', 'pipe']
+	const streamlinkProc = Bun.spawn(['streamlink', ...streamlinkArgs], {
+		stdin: 'ignore',
+		stdout: 'pipe',
+		stderr: 'pipe'
 	});
 
-	streamlinkProc.stderr?.on('data', (data: Buffer) => {
-		const msg = data.toString();
-		// streamlink prints status info to stderr
-		if (msg.includes('error') || msg.includes('Error')) {
-			console.error(`[streamlink:${channel}] ${msg.trim()}`);
-		}
-	});
+	// Log streamlink stderr asynchronously
+	(async () => {
+		const reader = streamlinkProc.stderr.getReader();
+		const decoder = new TextDecoder();
+		try {
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				const msg = decoder.decode(value);
+				if (msg.includes('error') || msg.includes('Error')) {
+					console.error(`[streamlink:${channel}] ${msg.trim()}`);
+				}
+			}
+		} catch { /* stream closed */ }
+	})();
 
 	// Start FFmpeg to receive streamlink's stdout and output HLS
-	// Note: -force_key_frames is omitted because -c:v copy cannot insert keyframes.
-	// Keyframe interval is determined by the source stream.
-	ffmpegProc = spawn(
-		'ffmpeg',
+	const ffmpegProc = Bun.spawn(
 		[
-			'-i',
-			'pipe:0',
-			'-c:v',
-			'copy',
-			'-c:a',
-			'copy',
-			'-f',
-			'hls',
-			'-hls_time',
-			'2',
-			'-hls_list_size',
-			'0',
-			'-hls_flags',
-			'append_list+independent_segments',
-			'-hls_segment_filename',
-			segmentPattern,
+			'ffmpeg',
+			'-i', 'pipe:0',
+			'-c:v', 'copy',
+			'-c:a', 'copy',
+			'-f', 'hls',
+			'-hls_time', '2',
+			'-hls_list_size', '0',
+			'-hls_flags', 'append_list+independent_segments',
+			'-hls_segment_filename', segmentPattern,
 			playlistPath
 		],
 		{
-			stdio: ['pipe', 'pipe', 'pipe']
+			stdin: streamlinkProc.stdout,
+			stdout: 'pipe',
+			stderr: 'pipe'
 		}
 	);
 
-	// Pipe streamlink stdout -> ffmpeg stdin
-	if (streamlinkProc.stdout && ffmpegProc.stdin) {
-		streamlinkProc.stdout.pipe(ffmpegProc.stdin);
-		// Swallow EPIPE when ffmpeg dies before streamlink stops writing
-		ffmpegProc.stdin.on('error', () => {});
-	}
-
-	ffmpegProc.stderr?.on('data', (data: Buffer) => {
-		const msg = data.toString();
-		if (msg.includes('Error') || msg.includes('error')) {
-			console.error(`[ffmpeg:${channel}] ${msg.trim()}`);
-		}
-	});
+	// Log ffmpeg stderr
+	(async () => {
+		const reader = ffmpegProc.stderr.getReader();
+		const decoder = new TextDecoder();
+		try {
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				const msg = decoder.decode(value);
+				if (msg.includes('Error') || msg.includes('error')) {
+					console.error(`[ffmpeg:${channel}] ${msg.trim()}`);
+				}
+			}
+		} catch { /* stream closed */ }
+	})();
 
 	// Update status asynchronously once FFmpeg starts producing segments
 	const segmentWatchInterval = setInterval(async () => {
@@ -178,7 +178,7 @@ export function startCapture(
 	}
 
 	// Handle process exits
-	streamlinkProc.on('close', (code) => {
+	streamlinkProc.exited.then((code) => {
 		console.log(`[streamlink:${channel}] exited with code ${code}`);
 		if (info.status !== 'stopped') {
 			info.status = code === 0 ? 'stopped' : 'error';
@@ -187,7 +187,7 @@ export function startCapture(
 		}
 	});
 
-	ffmpegProc.on('close', (code) => {
+	ffmpegProc.exited.then((code) => {
 		console.log(`[ffmpeg:${channel}] exited with code ${code}`);
 		if (info.status !== 'stopped') {
 			info.status = 'stopped';
@@ -201,17 +201,13 @@ export function startCapture(
 		info.status = 'stopped';
 		if (segmentWatchInterval) clearInterval(segmentWatchInterval);
 		if (streamMetaInterval) clearInterval(streamMetaInterval);
-		// Unpipe before killing so no writes reach a dead stdin
-		if (streamlinkProc?.stdout && ffmpegProc?.stdin) {
-			streamlinkProc.stdout.unpipe(ffmpegProc.stdin);
-		}
 		try {
-			streamlinkProc?.kill('SIGTERM');
+			streamlinkProc.kill();
 		} catch {
 			/* already dead */
 		}
 		try {
-			ffmpegProc?.kill('SIGTERM');
+			ffmpegProc.kill();
 		} catch {
 			/* already dead */
 		}

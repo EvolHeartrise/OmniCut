@@ -1,6 +1,5 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
-import { spawn } from 'node:child_process';
 import type { ClipRegion, StreamInfo } from './types.js';
 
 const EXPORTS_DIR = path.resolve(process.cwd(), 'exports');
@@ -166,30 +165,40 @@ export async function exportVideo(
 }
 
 /** Run an ffmpeg command and return a promise. Rejects with full stderr on failure. */
-function runFfmpeg(args: string[]): Promise<void> {
-	return new Promise((resolve, reject) => {
-		const proc = spawn('ffmpeg', args);
-		let stderr = '';
-		proc.stderr?.on('data', (data: Buffer) => { stderr += data.toString(); });
-		proc.on('close', (code) => {
-			if (code === 0) resolve();
-			else reject(new Error(`ffmpeg failed (code ${code}): ${stderr.slice(-1000)}`));
-		});
-		proc.on('error', reject);
+async function runFfmpeg(args: string[]): Promise<void> {
+	const proc = Bun.spawn(['ffmpeg', ...args], {
+		stdin: 'ignore',
+		stdout: 'pipe',
+		stderr: 'pipe'
 	});
+
+	const stderrText = await new Response(proc.stderr).text();
+	const code = await proc.exited;
+
+	if (code !== 0) {
+		throw new Error(`ffmpeg failed (code ${code}): ${stderrText.slice(-1000)}`);
+	}
 }
 
 /** Test if NVENC is available by encoding a tiny synthetic video. */
-function detectNvenc(): Promise<boolean> {
-	return new Promise((resolve) => {
-		const proc = spawn('ffmpeg', [
+async function detectNvenc(): Promise<boolean> {
+	try {
+		const proc = Bun.spawn([
+			'ffmpeg',
 			'-f', 'lavfi', '-i', 'nullsrc=s=64x64:d=0.1',
 			'-f', 'lavfi', '-i', 'anullsrc=d=0.1',
 			'-c:v', 'h264_nvenc', '-preset', 'p4', '-qp', '18',
 			'-c:a', 'aac',
 			'-f', 'null', '-'
-		]);
-		proc.on('close', (code) => resolve(code === 0));
-		proc.on('error', () => resolve(false));
-	});
+		], {
+			stdin: 'ignore',
+			stdout: 'pipe',
+			stderr: 'pipe'
+		});
+
+		const code = await proc.exited;
+		return code === 0;
+	} catch {
+		return false;
+	}
 }

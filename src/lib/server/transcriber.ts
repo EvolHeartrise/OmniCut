@@ -1,5 +1,3 @@
-import { spawn, execFile } from 'node:child_process';
-import { createInterface } from 'node:readline';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 
@@ -9,7 +7,14 @@ const SEGMENT_DURATION = 2; // seconds per HLS segment (matches -hls_time 2)
 
 // --- Python worker process (shared across all streams) ---
 
-let workerProc: ReturnType<typeof spawn> | null = null;
+interface WorkerProc {
+	stdout: ReadableStream<Uint8Array>;
+	stderr: ReadableStream<Uint8Array>;
+	stdin: { write(data: string): number };
+	exited: Promise<number>;
+	kill(): void;
+}
+let workerProc: WorkerProc | null = null;
 let workerReady = false;
 let workerFailed = false;
 
@@ -36,46 +41,78 @@ function ensureWorker(): boolean {
 	}
 
 	try {
-		workerProc = spawn('python', [scriptPath], {
-			stdio: ['pipe', 'pipe', 'pipe']
+		const proc = Bun.spawn(['python', scriptPath], {
+			stdin: 'pipe',
+			stdout: 'pipe',
+			stderr: 'pipe'
 		});
+		workerProc = proc as unknown as WorkerProc;
 
-		const rl = createInterface({ input: workerProc.stdout! });
-		rl.on('line', (line) => {
+		// Read stdout line-by-line for JSON responses
+		(async () => {
+			const reader = workerProc!.stdout.getReader();
+			const decoder = new TextDecoder();
+			let buffer = '';
+
 			try {
-				const data = JSON.parse(line);
-				if (data.ready) {
-					console.log('[transcriber] Model loaded, ready for transcription');
-					workerReady = true;
-					processQueue();
-					return;
-				}
-				if (data.error && !workerReady) {
-					console.error(`[transcriber] Worker error: ${data.error}`);
-					workerFailed = true;
-					workerProc?.kill();
-					workerProc = null;
-					return;
-				}
-				// Transcription response
-				if (currentResolve) {
-					const resolve = currentResolve;
-					currentResolve = null;
-					processing = false;
-					resolve(data.text || '');
-					processQueue();
-				}
-			} catch {
-				// ignore malformed lines
-			}
-		});
+				while (true) {
+					const { done, value } = await reader.read();
+					if (done) break;
+					buffer += decoder.decode(value, { stream: true });
 
-		workerProc.stderr?.on('data', (data: Buffer) => {
-			const msg = data.toString().trim();
-			if (msg) console.error(`[transcriber] ${msg}`);
-		});
+					let newlineIdx: number;
+					while ((newlineIdx = buffer.indexOf('\n')) !== -1) {
+						const line = buffer.slice(0, newlineIdx).trim();
+						buffer = buffer.slice(newlineIdx + 1);
 
-		workerProc.on('close', (code) => {
+						if (!line) continue;
+						try {
+							const data = JSON.parse(line);
+							if (data.ready) {
+								console.log('[transcriber] Model loaded, ready for transcription');
+								workerReady = true;
+								processQueue();
+								continue;
+							}
+							if (data.error && !workerReady) {
+								console.error(`[transcriber] Worker error: ${data.error}`);
+								workerFailed = true;
+								workerProc?.kill();
+								workerProc = null;
+								return;
+							}
+							// Transcription response
+							if (currentResolve) {
+								const resolve = currentResolve;
+								currentResolve = null;
+								processing = false;
+								resolve(data.text || '');
+								processQueue();
+							}
+						} catch {
+							// ignore malformed lines
+						}
+					}
+				}
+			} catch { /* stream closed */ }
+		})();
+
+		// Log stderr
+		(async () => {
+			const reader = workerProc!.stderr.getReader();
+			const decoder = new TextDecoder();
+			try {
+				while (true) {
+					const { done, value } = await reader.read();
+					if (done) break;
+					const msg = decoder.decode(value).trim();
+					if (msg) console.error(`[transcriber] ${msg}`);
+				}
+			} catch { /* stream closed */ }
+		})();
+
+		// Handle worker exit
+		workerProc.exited.then((code) => {
 			console.warn(`[transcriber] Worker exited with code ${code}`);
 			workerProc = null;
 			workerReady = false;
@@ -100,7 +137,7 @@ function processQueue() {
 	processing = true;
 	const req = requestQueue.shift()!;
 	currentResolve = req.resolve;
-	workerProc.stdin!.write(req.wavPath + '\n');
+	workerProc.stdin.write(req.wavPath + '\n');
 }
 
 function transcribeAudio(wavPath: string): Promise<string> {
@@ -114,9 +151,9 @@ function transcribeAudio(wavPath: string): Promise<string> {
 	});
 }
 
-// --- Audio extraction (ffmpeg) ---
+// --- Audio extraction (ffmpeg via Bun.spawn) ---
 
-function extractAudio(recordingDir: string, segmentFiles: string[]): Promise<string | null> {
+async function extractAudio(recordingDir: string, segmentFiles: string[]): Promise<string | null> {
 	const listPath = path.join(recordingDir, '_concat.txt');
 	const wavPath = path.join(recordingDir, '_transcribe_' + Date.now() + '.wav');
 
@@ -124,23 +161,26 @@ function extractAudio(recordingDir: string, segmentFiles: string[]): Promise<str
 	const listContent = segmentFiles.map((s) => `file '${s}'`).join('\n');
 	fs.writeFileSync(listPath, listContent);
 
-	return new Promise((resolve) => {
-		execFile(
-			'ffmpeg',
-			['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-vn', '-ar', '16000', '-ac', '1', '-f', 'wav', wavPath],
-			{ cwd: recordingDir },
-			(err) => {
-				try {
-					fs.unlinkSync(listPath);
-				} catch {}
-				if (err) {
-					resolve(null);
-				} else {
-					resolve(wavPath);
-				}
-			}
-		);
-	});
+	const proc = Bun.spawn(
+		['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-vn', '-ar', '16000', '-ac', '1', '-f', 'wav', wavPath],
+		{
+			cwd: recordingDir,
+			stdin: 'ignore',
+			stdout: 'pipe',
+			stderr: 'pipe'
+		}
+	);
+
+	const code = await proc.exited;
+
+	try {
+		fs.unlinkSync(listPath);
+	} catch {}
+
+	if (code !== 0) {
+		return null;
+	}
+	return wavPath;
 }
 
 // --- Per-stream transcription tracking ---
