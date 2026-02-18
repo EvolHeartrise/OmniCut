@@ -1,22 +1,6 @@
-import type { Subprocess } from 'bun';
+import type { ClipRegion } from '../types.js';
 
-export interface SessionExport {
-	version: 1;
-	exportedAt: number;
-	streams: Array<{
-		id: string;
-		channel: string;
-		startedAt: number;
-		viewerCount: number | null;
-		streamTitle: string | null;
-		recordingDir: string;
-		offset: number;
-		sourceType: 'live' | 'vod';
-		parentStreamId: string | null;
-	}>;
-	transcriptions: Record<string, Array<{ text: string; startTime: number; endTime: number }>>;
-	clipRegions: Array<{ id: string; streamId: string; startTime: number; endTime: number }>;
-}
+export type { ClipRegion };
 
 export interface StreamInfo {
 	id: string;
@@ -36,7 +20,31 @@ export interface StreamInfo {
 
 export interface CaptureHandle {
 	info: StreamInfo;
-	streamlinkProc: Subprocess | null;
-	ffmpegProc: Subprocess | null;
+	kill: () => void;
 	segmentWatchInterval: ReturnType<typeof setInterval> | null;
+}
+
+export interface StreamMeta {
+	viewerCount: number | null;
+	title: string | null;
+	createdAt: string | null;
+	vodId: string | null;
+}
+
+export interface SessionExport {
+	version: 1;
+	exportedAt: number;
+	streams: Array<{
+		id: string;
+		channel: string;
+		startedAt: number;
+		viewerCount: number | null;
+		streamTitle: string | null;
+		recordingDir: string;
+		offset: number;
+		sourceType: 'live' | 'vod';
+		parentStreamId: string | null;
+	}>;
+	transcriptions: Record<string, Array<{ text: string; startTime: number; endTime: number }>>;
+	clipRegions: ClipRegion[];
 }

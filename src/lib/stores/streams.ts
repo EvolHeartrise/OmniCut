@@ -1,4 +1,7 @@
 import { writable, get } from 'svelte/store';
+import type { ClipRegion } from '$lib/types.js';
+
+export type { ClipRegion };
 
 export interface StreamState {
 	id: string;
@@ -48,12 +51,6 @@ export interface TranscriptionEntry {
 export const transcriptions = writable<Record<string, TranscriptionEntry[]>>({});
 
 // Clip regions marked by the user (W key hold-to-mark)
-export interface ClipRegion {
-	id: string;
-	streamId: string;
-	startTime: number; // master time
-	endTime: number;   // master time
-}
 export const clipRegions = writable<ClipRegion[]>([]);
 
 // Master playback rate (1 = normal speed)

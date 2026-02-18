@@ -9,6 +9,7 @@
 	import Hls from 'hls.js';
 	import type { StreamState } from '$lib/stores/streams.js';
 	import { syncOffsets, streamPlaybackStates, masterControl, masterPlaying, masterPlaybackRate, masterTime, transcriptions, stopStream } from '$lib/stores/streams.js';
+	import { createHlsConfig } from '$lib/utils.js';
 
 	let { stream, focused = false, trackNumber = 0 }: { stream: StreamState; focused?: boolean; trackNumber?: number } = $props();
 
@@ -22,6 +23,10 @@
 	let muted = $state(initVol?.muted ?? true);
 	let lastMasterSeq = 0;
 	let needsInitialSeek = false;
+
+	// Throttle playback state store updates (~4/sec per video is excessive)
+	let lastStateUpdate = 0;
+	const STATE_UPDATE_INTERVAL = 250; // ms
 
 	let playlistUrl = $derived(`/hls/${stream.id}/playlist.m3u8`);
 	let offset = $derived($syncOffsets[stream.id] || 0);
@@ -81,7 +86,7 @@
 			case 'step':
 				videoEl.pause();
 				videoEl.currentTime += ctrl.direction * (1 / 30);
-	
+
 				break;
 		}
 	}
@@ -138,11 +143,7 @@
 
 		hls = new Hls({
 			liveSyncDurationCount: 3,
-			enableWorker: true,
-			lowLatencyMode: false,
-			backBufferLength: Infinity,
-			maxBufferLength: 30,
-			maxMaxBufferLength: 600
+			...createHlsConfig()
 		});
 
 		hls.loadSource(playlistUrl);
@@ -202,10 +203,16 @@
 
 		currentTime = videoEl.currentTime;
 		duration = videoEl.duration || 0;
-		streamPlaybackStates.update((s) => ({
-			...s,
-			[stream.id]: { currentTime, duration, paused: videoEl.paused }
-		}));
+
+		// Throttle store updates to reduce churn
+		const now = performance.now();
+		if (now - lastStateUpdate >= STATE_UPDATE_INTERVAL) {
+			lastStateUpdate = now;
+			streamPlaybackStates.update((s) => ({
+				...s,
+				[stream.id]: { currentTime, duration, paused: videoEl.paused }
+			}));
+		}
 	}
 
 	// Init HLS when stream has data (capturing, stopped, or error — segments are on disk)

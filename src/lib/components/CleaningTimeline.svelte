@@ -6,10 +6,12 @@
 		streams,
 		syncOffsets,
 		clipRegions,
-		deleteClipRegion,
 		saveClipRegion,
 		type ClipRegion
 	} from '$lib/stores/streams.js';
+	import { formatDuration, createHlsConfig } from '$lib/utils.js';
+	import { applyTimelineZoom, clampPps } from '$lib/timeline.js';
+	import { splitClipRegion, removeClipRegionAction } from '$lib/clipActions.js';
 
 	interface ClipSegment {
 		clip: ClipRegion;
@@ -115,13 +117,7 @@
 		if (!Hls.isSupported()) {
 			el.src = url;
 		} else {
-			const h = new Hls({
-				enableWorker: true,
-				lowLatencyMode: false,
-				backBufferLength: Infinity,
-				maxBufferLength: 30,
-				maxMaxBufferLength: 600
-			});
+			const h = new Hls(createHlsConfig());
 			s.hls = h;
 			h.loadSource(url);
 			h.attachMedia(el);
@@ -344,18 +340,11 @@
 		if (e.ctrlKey) {
 			e.preventDefault();
 			if (!scrollAreaEl) return;
-			const rect = scrollAreaEl.getBoundingClientRect();
-			const cursorX = e.clientX - rect.left;
-			const cursorScrollX = scrollAreaEl.scrollLeft + cursorX;
-			const timeUnderCursor = cursorScrollX / pixelsPerSecond;
-			const factor = e.deltaY < 0 ? 1.25 : 1 / 1.25;
-			pixelsPerSecond = Math.min(MAX_PPS, Math.max(MIN_PPS, pixelsPerSecond * factor));
-			tick().then(() => {
-				if (!scrollAreaEl) return;
-				const newCursorScrollX = timeUnderCursor * pixelsPerSecond;
-				ignoreScrollEvents = true;
-				scrollAreaEl.scrollLeft = newCursorScrollX - cursorX;
-			});
+			const { newPps, scheduleScrollRestore } = applyTimelineZoom(
+				e, scrollAreaEl, pixelsPerSecond, 0, MIN_PPS, MAX_PPS
+			);
+			pixelsPerSecond = newPps;
+			scheduleScrollRestore(() => { ignoreScrollEvents = true; });
 		} else if (e.shiftKey) {
 			e.preventDefault();
 			if (!scrollAreaEl) return;
@@ -372,33 +361,14 @@
 
 	function removeClip(clip: ClipRegion) {
 		undoStack = [...undoStack, { type: 'delete', clip: { ...clip } }];
-		clipRegions.update((regions) => regions.filter((r) => r.id !== clip.id));
-		deleteClipRegion(clip.id, clip.streamId);
+		removeClipRegionAction(clip);
 	}
 
 	function splitClip(clip: ClipRegion, splitMasterTime: number) {
-		if (splitMasterTime <= clip.startTime || splitMasterTime >= clip.endTime) return;
-		const firstHalf: ClipRegion = {
-			id: crypto.randomUUID(),
-			streamId: clip.streamId,
-			startTime: clip.startTime,
-			endTime: splitMasterTime
-		};
-		const secondHalf: ClipRegion = {
-			id: crypto.randomUUID(),
-			streamId: clip.streamId,
-			startTime: splitMasterTime,
-			endTime: clip.endTime
-		};
-		clipRegions.update((regions) => [
-			...regions.filter((r) => r.id !== clip.id),
-			firstHalf,
-			secondHalf
-		]);
-		deleteClipRegion(clip.id, clip.streamId);
-		saveClipRegion(firstHalf);
-		saveClipRegion(secondHalf);
-		undoStack = [...undoStack, { type: 'split', original: clip, createdIds: [firstHalf.id, secondHalf.id] }];
+		const result = splitClipRegion(clip, splitMasterTime);
+		if (result) {
+			undoStack = [...undoStack, { type: 'split', original: clip, createdIds: [result.firstHalf.id, result.secondHalf.id] }];
+		}
 	}
 
 	function applyUndo() {
@@ -417,8 +387,8 @@
 					...regions.filter((r) => !createdIds.includes(r.id)),
 					original
 				]);
-				deleteClipRegion(createdIds[0], original.streamId);
-				deleteClipRegion(createdIds[1], original.streamId);
+				removeClipRegionAction({ ...original, id: createdIds[0] });
+				removeClipRegionAction({ ...original, id: createdIds[1] });
 				saveClipRegion(original);
 				break;
 			}
@@ -451,18 +421,12 @@
 		});
 	}
 
-	function formatDuration(sec: number): string {
-		const m = Math.floor(sec / 60);
-		const s = Math.floor(sec % 60);
-		return `${m}:${s.toString().padStart(2, '0')}`;
-	}
-
 	function zoomIn() {
-		pixelsPerSecond = Math.min(MAX_PPS, pixelsPerSecond * 1.5);
+		pixelsPerSecond = clampPps(pixelsPerSecond * 1.5, MIN_PPS, MAX_PPS);
 	}
 
 	function zoomOut() {
-		pixelsPerSecond = Math.max(MIN_PPS, pixelsPerSecond / 1.5);
+		pixelsPerSecond = clampPps(pixelsPerSecond / 1.5, MIN_PPS, MAX_PPS);
 	}
 
 	function reCenter() {

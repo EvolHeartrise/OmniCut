@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { clipRegions, streams, syncOffsets, exportLog } from '$lib/stores/streams.js';
+	import { formatDuration } from '$lib/utils.js';
 
 	let filename = $state('export');
 	let exporting = $state(false);
@@ -24,12 +25,6 @@
 	let totalDuration = $derived(
 		clipSummary.reduce((sum, c) => sum + c.duration, 0)
 	);
-
-	function formatDuration(sec: number): string {
-		const m = Math.floor(sec / 60);
-		const s = Math.floor(sec % 60);
-		return `${m}:${s.toString().padStart(2, '0')}`;
-	}
 
 	// Auto-scroll log when new entries arrive
 	$effect(() => {

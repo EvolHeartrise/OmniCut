@@ -1,28 +1,17 @@
-import 'dotenv/config';
 import { spawn } from 'node:child_process';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
-import type { StreamInfo } from './types.js';
+import type { StreamInfo, CaptureHandle, StreamMeta } from './types.js';
+import { TWITCH_CLIENT_ID } from './twitchApi.js';
 
-export interface CaptureHandle {
-	info: StreamInfo;
-	kill: () => void;
-	segmentWatchInterval: ReturnType<typeof setInterval> | null;
-}
-
-export interface StreamMeta {
-	viewerCount: number | null;
-	title: string | null;
-	createdAt: string | null;
-	vodId: string | null;
-}
+export type { CaptureHandle };
 
 export async function fetchStreamMeta(channel: string): Promise<StreamMeta> {
 	try {
 		const res = await fetch('https://gql.twitch.tv/gql', {
 			method: 'POST',
 			headers: {
-				'Client-ID': 'ue6666qo983tsx6so1t0vnawi233wa',
+				'Client-ID': TWITCH_CLIENT_ID,
 				'Content-Type': 'application/json'
 			},
 			body: JSON.stringify({
@@ -104,27 +93,27 @@ export function startCapture(
 	});
 
 	// Start FFmpeg to receive streamlink's stdout and output HLS
+	// Note: -force_key_frames is omitted because -c:v copy cannot insert keyframes.
+	// Keyframe interval is determined by the source stream.
 	ffmpegProc = spawn(
 		'ffmpeg',
 		[
 			'-i',
-			'pipe:0', // Read from stdin
+			'pipe:0',
 			'-c:v',
-			'copy', // Copy video codec (no re-encode)
+			'copy',
 			'-c:a',
-			'copy', // Copy audio codec (no re-encode)
+			'copy',
 			'-f',
-			'hls', // Output format: HLS
+			'hls',
 			'-hls_time',
-			'2', // 2-second segments
+			'2',
 			'-hls_list_size',
-			'0', // Keep ALL segments in the playlist
+			'0',
 			'-hls_flags',
 			'append_list+independent_segments',
 			'-hls_segment_filename',
 			segmentPattern,
-			'-force_key_frames',
-			'expr:gte(t,n_forced*1)', // Keyframe every 1 second
 			playlistPath
 		],
 		{
@@ -141,26 +130,27 @@ export function startCapture(
 
 	ffmpegProc.stderr?.on('data', (data: Buffer) => {
 		const msg = data.toString();
-		// FFmpeg outputs progress info to stderr — we can use this for status
 		if (msg.includes('Error') || msg.includes('error')) {
 			console.error(`[ffmpeg:${channel}] ${msg.trim()}`);
 		}
 	});
 
-	// Update status once FFmpeg starts producing segments
-	const segmentWatchInterval = setInterval(() => {
+	// Update status asynchronously once FFmpeg starts producing segments
+	const segmentWatchInterval = setInterval(async () => {
 		try {
-			const allFiles = fs.readdirSync(recordingDir);
+			const allFiles = await fs.promises.readdir(recordingDir);
 			const tsFiles = allFiles.filter((f) => f.endsWith('.ts'));
 			info.segmentCount = tsFiles.length;
 
-			let totalBytes = 0;
-			for (const f of allFiles) {
-				try {
-					totalBytes += fs.statSync(path.join(recordingDir, f)).size;
-				} catch { /* file may have been removed */ }
-			}
-			info.diskUsageBytes = totalBytes;
+			const stats = await Promise.all(
+				allFiles.map(async (f) => {
+					try {
+						const stat = await fs.promises.stat(path.join(recordingDir, f));
+						return stat.size;
+					} catch { return 0; }
+				})
+			);
+			info.diskUsageBytes = stats.reduce((a, b) => a + b, 0);
 
 			if (tsFiles.length > 0 && info.status === 'starting') {
 				info.status = 'capturing';

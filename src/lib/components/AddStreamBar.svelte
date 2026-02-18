@@ -1,19 +1,10 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import { addStream, streams, appMode } from '$lib/stores/streams.js';
+	import type { ChannelInfo } from '$lib/types.js';
 
 	const STORAGE_KEY = 'omni-channel-history';
 	const POLL_INTERVAL = 30_000;
-
-	interface ChannelInfo {
-		login: string;
-		displayName: string | null;
-		profileImageUrl: string | null;
-		isLive: boolean;
-		title: string | null;
-		viewerCount: number | null;
-		startedAt: string | null;
-	}
 
 	let channelInput = $state('');
 	let watchlist = $state<string[]>([]);

@@ -1,17 +1,7 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-
-interface ChannelInfo {
-	login: string;
-	displayName: string | null;
-	profileImageUrl: string | null;
-	isLive: boolean;
-	title: string | null;
-	viewerCount: number | null;
-	startedAt: string | null;
-}
-
-const CLIENT_ID = 'ue6666qo983tsx6so1t0vnawi233wa';
+import type { ChannelInfo } from '$lib/types.js';
+import { TWITCH_CLIENT_ID } from '$lib/server/twitchApi.js';
 
 const GQL_QUERY = `query($login: String!) {
 	user(login: $login) {
@@ -30,7 +20,7 @@ async function fetchChannel(login: string): Promise<ChannelInfo> {
 		const res = await fetch('https://gql.twitch.tv/gql', {
 			method: 'POST',
 			headers: {
-				'Client-ID': CLIENT_ID,
+				'Client-ID': TWITCH_CLIENT_ID,
 				'Content-Type': 'application/json'
 			},
 			body: JSON.stringify({

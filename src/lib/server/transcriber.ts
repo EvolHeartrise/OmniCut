@@ -5,6 +5,7 @@ import * as fs from 'node:fs';
 
 const BATCH_SIZE = 3; // segments per batch (~6 seconds at 2s/segment)
 const POLL_INTERVAL = 3000; // check for new segments every 3s
+const SEGMENT_DURATION = 2; // seconds per HLS segment (matches -hls_time 2)
 
 // --- Python worker process (shared across all streams) ---
 
@@ -144,7 +145,10 @@ function extractAudio(recordingDir: string, segmentFiles: string[]): Promise<str
 
 // --- Per-stream transcription tracking ---
 
-const SEGMENT_DURATION = 2; // seconds per HLS segment (matches -hls_time 2)
+/** Build the expected filename for a segment index. */
+function segmentFilename(index: number): string {
+	return `seg${index.toString().padStart(6, '0')}.ts`;
+}
 
 export type TranscriptionCallback = (
 	streamId: string,
@@ -172,24 +176,29 @@ async function checkForNewSegments(streamId: string) {
 	ensureWorker();
 	if (!workerReady) return; // model still loading
 
-	let files: string[];
-	try {
-		files = fs
-			.readdirSync(tracker.recordingDir)
-			.filter((f) => f.endsWith('.ts'))
-			.sort();
-	} catch {
-		return;
+	// Probe for sequential segment files instead of listing the full directory.
+	// Segments are named seg000000.ts, seg000001.ts, ... so we just check
+	// if the next expected files exist.
+	const startIdx = tracker.lastProcessedIndex + 1;
+	const needed = BATCH_SIZE + 1; // need BATCH_SIZE for transcription + 1 buffer
+	let availableCount = 0;
+
+	for (let i = 0; i < needed; i++) {
+		const segPath = path.join(tracker.recordingDir, segmentFilename(startIdx + i));
+		try {
+			await fs.promises.access(segPath);
+			availableCount++;
+		} catch {
+			break;
+		}
 	}
 
-	const startIdx = tracker.lastProcessedIndex + 1;
-	const unprocessed = files.slice(startIdx);
+	if (availableCount < needed) return;
 
-	// Wait until we have enough segments for a batch
-	// (leave 1 segment buffer so we don't read a file mid-write)
-	if (unprocessed.length < BATCH_SIZE + 1) return;
-
-	const batch = unprocessed.slice(0, BATCH_SIZE);
+	const batch: string[] = [];
+	for (let i = 0; i < BATCH_SIZE; i++) {
+		batch.push(segmentFilename(startIdx + i));
+	}
 
 	const wavPath = await extractAudio(tracker.recordingDir, batch);
 	if (!wavPath) return;

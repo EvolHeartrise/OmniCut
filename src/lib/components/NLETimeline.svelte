@@ -13,9 +13,10 @@
 		focusedStreamId,
 		clipRegions,
 		saveClipRegion,
-		deleteClipRegion,
 		type ClipRegion
 	} from '$lib/stores/streams.js';
+	import { applyTimelineZoom, clampPps } from '$lib/timeline.js';
+	import { splitClipRegion, removeClipRegionAction } from '$lib/clipActions.js';
 
 	const COLORS = [
 		'#7c3aed',
@@ -218,23 +219,11 @@
 		if (e.ctrlKey) {
 			e.preventDefault();
 			if (!scrollAreaEl) return;
-
-			const rect = scrollAreaEl.getBoundingClientRect();
-			const cursorX = e.clientX - rect.left;
-			const cursorScrollX = scrollAreaEl.scrollLeft + cursorX;
-			const timeUnderCursor = cursorScrollX / pixelsPerSecond + effectiveTimelineStart;
-
-			const factor = e.deltaY < 0 ? 1.25 : 1 / 1.25;
-			pixelsPerSecond = Math.min(MAX_PPS, Math.max(MIN_PPS, pixelsPerSecond * factor));
-
-			// After zoom, preserve the time under cursor
-			tick().then(() => {
-				if (!scrollAreaEl) return;
-				const newCursorScrollX =
-					(timeUnderCursor - effectiveTimelineStart) * pixelsPerSecond;
-				ignoreScrollEvents = true;
-				scrollAreaEl.scrollLeft = newCursorScrollX - cursorX;
-			});
+			const { newPps, scheduleScrollRestore } = applyTimelineZoom(
+				e, scrollAreaEl, pixelsPerSecond, effectiveTimelineStart, MIN_PPS, MAX_PPS
+			);
+			pixelsPerSecond = newPps;
+			scheduleScrollRestore(() => { ignoreScrollEvents = true; });
 		} else if (e.shiftKey) {
 			// Shift+wheel → horizontal pan
 			e.preventDefault();
@@ -363,8 +352,7 @@
 		switch (entry.type) {
 			case 'add-region':
 				// Undo region creation → remove it
-				clipRegions.update((regions) => regions.filter((r) => r.id !== entry.region.id));
-				deleteClipRegion(entry.region.id, entry.region.streamId);
+				removeClipRegionAction(entry.region);
 				break;
 			case 'delete-region':
 				// Undo region deletion → re-add it
@@ -405,8 +393,9 @@
 				clipRegions.update((regions) =>
 					[...regions.filter((r) => !createdIds.includes(r.id)), original]
 				);
-				deleteClipRegion(createdIds[0], original.streamId);
-				deleteClipRegion(createdIds[1], original.streamId);
+				removeClipRegionAction({ ...original, id: createdIds[0] });
+				removeClipRegionAction({ ...original, id: createdIds[1] });
+				// Re-add original (removeClipRegionAction removed from store, but we re-added above)
 				saveClipRegion(original);
 				break;
 			}
@@ -492,8 +481,7 @@
 				);
 				if (region) {
 					pushUndo({ type: 'delete-region', region: { ...region } });
-					clipRegions.update((regions) => regions.filter((r) => r.id !== region.id));
-					deleteClipRegion(region.id, region.streamId);
+					removeClipRegionAction(region);
 				}
 			}
 		} else if ((e.key === 's' || e.key === 'S') && !e.repeat) {
@@ -503,27 +491,10 @@
 					(r) => r.streamId === $focusedStreamId && r.startTime < now && now < r.endTime
 				);
 				if (region) {
-					const firstHalf: ClipRegion = {
-						id: crypto.randomUUID(),
-						streamId: region.streamId,
-						startTime: region.startTime,
-						endTime: now
-					};
-					const secondHalf: ClipRegion = {
-						id: crypto.randomUUID(),
-						streamId: region.streamId,
-						startTime: now,
-						endTime: region.endTime
-					};
-					clipRegions.update((regions) => [
-						...regions.filter((r) => r.id !== region.id),
-						firstHalf,
-						secondHalf
-					]);
-					deleteClipRegion(region.id, region.streamId);
-					saveClipRegion(firstHalf);
-					saveClipRegion(secondHalf);
-					pushUndo({ type: 'split-region', original: region, createdIds: [firstHalf.id, secondHalf.id] });
+					const result = splitClipRegion(region, now);
+					if (result) {
+						pushUndo({ type: 'split-region', original: region, createdIds: [result.firstHalf.id, result.secondHalf.id] });
+					}
 				}
 			}
 		} else if (e.shiftKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
@@ -580,11 +551,11 @@
 	}
 
 	function zoomIn() {
-		pixelsPerSecond = Math.min(MAX_PPS, pixelsPerSecond * 1.5);
+		pixelsPerSecond = clampPps(pixelsPerSecond * 1.5, MIN_PPS, MAX_PPS);
 	}
 
 	function zoomOut() {
-		pixelsPerSecond = Math.max(MIN_PPS, pixelsPerSecond / 1.5);
+		pixelsPerSecond = clampPps(pixelsPerSecond / 1.5, MIN_PPS, MAX_PPS);
 	}
 
 	// Wheel listener — needs non-passive, reacts to scrollAreaEl availability

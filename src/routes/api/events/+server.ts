@@ -9,6 +9,7 @@ import { addSSEClient } from '$lib/server/streamManager.js';
  */
 export const GET: RequestHandler = async () => {
 	let cleanup: (() => void) | null = null;
+	let keepalive: ReturnType<typeof setInterval> | null = null;
 
 	const stream = new ReadableStream({
 		start(controller) {
@@ -23,23 +24,25 @@ export const GET: RequestHandler = async () => {
 				} catch {
 					// Stream might be closed
 					cleanup?.();
+					if (keepalive) clearInterval(keepalive);
 				}
 			};
 
 			cleanup = addSSEClient(send);
 
 			// Send a keepalive ping every 15 seconds
-			const keepalive = setInterval(() => {
+			keepalive = setInterval(() => {
 				try {
 					controller.enqueue(encoder.encode(': ping\n\n'));
 				} catch {
-					clearInterval(keepalive);
+					if (keepalive) clearInterval(keepalive);
 					cleanup?.();
 				}
 			}, 15000);
 		},
 		cancel() {
 			cleanup?.();
+			if (keepalive) clearInterval(keepalive);
 		}
 	});
 
@@ -47,8 +50,7 @@ export const GET: RequestHandler = async () => {
 		headers: {
 			'Content-Type': 'text/event-stream',
 			'Cache-Control': 'no-cache',
-			Connection: 'keep-alive',
-			'Access-Control-Allow-Origin': '*'
+			Connection: 'keep-alive'
 		}
 	});
 };

@@ -3,6 +3,24 @@ import * as path from 'node:path';
 import type { RequestHandler } from './$types.js';
 import { getStreamRecordingDir } from '$lib/server/streamManager.js';
 
+/** Wrap a Node.js ReadStream as a Web ReadableStream. */
+function nodeStreamToWeb(nodeStream: fs.ReadStream): ReadableStream {
+	return new ReadableStream({
+		start(controller) {
+			nodeStream.on('data', (chunk) => {
+				try { controller.enqueue(chunk); } catch { nodeStream.destroy(); }
+			});
+			nodeStream.on('end', () => {
+				try { controller.close(); } catch { /* already closed */ }
+			});
+			nodeStream.on('error', (err) => {
+				try { controller.error(err); } catch { /* already closed */ }
+			});
+		},
+		cancel() { nodeStream.destroy(); }
+	});
+}
+
 /**
  * GET /hls/:id/* — Serve HLS playlist and segment files
  *
@@ -50,8 +68,7 @@ export const GET: RequestHandler = async ({ params, request }) => {
 		return new Response(content, {
 			headers: {
 				'Content-Type': contentType,
-				'Cache-Control': 'no-cache, no-store, must-revalidate',
-				'Access-Control-Allow-Origin': '*'
+				'Cache-Control': 'no-cache, no-store, must-revalidate'
 			}
 		});
 	}
@@ -66,21 +83,7 @@ export const GET: RequestHandler = async ({ params, request }) => {
 			const end = match[2] ? parseInt(match[2], 10) : stat.size - 1;
 			const chunkSize = end - start + 1;
 
-			const stream = fs.createReadStream(resolved, { start, end });
-			const readable = new ReadableStream({
-				start(controller) {
-					stream.on('data', (chunk) => {
-						try { controller.enqueue(chunk); } catch { stream.destroy(); }
-					});
-					stream.on('end', () => {
-						try { controller.close(); } catch { /* already closed */ }
-					});
-					stream.on('error', (err) => {
-						try { controller.error(err); } catch { /* already closed */ }
-					});
-				},
-				cancel() { stream.destroy(); }
-			});
+			const readable = nodeStreamToWeb(fs.createReadStream(resolved, { start, end }));
 
 			return new Response(readable, {
 				status: 206,
@@ -89,7 +92,6 @@ export const GET: RequestHandler = async ({ params, request }) => {
 					'Content-Range': `bytes ${start}-${end}/${stat.size}`,
 					'Content-Length': chunkSize.toString(),
 					'Accept-Ranges': 'bytes',
-					'Access-Control-Allow-Origin': '*',
 					'Cache-Control': 'public, max-age=31536000, immutable'
 				}
 			});
@@ -97,28 +99,13 @@ export const GET: RequestHandler = async ({ params, request }) => {
 	}
 
 	// Full file response
-	const stream = fs.createReadStream(resolved);
-	const readable = new ReadableStream({
-		start(controller) {
-			stream.on('data', (chunk) => {
-				try { controller.enqueue(chunk); } catch { stream.destroy(); }
-			});
-			stream.on('end', () => {
-				try { controller.close(); } catch { /* already closed */ }
-			});
-			stream.on('error', (err) => {
-				try { controller.error(err); } catch { /* already closed */ }
-			});
-		},
-		cancel() { stream.destroy(); }
-	});
+	const readable = nodeStreamToWeb(fs.createReadStream(resolved));
 
 	return new Response(readable, {
 		headers: {
 			'Content-Type': contentType,
 			'Content-Length': stat.size.toString(),
 			'Accept-Ranges': 'bytes',
-			'Access-Control-Allow-Origin': '*',
 			// Segments are immutable once written; cache aggressively
 			'Cache-Control': ext === '.ts' ? 'public, max-age=31536000, immutable' : 'no-cache'
 		}
