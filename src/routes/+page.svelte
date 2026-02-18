@@ -3,6 +3,8 @@
 	import AddStreamBar from '$lib/components/AddStreamBar.svelte';
 	import StreamGrid from '$lib/components/StreamGrid.svelte';
 	import NLETimeline from '$lib/components/NLETimeline.svelte';
+	import CleaningTimeline from '$lib/components/CleaningTimeline.svelte';
+	import ExportPanel from '$lib/components/ExportPanel.svelte';
 	import { refreshStreams, connectSSE, streams, focusedStreamId, soloStreamId, appMode, exportSessionFile, importSessionFile } from '$lib/stores/streams.js';
 
 	onMount(() => {
@@ -48,11 +50,14 @@
 		// TAB toggles mode — always, even in inputs
 		if (e.key === 'Tab') {
 			e.preventDefault();
-			$appMode = $appMode === 'sources' ? 'clipping' : 'sources';
+			const modes: Array<typeof $appMode> = ['sources', 'clipping', 'cleaning', 'export'];
+			const idx = modes.indexOf($appMode);
+			$appMode = modes[(idx + 1) % modes.length];
 			return;
 		}
 
 		if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+		if ($appMode !== 'clipping') return;
 
 		const activeStreams = $streams;
 
@@ -104,12 +109,22 @@
 				class:active={mode === 'clipping'}
 				onclick={() => $appMode = 'clipping'}
 			>Clipping</button>
+			<button
+				class="mode-tab"
+				class:active={mode === 'cleaning'}
+				onclick={() => $appMode = 'cleaning'}
+			>Cleaning</button>
+			<button
+				class="mode-tab"
+				class:active={mode === 'export'}
+				onclick={() => $appMode = 'export'}
+			>Export</button>
 		</div>
 		<div class="header-info">
 			<span class="stream-count">{$streams.length} streams</span>
-			<button class="btn-tool" onclick={handleExport}>Export</button>
+			<button class="btn-tool" onclick={handleExport}>Save Session</button>
 			<button class="btn-tool" onclick={handleImportClick} disabled={importing}>
-				{importing ? 'Importing...' : 'Import'}
+				{importing ? 'Loading...' : 'Load Session'}
 			</button>
 			<input
 				type="file"
@@ -129,11 +144,19 @@
 		<main class="sources-content">
 			<AddStreamBar />
 		</main>
-	{:else}
+	{:else if mode === 'clipping'}
 		<main class="main-content">
 			<StreamGrid />
 		</main>
 		<NLETimeline />
+	{:else if mode === 'cleaning'}
+		<main class="main-content">
+			<CleaningTimeline />
+		</main>
+	{:else if mode === 'export'}
+		<main class="main-content">
+			<ExportPanel />
+		</main>
 	{/if}
 </div>
 

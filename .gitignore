@@ -27,3 +27,6 @@ vite.config.ts.timestamp-*
 
 # Bun
 bun.lockb
+
+# App
+exports

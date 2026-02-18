@@ -15,7 +15,7 @@ export interface StreamState {
 	parentStreamId: string | null;
 }
 
-export type AppMode = 'sources' | 'clipping';
+export type AppMode = 'sources' | 'clipping' | 'cleaning' | 'export';
 export const appMode = writable<AppMode>('sources');
 
 export const streams = writable<StreamState[]>([]);
@@ -58,6 +58,15 @@ export const clipRegions = writable<ClipRegion[]>([]);
 
 // Master playback rate (1 = normal speed)
 export const masterPlaybackRate = writable(1);
+
+// Export progress log (fed by SSE)
+export interface ExportLogEntry {
+	message: string;
+	step: number;
+	totalSteps: number;
+	timestamp: number;
+}
+export const exportLog = writable<ExportLogEntry[]>([]);
 
 // Master timeline control: streams react to seq changes
 export const masterControl = writable<{
@@ -292,6 +301,11 @@ export function connectSSE(): () => void {
 						]
 					};
 				});
+			} else if (data.type === 'export-progress') {
+				exportLog.update((log) => [
+					...log,
+					{ message: data.message, step: data.step, totalSteps: data.totalSteps, timestamp: Date.now() }
+				]);
 			}
 		} catch {
 			// Ignore parse errors (keepalive pings etc)

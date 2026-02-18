@@ -47,7 +47,8 @@
 		| { type: 'add-region'; region: ClipRegion }
 		| { type: 'delete-region'; region: ClipRegion }
 		| { type: 'update-region'; before: ClipRegion }
-		| { type: 'offset-drag'; streamId: string; oldOffset: number; oldRegions: ClipRegion[] };
+		| { type: 'offset-drag'; streamId: string; oldOffset: number; oldRegions: ClipRegion[] }
+		| { type: 'split-region'; original: ClipRegion; createdIds: [string, string] };
 
 	let undoStack = $state<UndoEntry[]>([]);
 	function pushUndo(entry: UndoEntry) {
@@ -398,6 +399,17 @@
 				}));
 				break;
 			}
+			case 'split-region': {
+				// Undo split → remove the two halves, re-add original
+				const { original, createdIds } = entry;
+				clipRegions.update((regions) =>
+					[...regions.filter((r) => !createdIds.includes(r.id)), original]
+				);
+				deleteClipRegion(createdIds[0], original.streamId);
+				deleteClipRegion(createdIds[1], original.streamId);
+				saveClipRegion(original);
+				break;
+			}
 		}
 	}
 
@@ -483,6 +495,58 @@
 					clipRegions.update((regions) => regions.filter((r) => r.id !== region.id));
 					deleteClipRegion(region.id, region.streamId);
 				}
+			}
+		} else if ((e.key === 's' || e.key === 'S') && !e.repeat) {
+			if ($focusedStreamId) {
+				const now = masterCurrentTimeState;
+				const region = $clipRegions.find(
+					(r) => r.streamId === $focusedStreamId && r.startTime < now && now < r.endTime
+				);
+				if (region) {
+					const firstHalf: ClipRegion = {
+						id: crypto.randomUUID(),
+						streamId: region.streamId,
+						startTime: region.startTime,
+						endTime: now
+					};
+					const secondHalf: ClipRegion = {
+						id: crypto.randomUUID(),
+						streamId: region.streamId,
+						startTime: now,
+						endTime: region.endTime
+					};
+					clipRegions.update((regions) => [
+						...regions.filter((r) => r.id !== region.id),
+						firstHalf,
+						secondHalf
+					]);
+					deleteClipRegion(region.id, region.streamId);
+					saveClipRegion(firstHalf);
+					saveClipRegion(secondHalf);
+					pushUndo({ type: 'split-region', original: region, createdIds: [firstHalf.id, secondHalf.id] });
+				}
+			}
+		} else if (e.shiftKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+			e.preventDefault();
+			const now = masterCurrentTimeState;
+			const regions = $focusedStreamId
+				? $clipRegions.filter((r) => r.streamId === $focusedStreamId)
+				: $clipRegions;
+			const markers = regions.flatMap((r) => [r.startTime, r.endTime]);
+			let target: number | undefined;
+			if (e.key === 'ArrowLeft') {
+				target = markers.filter((t) => t < now - 0.05).sort((a, b) => b - a)[0];
+			} else {
+				target = markers.filter((t) => t > now + 0.05).sort((a, b) => a - b)[0];
+			}
+			if (target !== undefined) {
+				masterCurrentTimeState = target;
+				masterControl.update((c) => ({
+					action: 'seek',
+					time: target,
+					direction: 0,
+					seq: c.seq + 1
+				}));
 			}
 		} else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
 			e.preventDefault();
