@@ -29,6 +29,10 @@ export interface CaptureHandle {
 	kill: () => void;
 	segmentWatchInterval: ReturnType<typeof setInterval> | null;
 	stopChat?: () => void;
+	/** Guard flag: true once startTranscription has been called for this capture */
+	transcriptionStarted?: boolean;
+	/** Guard flag: true once chat collection has been started for this capture */
+	chatStarted?: boolean;
 }
 
 export interface StreamMeta {

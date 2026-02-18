@@ -19,17 +19,7 @@
 	} from '$lib/stores/streams.js';
 	import { applyTimelineZoom, clampPps } from '$lib/timeline.js';
 	import { splitClipRegion, removeClipRegionAction } from '$lib/clipActions.js';
-
-	const COLORS = [
-		'#7c3aed',
-		'#2563eb',
-		'#dc2626',
-		'#16a34a',
-		'#d97706',
-		'#db2777',
-		'#0891b2',
-		'#84cc16'
-	];
+	import { TRACK_COLORS as COLORS } from '$lib/constants.js';
 
 	const MIN_PPS = 0.1;
 	const MAX_PPS = 200;

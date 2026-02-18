@@ -6,19 +6,20 @@ import { startTranscription, stopTranscription, shutdownTranscriber } from './tr
 import { startChatCollection } from './chatCollector.js';
 import { exportVideo as exportVideoImpl } from './exporter.js';
 import type { StreamInfo, ClipRegion, SessionExport, ChatMessage } from './types.js';
+import * as db from './persistence.js';
 
 const RECORDINGS_DIR = path.resolve(process.cwd(), 'recordings');
 
-// In-memory store of active captures
+// In-memory store of active captures (hot cache; persisted to SQLite on changes)
 const captures = new Map<string, CaptureHandle>();
 
-// In-memory store of transcriptions per stream
+// In-memory store of transcriptions per stream (hot cache; persisted to SQLite)
 const streamTranscriptions = new Map<string, Array<{ text: string; startTime: number; endTime: number }>>();
 
-// In-memory store of chat messages per stream
+// In-memory store of chat messages per stream (hot cache; persisted to SQLite)
 const streamChatMessages = new Map<string, ChatMessage[]>();
 
-// In-memory store of clip regions
+// In-memory store of clip regions (hot cache; persisted to SQLite)
 const clipRegionsStore: ClipRegion[] = [];
 
 // SSE clients for real-time updates
@@ -26,6 +27,66 @@ const sseClients = new Set<(data: string) => void>();
 
 export function getRecordingsDir(): string {
 	return RECORDINGS_DIR;
+}
+
+// --- Initialization: restore state from SQLite ---
+
+/**
+ * Initialize the stream manager by restoring persisted state from SQLite.
+ * Should be called once at server startup.
+ */
+export async function initStreamManager(): Promise<void> {
+	await db.initDatabase();
+
+	// Restore streams as stopped stub handles
+	const savedStreams = db.loadAllStreams();
+	for (const info of savedStreams) {
+		// Verify recording directory still exists
+		if (!fs.existsSync(info.recordingDir)) {
+			console.warn(`[init] Skipping stream ${info.channel} — recording dir missing: ${info.recordingDir}`);
+			db.deleteStream(info.id);
+			continue;
+		}
+
+		// Mark all restored streams as stopped (processes are gone after restart)
+		info.status = 'stopped';
+
+		const stubHandle: CaptureHandle = {
+			info,
+			kill: () => {},
+			segmentWatchInterval: null
+		};
+		captures.set(info.id, stubHandle);
+	}
+
+	// Restore transcriptions
+	const savedTranscriptions = db.loadAllTranscriptions();
+	for (const [streamId, entries] of Object.entries(savedTranscriptions)) {
+		if (captures.has(streamId)) {
+			streamTranscriptions.set(streamId, entries);
+		}
+	}
+
+	// Restore chat messages
+	const savedChat = db.loadAllChatMessages();
+	for (const [streamId, messages] of Object.entries(savedChat)) {
+		if (captures.has(streamId)) {
+			streamChatMessages.set(streamId, messages);
+		}
+	}
+
+	// Restore clip regions
+	const savedClips = db.loadAllClipRegions();
+	for (const region of savedClips) {
+		if (captures.has(region.streamId)) {
+			clipRegionsStore.push(region);
+		}
+	}
+
+	const streamCount = captures.size;
+	const transcriptionCount = Object.values(savedTranscriptions).reduce((n, e) => n + e.length, 0);
+	const chatCount = Object.values(savedChat).reduce((n, m) => n + m.length, 0);
+	console.log(`[init] Restored ${streamCount} streams, ${transcriptionCount} transcriptions, ${chatCount} chat messages, ${clipRegionsStore.length} clip regions`);
 }
 
 // --- Broadcasting ---
@@ -45,7 +106,7 @@ function broadcastUpdate(info: StreamInfo) {
 }
 
 function broadcastTranscription(streamId: string, text: string, startTime: number, endTime: number) {
-	// Persist in memory so clients can fetch on page load
+	// Persist in memory
 	let entries = streamTranscriptions.get(streamId);
 	if (!entries) {
 		entries = [];
@@ -53,16 +114,23 @@ function broadcastTranscription(streamId: string, text: string, startTime: numbe
 	}
 	entries.push({ text, startTime, endTime });
 
+	// Persist to SQLite
+	db.saveTranscription(streamId, text, startTime, endTime);
+
 	broadcast(JSON.stringify({ type: 'transcription', streamId, text, startTime, endTime }));
 }
 
 function broadcastChatMessage(streamId: string, msg: ChatMessage) {
+	// Persist in memory
 	let messages = streamChatMessages.get(streamId);
 	if (!messages) {
 		messages = [];
 		streamChatMessages.set(streamId, messages);
 	}
 	messages.push(msg);
+
+	// Persist to SQLite
+	db.saveChatMessage(streamId, msg);
 
 	broadcast(
 		JSON.stringify({
@@ -128,14 +196,19 @@ export async function addStream(channel: string): Promise<StreamInfo> {
 	const handle = startCapture(channel, id, RECORDINGS_DIR, (info) => {
 		broadcastUpdate(info);
 
-		// Start transcription once segments begin appearing
-		if (info.status === 'capturing') {
+		// Persist stream state changes to SQLite
+		db.saveStream(info);
+
+		// Start transcription once segments begin appearing (guarded — only once per capture)
+		if (info.status === 'capturing' && !handle.transcriptionStarted) {
+			handle.transcriptionStarted = true;
 			startTranscription(id, info.recordingDir, (_streamId, text, startTime, endTime) => {
 				broadcastTranscription(id, text, startTime, endTime);
 			});
 
-			// Start chat collection for live streams
-			if (info.sourceType === 'live' && !handle.stopChat) {
+			// Start chat collection for live streams (guarded — only once per capture)
+			if (info.sourceType === 'live' && !handle.chatStarted) {
+				handle.chatStarted = true;
 				handle.stopChat = startChatCollection(id, channel, info.startedAt, (_streamId, msg) => {
 					broadcastChatMessage(id, msg);
 				});
@@ -144,6 +217,9 @@ export async function addStream(channel: string): Promise<StreamInfo> {
 	});
 
 	captures.set(id, handle);
+
+	// Persist initial stream state
+	db.saveStream(handle.info);
 
 	// Auto-spawn VOD capture if available
 	try {
@@ -154,11 +230,15 @@ export async function addStream(channel: string): Promise<StreamInfo> {
 
 			const vodHandle = startCapture(channel, vodId, RECORDINGS_DIR, (info) => {
 				broadcastUpdate(info);
+				db.saveStream(info);
 			}, vodUrl);
 
 			vodHandle.info.startedAt = Date.parse(meta.createdAt);
 			vodHandle.info.parentStreamId = id;
 			captures.set(vodId, vodHandle);
+
+			// Persist VOD stream
+			db.saveStream(vodHandle.info);
 
 			console.log(`[vod:${channel}] Auto-spawned VOD capture (video ${meta.vodId}), startedAt=${meta.createdAt}`);
 		}
@@ -179,6 +259,10 @@ export function stopStream(id: string): boolean {
 	stopTranscription(id);
 	handle.stopChat?.();
 	handle.kill();
+
+	// Persist stopped status
+	db.saveStream(handle.info);
+
 	return true;
 }
 
@@ -193,6 +277,20 @@ export function removeStream(id: string): boolean {
 	handle.stopChat?.();
 	handle.kill();
 	captures.delete(id);
+
+	// Remove from in-memory caches
+	streamTranscriptions.delete(id);
+	streamChatMessages.delete(id);
+	const clipIndicesToRemove: number[] = [];
+	for (let i = clipRegionsStore.length - 1; i >= 0; i--) {
+		if (clipRegionsStore[i].streamId === id) {
+			clipRegionsStore.splice(i, 1);
+		}
+	}
+
+	// Remove from SQLite (cascades to transcriptions, chat, clips)
+	db.deleteStream(id);
+
 	return true;
 }
 
@@ -223,6 +321,10 @@ export function updateStreamOffset(id: string, offset: number): boolean {
 	const handle = captures.get(id);
 	if (!handle) return false;
 	handle.info.offset = offset;
+
+	// Persist to SQLite
+	db.updateStreamOffset(id, offset);
+
 	return true;
 }
 
@@ -242,6 +344,9 @@ export function addClipRegion(region: ClipRegion): void {
 	} else {
 		clipRegionsStore.push(region);
 	}
+
+	// Persist to SQLite
+	db.saveClipRegion(region);
 }
 
 /**
@@ -251,6 +356,10 @@ export function removeClipRegion(id: string): boolean {
 	const idx = clipRegionsStore.findIndex((r) => r.id === id);
 	if (idx === -1) return false;
 	clipRegionsStore.splice(idx, 1);
+
+	// Remove from SQLite
+	db.deleteClipRegion(id);
+
 	return true;
 }
 
@@ -348,6 +457,9 @@ export function importSession(data: SessionExport): { imported: number; errors: 
 	streamChatMessages.clear();
 	clipRegionsStore.length = 0;
 
+	// Clear SQLite
+	db.clearAll();
+
 	const errors: string[] = [];
 	let imported = 0;
 
@@ -406,6 +518,10 @@ export function importSession(data: SessionExport): { imported: number; errors: 
 		};
 
 		captures.set(stream.id, stubHandle);
+
+		// Persist to SQLite
+		db.saveStream(info);
+
 		imported++;
 	}
 
@@ -414,16 +530,22 @@ export function importSession(data: SessionExport): { imported: number; errors: 
 		for (const [streamId, entries] of Object.entries(data.transcriptions)) {
 			if (captures.has(streamId)) {
 				streamTranscriptions.set(streamId, [...entries]);
+				db.bulkImportTranscriptions(streamId, entries);
 			}
 		}
 	}
 
 	// Restore clip regions (only for successfully imported streams)
 	if (data.clipRegions) {
+		const validRegions: ClipRegion[] = [];
 		for (const region of data.clipRegions) {
 			if (captures.has(region.streamId)) {
 				clipRegionsStore.push({ ...region });
+				validRegions.push(region);
 			}
+		}
+		if (validRegions.length > 0) {
+			db.bulkImportClipRegions(validRegions);
 		}
 	}
 
@@ -432,6 +554,7 @@ export function importSession(data: SessionExport): { imported: number; errors: 
 		for (const [streamId, messages] of Object.entries(data.chatMessages)) {
 			if (captures.has(streamId)) {
 				streamChatMessages.set(streamId, [...messages]);
+				db.bulkImportChatMessages(streamId, messages);
 			}
 		}
 	}
@@ -468,6 +591,7 @@ export function shutdownAll() {
 		handle.kill();
 	}
 	captures.clear();
+	db.closeDatabase();
 }
 
 // Cleanup on process exit

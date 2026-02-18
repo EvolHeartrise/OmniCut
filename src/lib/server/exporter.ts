@@ -5,6 +5,18 @@ import type { ClipRegion, StreamInfo } from './types.js';
 const EXPORTS_DIR = path.resolve(process.cwd(), 'exports');
 
 /**
+ * Escape a file path for use in an ffmpeg concat demuxer list file.
+ * The concat format wraps entries in single quotes and requires escaping
+ * single quotes and backslashes within the path.
+ */
+function ffmpegConcatEscape(filePath: string): string {
+	// ffmpeg concat format: file 'path'
+	// Inside quotes: escape \ as \\ and ' as '\''
+	const escaped = filePath.replace(/\\/g, '\\\\').replace(/'/g, "'\\''");
+	return `file '${escaped}'`;
+}
+
+/**
  * Export all clip regions as a single stitched video file.
  * Clips are sorted by startTime (same order as Cleaning mode).
  */
@@ -87,7 +99,7 @@ export async function exportVideo(
 			const padded = i.toString().padStart(4, '0');
 			const clipConcatPath = path.join(tempDir, `clip_${padded}_concat.txt`);
 			const clipConcatContent = relevantSegments
-				.map((s) => `file '${s.file.replace(/\\/g, '/').replace(/'/g, "'\\''")}'`)
+				.map((s) => ffmpegConcatEscape(s.file))
 				.join('\n');
 			fs.writeFileSync(clipConcatPath, clipConcatContent);
 
@@ -138,11 +150,11 @@ export async function exportVideo(
 		// Create final concat list
 		const concatListPath = path.join(tempDir, 'concat.txt');
 		const concatContent = clipFiles
-			.map((f) => `file '${f.replace(/\\/g, '/').replace(/'/g, "'\\''")}'`)
+			.map((f) => ffmpegConcatEscape(f))
 			.join('\n');
 		fs.writeFileSync(concatListPath, concatContent);
 
-		const safeName = filename.replace(/[<>:"/\\|?*]/g, '_');
+		const safeName = path.basename(filename).replace(/[<>:"/\\|?*]/g, '_');
 		const outputPath = path.join(EXPORTS_DIR, `${safeName}.mp4`);
 
 		onProgress(

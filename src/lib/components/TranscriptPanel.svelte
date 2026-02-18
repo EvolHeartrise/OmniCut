@@ -9,18 +9,7 @@
 		seekRequest,
 		type TranscriptionEntry
 	} from '$lib/stores/streams.js';
-
-	// Same palette as NLETimeline COLORS for visual consistency
-	const COLORS = [
-		'#7c3aed',
-		'#2563eb',
-		'#dc2626',
-		'#16a34a',
-		'#d97706',
-		'#db2777',
-		'#0891b2',
-		'#84cc16'
-	];
+	import { TRACK_COLORS as COLORS } from '$lib/constants.js';
 
 	let searchQuery = $state('');
 	let listEl = $state<HTMLDivElement | null>(null);

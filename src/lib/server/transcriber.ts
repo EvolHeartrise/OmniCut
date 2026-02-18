@@ -4,8 +4,9 @@ import * as fs from 'node:fs';
 const BATCH_SIZE = 3; // segments per batch (~6 seconds at 2s/segment)
 const POLL_INTERVAL = 3000; // check for new segments every 3s
 const SEGMENT_DURATION = 2; // seconds per HLS segment (matches -hls_time 2)
+const POOL_SIZE = 3; // number of concurrent transcription workers
 
-// --- Python worker process (shared across all streams) ---
+// --- Worker pool ---
 
 interface WorkerProc {
 	stdout: ReadableStream<Uint8Array>;
@@ -14,9 +15,13 @@ interface WorkerProc {
 	exited: Promise<number>;
 	kill(): void;
 }
-let workerProc: WorkerProc | null = null;
-let workerReady = false;
-let workerFailed = false;
+
+interface PoolWorker {
+	proc: WorkerProc;
+	ready: boolean;
+	busy: boolean;
+	id: number;
+}
 
 interface QueueItem {
 	wavPath: string;
@@ -24,20 +29,23 @@ interface QueueItem {
 	reject: (err: Error) => void;
 }
 
+let poolWorkers: PoolWorker[] = [];
+let poolInitStarted = false;
+let poolFailed = false;
+let poolReadyCount = 0;
+
 const requestQueue: QueueItem[] = [];
-let currentResolve: ((text: string) => void) | null = null;
-let processing = false;
 
-function ensureWorker(): boolean {
-	if (workerFailed) return false;
-	if (workerReady) return true;
-	if (workerProc) return false; // still starting
+function getScriptPath(): string {
+	return path.join(process.cwd(), 'scripts', 'transcribe_worker.py');
+}
 
-	const scriptPath = path.join(process.cwd(), 'scripts', 'transcribe_worker.py');
+function spawnWorker(workerId: number): PoolWorker | null {
+	const scriptPath = getScriptPath();
 	if (!fs.existsSync(scriptPath)) {
 		console.warn('[transcriber] scripts/transcribe_worker.py not found, transcription disabled');
-		workerFailed = true;
-		return false;
+		poolFailed = true;
+		return null;
 	}
 
 	try {
@@ -45,12 +53,18 @@ function ensureWorker(): boolean {
 			stdin: 'pipe',
 			stdout: 'pipe',
 			stderr: 'pipe'
-		});
-		workerProc = proc as unknown as WorkerProc;
+		}) as unknown as WorkerProc;
+
+		const worker: PoolWorker = {
+			proc,
+			ready: false,
+			busy: false,
+			id: workerId
+		};
 
 		// Read stdout line-by-line for JSON responses
 		(async () => {
-			const reader = workerProc!.stdout.getReader();
+			const reader = proc.stdout.getReader();
 			const decoder = new TextDecoder();
 			let buffer = '';
 
@@ -69,23 +83,22 @@ function ensureWorker(): boolean {
 						try {
 							const data = JSON.parse(line);
 							if (data.ready) {
-								console.log('[transcriber] Model loaded, ready for transcription');
-								workerReady = true;
+								console.log(`[transcriber:w${workerId}] Model loaded, ready for transcription`);
+								worker.ready = true;
+								poolReadyCount++;
 								processQueue();
 								continue;
 							}
-							if (data.error && !workerReady) {
-								console.error(`[transcriber] Worker error: ${data.error}`);
-								workerFailed = true;
-								workerProc?.kill();
-								workerProc = null;
+							if (data.error && !worker.ready) {
+								console.error(`[transcriber:w${workerId}] Worker error: ${data.error}`);
+								removeWorker(worker);
 								return;
 							}
-							// Transcription response
-							if (currentResolve) {
-								const resolve = currentResolve;
-								currentResolve = null;
-								processing = false;
+							// Transcription response — resolve the current item
+							if (worker.busy && (worker as any)._currentResolve) {
+								const resolve = (worker as any)._currentResolve as (text: string) => void;
+								(worker as any)._currentResolve = null;
+								worker.busy = false;
 								resolve(data.text || '');
 								processQueue();
 							}
@@ -99,50 +112,103 @@ function ensureWorker(): boolean {
 
 		// Log stderr
 		(async () => {
-			const reader = workerProc!.stderr.getReader();
+			const reader = proc.stderr.getReader();
 			const decoder = new TextDecoder();
 			try {
 				while (true) {
 					const { done, value } = await reader.read();
 					if (done) break;
 					const msg = decoder.decode(value).trim();
-					if (msg) console.error(`[transcriber] ${msg}`);
+					if (msg) console.error(`[transcriber:w${workerId}] ${msg}`);
 				}
 			} catch { /* stream closed */ }
 		})();
 
 		// Handle worker exit
-		workerProc.exited.then((code) => {
-			console.warn(`[transcriber] Worker exited with code ${code}`);
-			workerProc = null;
-			workerReady = false;
-			// Reject any pending request
-			if (currentResolve) {
-				currentResolve('');
-				currentResolve = null;
-				processing = false;
+		proc.exited.then((code) => {
+			console.warn(`[transcriber:w${workerId}] Worker exited with code ${code}`);
+			// Resolve any pending request with empty string
+			if (worker.busy && (worker as any)._currentResolve) {
+				const resolve = (worker as any)._currentResolve as (text: string) => void;
+				(worker as any)._currentResolve = null;
+				worker.busy = false;
+				resolve('');
+			}
+			removeWorker(worker);
+			// Try to respawn if the pool is still active
+			if (!poolFailed && poolWorkers.length < POOL_SIZE) {
+				const newWorker = spawnWorker(workerId);
+				if (newWorker) {
+					poolWorkers.push(newWorker);
+				}
 			}
 		});
 
-		return false; // not ready yet, will be after "ready" message
+		return worker;
 	} catch (err) {
-		console.warn('[transcriber] Failed to spawn Python worker:', err);
-		workerFailed = true;
-		return false;
+		console.warn(`[transcriber:w${workerId}] Failed to spawn Python worker:`, err);
+		return null;
 	}
 }
 
+function removeWorker(worker: PoolWorker) {
+	if (worker.ready) poolReadyCount--;
+	worker.ready = false;
+	const idx = poolWorkers.indexOf(worker);
+	if (idx !== -1) poolWorkers.splice(idx, 1);
+}
+
+function ensurePool(): boolean {
+	if (poolFailed) return false;
+	if (poolReadyCount > 0) return true;
+	if (poolInitStarted) return false; // still starting up
+
+	poolInitStarted = true;
+
+	const scriptPath = getScriptPath();
+	if (!fs.existsSync(scriptPath)) {
+		console.warn('[transcriber] scripts/transcribe_worker.py not found, transcription disabled');
+		poolFailed = true;
+		return false;
+	}
+
+	console.log(`[transcriber] Spawning worker pool (size=${POOL_SIZE})`);
+	for (let i = 0; i < POOL_SIZE; i++) {
+		const worker = spawnWorker(i);
+		if (worker) {
+			poolWorkers.push(worker);
+		}
+	}
+
+	if (poolWorkers.length === 0) {
+		poolFailed = true;
+		return false;
+	}
+
+	return false; // not ready yet, workers are loading models
+}
+
 function processQueue() {
-	if (processing || requestQueue.length === 0 || !workerReady || !workerProc) return;
-	processing = true;
+	if (requestQueue.length === 0) return;
+
+	// Find an idle, ready worker
+	const worker = poolWorkers.find((w) => w.ready && !w.busy);
+	if (!worker) return;
+
 	const req = requestQueue.shift()!;
-	currentResolve = req.resolve;
-	workerProc.stdin.write(req.wavPath + '\n');
+	worker.busy = true;
+	(worker as any)._currentResolve = req.resolve;
+	worker.proc.stdin.write(req.wavPath + '\n');
+
+	// Process more items if there are more idle workers
+	if (requestQueue.length > 0) {
+		processQueue();
+	}
 }
 
 function transcribeAudio(wavPath: string): Promise<string> {
 	return new Promise((resolve, reject) => {
-		if (!ensureWorker() && !workerProc) {
+		if (!ensurePool() && poolWorkers.length === 0) {
 			resolve('');
 			return;
 		}
@@ -155,7 +221,7 @@ function transcribeAudio(wavPath: string): Promise<string> {
 
 async function extractAudio(recordingDir: string, segmentFiles: string[]): Promise<string | null> {
 	const listPath = path.join(recordingDir, '_concat.txt');
-	const wavPath = path.join(recordingDir, '_transcribe_' + Date.now() + '.wav');
+	const wavPath = path.join(recordingDir, '_transcribe_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6) + '.wav');
 
 	// Write concat file list (relative filenames, ffmpeg runs with cwd=recordingDir)
 	const listContent = segmentFiles.map((s) => `file '${s}'`).join('\n');
@@ -178,6 +244,7 @@ async function extractAudio(recordingDir: string, segmentFiles: string[]): Promi
 	} catch {}
 
 	if (code !== 0) {
+		console.warn(`[transcriber] Audio extraction failed (code ${code}) for ${recordingDir}`);
 		return null;
 	}
 	return wavPath;
@@ -210,11 +277,11 @@ const streamTrackers = new Map<string, StreamTracker>();
 async function checkForNewSegments(streamId: string) {
 	const tracker = streamTrackers.get(streamId);
 	if (!tracker || !tracker.active) return;
-	if (workerFailed) return;
+	if (poolFailed) return;
 
-	// Ensure worker is started (non-blocking)
-	ensureWorker();
-	if (!workerReady) return; // model still loading
+	// Ensure pool is started (non-blocking)
+	ensurePool();
+	if (poolReadyCount === 0) return; // model(s) still loading
 
 	// Probe for sequential segment files instead of listing the full directory.
 	// Segments are named seg000000.ts, seg000001.ts, ... so we just check
@@ -240,6 +307,9 @@ async function checkForNewSegments(streamId: string) {
 		batch.push(segmentFilename(startIdx + i));
 	}
 
+	// Advance lastProcessedIndex immediately so concurrent polls don't double-process
+	tracker.lastProcessedIndex = startIdx + batch.length - 1;
+
 	const wavPath = await extractAudio(tracker.recordingDir, batch);
 	if (!wavPath) return;
 
@@ -255,8 +325,6 @@ async function checkForNewSegments(streamId: string) {
 			fs.unlinkSync(wavPath);
 		} catch {}
 	}
-
-	tracker.lastProcessedIndex = startIdx + batch.length - 1;
 }
 
 /**
@@ -268,12 +336,12 @@ export function startTranscription(
 	recordingDir: string,
 	onResult: TranscriptionCallback
 ): void {
-	// Don't start if already tracking or worker is known to be broken
+	// Don't start if already tracking or worker pool is known to be broken
 	if (streamTrackers.has(streamId)) return;
-	if (workerFailed) return;
+	if (poolFailed) return;
 
-	// Kick off worker startup early
-	ensureWorker();
+	// Kick off worker pool startup early
+	ensurePool();
 
 	const tracker: StreamTracker = {
 		recordingDir,
@@ -299,15 +367,18 @@ export function stopTranscription(streamId: string): void {
 }
 
 /**
- * Shut down the transcription worker process.
+ * Shut down all transcription workers.
  */
 export function shutdownTranscriber(): void {
 	for (const [id] of streamTrackers) {
 		stopTranscription(id);
 	}
-	if (workerProc) {
-		workerProc.kill();
-		workerProc = null;
-		workerReady = false;
+	for (const worker of poolWorkers) {
+		try {
+			worker.proc.kill();
+		} catch {}
 	}
+	poolWorkers = [];
+	poolReadyCount = 0;
+	poolInitStarted = false;
 }
