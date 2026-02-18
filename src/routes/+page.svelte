@@ -5,7 +5,8 @@
 	import NLETimeline from '$lib/components/NLETimeline.svelte';
 	import CleaningTimeline from '$lib/components/CleaningTimeline.svelte';
 	import ExportPanel from '$lib/components/ExportPanel.svelte';
-	import { refreshStreams, connectSSE, streams, focusedStreamId, soloStreamId, appMode, exportSessionFile, importSessionFile } from '$lib/stores/streams.js';
+	import TranscriptPanel from '$lib/components/TranscriptPanel.svelte';
+	import { refreshStreams, connectSSE, streams, focusedStreamId, soloStreamId, appMode, transcriptPanelOpen, exportSessionFile, importSessionFile } from '$lib/stores/streams.js';
 
 	onMount(() => {
 		refreshStreams();
@@ -90,6 +91,10 @@
 				soloStreamId.set(null);
 				focusedStreamId.set(null);
 				break;
+			case 't':
+			case 'T':
+				transcriptPanelOpen.update((v) => !v);
+				break;
 		}
 	}
 </script>
@@ -136,7 +141,14 @@
 			{#if importError}
 				<span class="import-error">{importError}</span>
 			{/if}
-			<span class="shortcut-hint">Tab: Switch mode | 1-6: Focus | Esc: Unfocus</span>
+			{#if mode === 'clipping'}
+				<button
+					class="btn-tool"
+					class:btn-tool-active={$transcriptPanelOpen}
+					onclick={() => $transcriptPanelOpen = !$transcriptPanelOpen}
+				>Transcript</button>
+			{/if}
+			<span class="shortcut-hint">Tab: Switch mode | 1-6: Focus | Esc: Unfocus | T: Transcript</span>
 		</div>
 	</header>
 
@@ -147,6 +159,9 @@
 	{:else if mode === 'clipping'}
 		<main class="main-content">
 			<StreamGrid />
+			{#if $transcriptPanelOpen}
+				<TranscriptPanel />
+			{/if}
 		</main>
 		<NLETimeline />
 	{:else if mode === 'cleaning'}
@@ -247,6 +262,17 @@
 	.btn-tool:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
+	}
+
+	.btn-tool-active {
+		background: #7c3aed;
+		color: #fff;
+		border-color: #7c3aed;
+	}
+
+	.btn-tool-active:hover {
+		background: #6d28d9;
+		color: #fff;
 	}
 
 	.import-error {

@@ -18,10 +18,17 @@ export interface StreamInfo {
 	parentStreamId: string | null;
 }
 
+export interface ChatMessage {
+	username: string;
+	text: string;
+	timestamp: number; // stream-local seconds (seconds since capture startedAt)
+}
+
 export interface CaptureHandle {
 	info: StreamInfo;
 	kill: () => void;
 	segmentWatchInterval: ReturnType<typeof setInterval> | null;
+	stopChat?: () => void;
 }
 
 export interface StreamMeta {
@@ -47,4 +54,5 @@ export interface SessionExport {
 	}>;
 	transcriptions: Record<string, Array<{ text: string; startTime: number; endTime: number }>>;
 	clipRegions: ClipRegion[];
+	chatMessages?: Record<string, ChatMessage[]>;
 }

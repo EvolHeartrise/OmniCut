@@ -1,6 +1,6 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types.js';
-import { addStream, listStreams, getTranscriptions, getAllClipRegions } from '$lib/server/streamManager.js';
+import { addStream, listStreams, getTranscriptions, getAllClipRegions, getChatMessages } from '$lib/server/streamManager.js';
 
 /**
  * GET /api/streams — List all active streams (includes stored transcriptions)
@@ -14,8 +14,15 @@ export const GET: RequestHandler = async () => {
 			transcriptions[s.id] = entries;
 		}
 	}
+	const chatMessages: Record<string, Array<{ username: string; text: string; timestamp: number }>> = {};
+	for (const s of streams) {
+		const msgs = getChatMessages(s.id);
+		if (msgs.length > 0) {
+			chatMessages[s.id] = msgs;
+		}
+	}
 	const clipRegions = getAllClipRegions();
-	return json({ streams, transcriptions, clipRegions });
+	return json({ streams, transcriptions, clipRegions, chatMessages });
 };
 
 /**

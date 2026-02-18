@@ -13,6 +13,8 @@
 		focusedStreamId,
 		clipRegions,
 		saveClipRegion,
+		seekRequest,
+		chatMessages,
 		type ClipRegion
 	} from '$lib/stores/streams.js';
 	import { applyTimelineZoom, clampPps } from '$lib/timeline.js';
@@ -109,6 +111,48 @@
 		})
 	);
 
+	// Chat heatmap: bucket messages into time windows, normalize intensity per track
+	const CHAT_BUCKET_SECONDS = 5;
+
+	let chatHeatmapData = $derived.by(() => {
+		const allChat = $chatMessages;
+		const result: Record<string, Array<{ startTime: number; count: number; intensity: number }>> = {};
+
+		for (const track of tracksData) {
+			const messages = allChat[track.id];
+			if (!messages || messages.length === 0) continue;
+
+			// Bucket messages into CHAT_BUCKET_SECONDS intervals (in master/epoch time)
+			const buckets = new Map<number, number>();
+			for (const msg of messages) {
+				// Convert stream-local time to master time for positioning
+				const msgMasterTime = msg.timestamp + track.anchor - track.offset;
+				const bucketKey = Math.floor(msgMasterTime / CHAT_BUCKET_SECONDS) * CHAT_BUCKET_SECONDS;
+				buckets.set(bucketKey, (buckets.get(bucketKey) || 0) + 1);
+			}
+
+			// Find max for normalization
+			let maxCount = 0;
+			for (const count of buckets.values()) {
+				if (count > maxCount) maxCount = count;
+			}
+
+			// Build sorted array with normalized intensity (0-1)
+			const sorted: Array<{ startTime: number; count: number; intensity: number }> = [];
+			for (const [time, count] of buckets) {
+				sorted.push({
+					startTime: time,
+					count,
+					intensity: maxCount > 0 ? count / maxCount : 0
+				});
+			}
+			sorted.sort((a, b) => a.startTime - b.startTime);
+			result[track.id] = sorted;
+		}
+
+		return result;
+	});
+
 	// Master time is a pure self-advancing clock in epoch seconds. Streams follow it, never the reverse.
 	let masterCurrentTimeState = $state(Date.now() / 1000);
 
@@ -119,6 +163,22 @@
 	// Sync to shared store (read by StreamGrid for intersection filtering)
 	$effect(() => {
 		$masterTime = masterCurrentTime;
+	});
+
+	// React to external seek requests (e.g. from TranscriptPanel click-to-seek)
+	let lastSeekReqSeq = 0;
+	$effect(() => {
+		const req = $seekRequest;
+		if (req.seq !== lastSeekReqSeq) {
+			lastSeekReqSeq = req.seq;
+			masterCurrentTimeState = req.time;
+			masterControl.update((c) => ({
+				action: 'seek',
+				time: req.time,
+				direction: 0,
+				seq: c.seq + 1
+			}));
+		}
 	});
 
 	let masterPaused = $derived(!$masterPlaying);
@@ -643,6 +703,18 @@
 									<span class="bar-label">{track.channel}{track.sourceType === 'vod' ? ' (VOD)' : ''}</span>
 								</div>
 							{/if}
+							{#if chatHeatmapData[track.id]}
+								{#each chatHeatmapData[track.id] as bucket}
+									{@const heatLeft = (bucket.startTime - effectiveTimelineStart) * pixelsPerSecond}
+									{@const heatWidth = CHAT_BUCKET_SECONDS * pixelsPerSecond}
+									{#if bucket.intensity > 0.05}
+										<div
+											class="chat-heatmap-bar"
+											style="left: {heatLeft}px; width: {heatWidth}px; opacity: {0.15 + bucket.intensity * 0.7}"
+										></div>
+									{/if}
+								{/each}
+							{/if}
 							{#each $clipRegions.filter((r) => r.streamId === track.id) as region}
 								{@const dragShift = draggingStreamId === track.id ? -dragOffsetDelta : 0}
 								{@const clipLeft = (region.startTime + dragShift - effectiveTimelineStart) * pixelsPerSecond}
@@ -930,6 +1002,16 @@
 		text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
 		padding: 0 8px;
 		line-height: 24px;
+	}
+
+	.chat-heatmap-bar {
+		position: absolute;
+		top: 4px;
+		height: 24px;
+		background: linear-gradient(to top, #f97316, #fbbf24);
+		border-radius: 2px;
+		pointer-events: none;
+		z-index: 2;
 	}
 
 	.clip-region {

@@ -50,6 +50,14 @@ export interface TranscriptionEntry {
 }
 export const transcriptions = writable<Record<string, TranscriptionEntry[]>>({});
 
+// Per-stream chat messages
+export interface ChatMessageEntry {
+	username: string;
+	text: string;
+	timestamp: number; // stream-local seconds
+}
+export const chatMessages = writable<Record<string, ChatMessageEntry[]>>({});
+
 // Clip regions marked by the user (W key hold-to-mark)
 export const clipRegions = writable<ClipRegion[]>([]);
 
@@ -72,6 +80,13 @@ export const masterControl = writable<{
 	direction: number;
 	seq: number;
 }>({ action: 'seek', time: 0, direction: 0, seq: 0 });
+
+// Transcript panel toggle state (visible in clipping mode)
+export const transcriptPanelOpen = writable(false);
+
+// External seek request: allows components outside NLETimeline to request a playhead seek.
+// NLETimeline watches the seq and updates its internal masterCurrentTimeState accordingly.
+export const seekRequest = writable<{ time: number; seq: number }>({ time: 0, seq: 0 });
 
 /**
  * Fetch all streams from the API and update the store.
@@ -111,6 +126,20 @@ export async function refreshStreams() {
 					const existing = merged[streamId] || [];
 					if (entries.length > existing.length) {
 						merged[streamId] = entries;
+					}
+				}
+				return merged;
+			});
+		}
+
+		// Restore chat messages from server
+		if (data.chatMessages) {
+			chatMessages.update((current) => {
+				const merged = { ...current };
+				for (const [streamId, msgs] of Object.entries(data.chatMessages as Record<string, ChatMessageEntry[]>)) {
+					const existing = merged[streamId] || [];
+					if (msgs.length > existing.length) {
+						merged[streamId] = msgs;
 					}
 				}
 				return merged;
@@ -295,6 +324,17 @@ export function connectSSE(): () => void {
 						[data.streamId]: [
 							...entries,
 							{ text: data.text, startTime: data.startTime, endTime: data.endTime }
+						]
+					};
+				});
+			} else if (data.type === 'chat-message') {
+				chatMessages.update((current) => {
+					const entries = current[data.streamId] || [];
+					return {
+						...current,
+						[data.streamId]: [
+							...entries,
+							{ username: data.username, text: data.text, timestamp: data.timestamp }
 						]
 					};
 				});

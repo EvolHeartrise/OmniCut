@@ -3,8 +3,9 @@ import * as fs from 'node:fs';
 import { v4 as uuidv4 } from 'uuid';
 import { startCapture, fetchStreamMeta, type CaptureHandle } from './captureProcess.js';
 import { startTranscription, stopTranscription, shutdownTranscriber } from './transcriber.js';
+import { startChatCollection } from './chatCollector.js';
 import { exportVideo as exportVideoImpl } from './exporter.js';
-import type { StreamInfo, ClipRegion, SessionExport } from './types.js';
+import type { StreamInfo, ClipRegion, SessionExport, ChatMessage } from './types.js';
 
 const RECORDINGS_DIR = path.resolve(process.cwd(), 'recordings');
 
@@ -13,6 +14,9 @@ const captures = new Map<string, CaptureHandle>();
 
 // In-memory store of transcriptions per stream
 const streamTranscriptions = new Map<string, Array<{ text: string; startTime: number; endTime: number }>>();
+
+// In-memory store of chat messages per stream
+const streamChatMessages = new Map<string, ChatMessage[]>();
 
 // In-memory store of clip regions
 const clipRegionsStore: ClipRegion[] = [];
@@ -50,6 +54,25 @@ function broadcastTranscription(streamId: string, text: string, startTime: numbe
 	entries.push({ text, startTime, endTime });
 
 	broadcast(JSON.stringify({ type: 'transcription', streamId, text, startTime, endTime }));
+}
+
+function broadcastChatMessage(streamId: string, msg: ChatMessage) {
+	let messages = streamChatMessages.get(streamId);
+	if (!messages) {
+		messages = [];
+		streamChatMessages.set(streamId, messages);
+	}
+	messages.push(msg);
+
+	broadcast(
+		JSON.stringify({
+			type: 'chat-message',
+			streamId,
+			username: msg.username,
+			text: msg.text,
+			timestamp: msg.timestamp
+		})
+	);
 }
 
 function broadcastExportProgress(message: string, step: number, totalSteps: number) {
@@ -110,6 +133,13 @@ export async function addStream(channel: string): Promise<StreamInfo> {
 			startTranscription(id, info.recordingDir, (_streamId, text, startTime, endTime) => {
 				broadcastTranscription(id, text, startTime, endTime);
 			});
+
+			// Start chat collection for live streams
+			if (info.sourceType === 'live' && !handle.stopChat) {
+				handle.stopChat = startChatCollection(id, channel, info.startedAt, (_streamId, msg) => {
+					broadcastChatMessage(id, msg);
+				});
+			}
 		}
 	});
 
@@ -147,6 +177,7 @@ export function stopStream(id: string): boolean {
 	if (!handle) return false;
 	if (handle.info.status === 'stopped') return true;
 	stopTranscription(id);
+	handle.stopChat?.();
 	handle.kill();
 	return true;
 }
@@ -159,6 +190,7 @@ export function removeStream(id: string): boolean {
 	if (!handle) return false;
 
 	stopTranscription(id);
+	handle.stopChat?.();
 	handle.kill();
 	captures.delete(id);
 	return true;
@@ -237,6 +269,13 @@ export function getTranscriptions(id: string): Array<{ text: string; startTime: 
 }
 
 /**
+ * Get all stored chat messages for a stream.
+ */
+export function getChatMessages(id: string): ChatMessage[] {
+	return streamChatMessages.get(id) || [];
+}
+
+/**
  * Get the recording directory path for a stream.
  */
 export function getStreamRecordingDir(id: string): string | null {
@@ -272,12 +311,20 @@ export function exportSession(): SessionExport {
 		transcriptions[id] = entries;
 	}
 
+	const chatMessages: SessionExport['chatMessages'] = {};
+	for (const [id, messages] of streamChatMessages) {
+		if (messages.length > 0) {
+			chatMessages[id] = messages;
+		}
+	}
+
 	return {
 		version: 1,
 		exportedAt: Date.now(),
 		streams,
 		transcriptions,
-		clipRegions: [...clipRegionsStore]
+		clipRegions: [...clipRegionsStore],
+		chatMessages
 	};
 }
 
@@ -293,10 +340,12 @@ export function importSession(data: SessionExport): { imported: number; errors: 
 	// Clear existing state
 	for (const [id, handle] of captures) {
 		stopTranscription(id);
+		handle.stopChat?.();
 		handle.kill();
 	}
 	captures.clear();
 	streamTranscriptions.clear();
+	streamChatMessages.clear();
 	clipRegionsStore.length = 0;
 
 	const errors: string[] = [];
@@ -378,6 +427,15 @@ export function importSession(data: SessionExport): { imported: number; errors: 
 		}
 	}
 
+	// Restore chat messages (only for successfully imported streams)
+	if (data.chatMessages) {
+		for (const [streamId, messages] of Object.entries(data.chatMessages)) {
+			if (captures.has(streamId)) {
+				streamChatMessages.set(streamId, [...messages]);
+			}
+		}
+	}
+
 	return { imported, errors };
 }
 
@@ -406,6 +464,7 @@ export async function exportVideo(filename: string): Promise<{ outputPath: strin
 export function shutdownAll() {
 	shutdownTranscriber();
 	for (const [, handle] of captures) {
+		handle.stopChat?.();
 		handle.kill();
 	}
 	captures.clear();
