@@ -1,6 +1,6 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types.js';
-import { exportSession, importSession } from '$lib/server/streamManager.js';
+import { exportSession, importSession, clearSession } from '$lib/server/streamManager.js';
 import type { SessionExport } from '$lib/server/types.js';
 
 /**
@@ -36,4 +36,12 @@ export const POST: RequestHandler = async ({ request }) => {
 	const status = result.errors.length === 0 ? 200 : result.imported > 0 ? 207 : 400;
 
 	return json({ imported: result.imported, total, errors: result.errors }, { status });
+};
+
+/**
+ * DELETE /api/session — Clear entire session (all streams, transcriptions, chat, clips)
+ */
+export const DELETE: RequestHandler = async () => {
+	clearSession();
+	return json({ ok: true });
 };

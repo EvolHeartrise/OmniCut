@@ -13,6 +13,7 @@ export interface StreamState {
 	diskUsageBytes: number;
 	viewerCount: number | null;
 	streamTitle: string | null;
+	gameName: string | null;
 	offset: number;
 	sourceType: 'live' | 'vod';
 	parentStreamId: string | null;
@@ -263,6 +264,24 @@ export async function deleteClipRegion(id: string, streamId: string) {
 	} catch (err) {
 		console.error('Failed to delete clip region:', err);
 	}
+}
+
+/**
+ * Clear the entire session (all streams, transcriptions, chat, clips).
+ * Calls the backend to wipe SQLite and resets all frontend stores.
+ */
+export async function clearSession() {
+	await fetch('/api/session', { method: 'DELETE' });
+	streams.set([]);
+	clipRegions.set([]);
+	transcriptions.set({});
+	chatMessages.set({});
+	syncOffsets.set({});
+	streamPlaybackStates.set({});
+	focusedStreamId.set(null);
+	soloStreamId.set(null);
+	exportLog.set([]);
+	appMode.set('sources');
 }
 
 /**

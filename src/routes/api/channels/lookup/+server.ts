@@ -10,6 +10,7 @@ const GQL_QUERY = `query($login: String!) {
 		stream {
 			viewersCount
 			title
+			game { name }
 			createdAt
 		}
 	}
@@ -37,6 +38,7 @@ async function fetchChannel(login: string): Promise<ChannelInfo> {
 				profileImageUrl: null,
 				isLive: false,
 				title: null,
+				gameName: null,
 				viewerCount: null,
 				startedAt: null
 			};
@@ -48,6 +50,7 @@ async function fetchChannel(login: string): Promise<ChannelInfo> {
 			profileImageUrl: user.profileImageURL ?? null,
 			isLive: !!stream,
 			title: stream?.title ?? null,
+			gameName: stream?.game?.name ?? null,
 			viewerCount: stream?.viewersCount ?? null,
 			startedAt: stream?.createdAt ?? null
 		};
@@ -58,6 +61,7 @@ async function fetchChannel(login: string): Promise<ChannelInfo> {
 			profileImageUrl: null,
 			isLive: false,
 			title: null,
+			gameName: null,
 			viewerCount: null,
 			startedAt: null
 		};

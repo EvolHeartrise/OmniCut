@@ -12,6 +12,7 @@ export interface StreamInfo {
 	diskUsageBytes: number;
 	viewerCount: number | null;
 	streamTitle: string | null;
+	gameName: string | null;
 	recordingDir: string;
 	offset: number;
 	sourceType: 'live' | 'vod';
@@ -38,6 +39,7 @@ export interface CaptureHandle {
 export interface StreamMeta {
 	viewerCount: number | null;
 	title: string | null;
+	gameName: string | null;
 	createdAt: string | null;
 	vodId: string | null;
 }

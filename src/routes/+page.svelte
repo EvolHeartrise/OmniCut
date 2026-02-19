@@ -1,12 +1,13 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import AddStreamBar from '$lib/components/AddStreamBar.svelte';
+	import DiscoveryBrowser from '$lib/components/DiscoveryBrowser.svelte';
 	import StreamGrid from '$lib/components/StreamGrid.svelte';
 	import NLETimeline from '$lib/components/NLETimeline.svelte';
 	import CleaningTimeline from '$lib/components/CleaningTimeline.svelte';
 	import ExportPanel from '$lib/components/ExportPanel.svelte';
 	import TranscriptPanel from '$lib/components/TranscriptPanel.svelte';
-	import { refreshStreams, connectSSE, streams, focusedStreamId, soloStreamId, appMode, transcriptPanelOpen, exportSessionFile, importSessionFile } from '$lib/stores/streams.js';
+	import { refreshStreams, connectSSE, streams, focusedStreamId, soloStreamId, appMode, transcriptPanelOpen, exportSessionFile, importSessionFile, clearSession } from '$lib/stores/streams.js';
 
 	onMount(() => {
 		refreshStreams();
@@ -18,9 +19,22 @@
 	let importing = $state(false);
 	let importError = $state<string | null>(null);
 	let fileInput: HTMLInputElement;
+	let clearConfirm = $state(false);
+	let clearConfirmTimer: ReturnType<typeof setTimeout> | undefined;
 
 	async function handleExport() {
 		await exportSessionFile();
+	}
+
+	async function handleClearSession() {
+		if (!clearConfirm) {
+			clearConfirm = true;
+			clearConfirmTimer = setTimeout(() => { clearConfirm = false; }, 3000);
+			return;
+		}
+		clearTimeout(clearConfirmTimer);
+		clearConfirm = false;
+		await clearSession();
 	}
 
 	async function handleImportClick() {
@@ -131,6 +145,10 @@
 			<button class="btn-tool" onclick={handleImportClick} disabled={importing}>
 				{importing ? 'Loading...' : 'Load Session'}
 			</button>
+			<button
+				class="btn-tool btn-danger"
+				onclick={handleClearSession}
+			>{clearConfirm ? 'Are you sure?' : 'Clear Session'}</button>
 			<input
 				type="file"
 				accept=".json"
@@ -155,6 +173,7 @@
 	{#if mode === 'sources'}
 		<main class="sources-content">
 			<AddStreamBar />
+			<DiscoveryBrowser />
 		</main>
 	{:else if mode === 'clipping'}
 		<main class="main-content">
@@ -205,6 +224,8 @@
 		min-height: 0;
 		overflow: auto;
 		padding: 24px;
+		display: flex;
+		gap: 24px;
 	}
 
 	.mode-tabs {
@@ -262,6 +283,12 @@
 	.btn-tool:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
+	}
+
+	.btn-danger:hover {
+		background: #7f1d1d;
+		border-color: #991b1b;
+		color: #fca5a5;
 	}
 
 	.btn-tool-active {

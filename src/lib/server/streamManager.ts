@@ -163,6 +163,7 @@ function serializeStreamInfo(info: StreamInfo) {
 		diskUsageBytes: info.diskUsageBytes,
 		viewerCount: info.viewerCount,
 		streamTitle: info.streamTitle,
+		gameName: info.gameName,
 		offset: info.offset,
 		sourceType: info.sourceType,
 		parentStreamId: info.parentStreamId
@@ -438,15 +439,9 @@ export function exportSession(): SessionExport {
 }
 
 /**
- * Import session state from a previously exported JSON structure.
- * Clears existing state and replaces with imported data.
+ * Clear all session state — stop processes, wipe in-memory caches, and clear SQLite.
  */
-export function importSession(data: SessionExport): { imported: number; errors: string[] } {
-	if (data.version !== 1) {
-		return { imported: 0, errors: [`Unsupported export version: ${data.version}`] };
-	}
-
-	// Clear existing state
+export function clearSession(): void {
 	for (const [id, handle] of captures) {
 		stopTranscription(id);
 		handle.stopChat?.();
@@ -456,9 +451,19 @@ export function importSession(data: SessionExport): { imported: number; errors: 
 	streamTranscriptions.clear();
 	streamChatMessages.clear();
 	clipRegionsStore.length = 0;
-
-	// Clear SQLite
 	db.clearAll();
+}
+
+/**
+ * Import session state from a previously exported JSON structure.
+ * Clears existing state and replaces with imported data.
+ */
+export function importSession(data: SessionExport): { imported: number; errors: string[] } {
+	if (data.version !== 1) {
+		return { imported: 0, errors: [`Unsupported export version: ${data.version}`] };
+	}
+
+	clearSession();
 
 	const errors: string[] = [];
 	let imported = 0;
@@ -504,6 +509,7 @@ export function importSession(data: SessionExport): { imported: number; errors: 
 			diskUsageBytes,
 			viewerCount: stream.viewerCount,
 			streamTitle: stream.streamTitle,
+			gameName: null,
 			recordingDir,
 			offset: stream.offset,
 			sourceType: stream.sourceType,

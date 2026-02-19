@@ -13,6 +13,7 @@ export interface ChannelInfo {
 	profileImageUrl: string | null;
 	isLive: boolean;
 	title: string | null;
+	gameName: string | null;
 	viewerCount: number | null;
 	startedAt: string | null;
 }

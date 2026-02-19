@@ -14,7 +14,7 @@ export async function fetchStreamMeta(channel: string): Promise<StreamMeta> {
 				'Content-Type': 'application/json'
 			},
 			body: JSON.stringify({
-				query: 'query($login: String!) { user(login: $login) { stream { viewersCount title createdAt archiveVideo { id } } } }',
+				query: 'query($login: String!) { user(login: $login) { stream { viewersCount title game { name } createdAt archiveVideo { id } } } }',
 				variables: { login: channel }
 			})
 		});
@@ -23,11 +23,12 @@ export async function fetchStreamMeta(channel: string): Promise<StreamMeta> {
 		return {
 			viewerCount: stream?.viewersCount ?? null,
 			title: stream?.title ?? null,
+			gameName: stream?.game?.name ?? null,
 			createdAt: stream?.createdAt ?? null,
 			vodId: stream?.archiveVideo?.id ?? null
 		};
 	} catch {
-		return { viewerCount: null, title: null, createdAt: null, vodId: null };
+		return { viewerCount: null, title: null, gameName: null, createdAt: null, vodId: null };
 	}
 }
 
@@ -61,6 +62,7 @@ export function startCapture(
 		diskUsageBytes: 0,
 		viewerCount: null,
 		streamTitle: null,
+		gameName: null,
 		recordingDir,
 		offset: 0,
 		sourceType: isVod ? 'vod' : 'live',
@@ -169,11 +171,13 @@ export function startCapture(
 				const meta = await fetchStreamMeta(channel);
 				info.viewerCount = meta.viewerCount;
 				info.streamTitle = meta.title;
+				info.gameName = meta.gameName;
 			}
 		}, 30000);
 		fetchStreamMeta(channel).then((meta) => {
 			info.viewerCount = meta.viewerCount;
 			info.streamTitle = meta.title;
+			info.gameName = meta.gameName;
 		});
 	}
 

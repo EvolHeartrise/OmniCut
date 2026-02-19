@@ -39,6 +39,7 @@ export async function initDatabase(): Promise<void> {
 			disk_usage_bytes INTEGER NOT NULL DEFAULT 0,
 			viewer_count INTEGER,
 			stream_title TEXT,
+			game_name TEXT,
 			recording_dir TEXT NOT NULL,
 			offset REAL NOT NULL DEFAULT 0,
 			source_type TEXT NOT NULL DEFAULT 'live',
@@ -76,7 +77,19 @@ export async function initDatabase(): Promise<void> {
 		);
 
 		CREATE INDEX IF NOT EXISTS idx_clip_stream ON clip_regions(stream_id);
+
+		CREATE TABLE IF NOT EXISTS ignored_channels (
+			login TEXT PRIMARY KEY,
+			ignored_at INTEGER NOT NULL DEFAULT (unixepoch())
+		);
 	`);
+
+	// Migration: add game_name column for existing databases
+	try {
+		db.exec('ALTER TABLE streams ADD COLUMN game_name TEXT');
+	} catch {
+		// Column already exists — ignore
+	}
 }
 
 function getDb(): Database {
@@ -93,8 +106,8 @@ export function saveStream(info: StreamInfo): void {
 	d.run(
 		`INSERT OR REPLACE INTO streams
 		(id, channel, status, started_at, error, segment_count, disk_usage_bytes,
-		 viewer_count, stream_title, recording_dir, offset, source_type, parent_stream_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 viewer_count, stream_title, game_name, recording_dir, offset, source_type, parent_stream_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		[
 			info.id,
 			info.channel,
@@ -105,6 +118,7 @@ export function saveStream(info: StreamInfo): void {
 			info.diskUsageBytes,
 			info.viewerCount,
 			info.streamTitle,
+			info.gameName,
 			info.recordingDir,
 			info.offset,
 			info.sourceType,
@@ -131,6 +145,7 @@ export function loadAllStreams(): StreamInfo[] {
 		diskUsageBytes: r.disk_usage_bytes,
 		viewerCount: r.viewer_count,
 		streamTitle: r.stream_title,
+		gameName: r.game_name ?? null,
 		recordingDir: r.recording_dir,
 		offset: r.offset,
 		sourceType: r.source_type as StreamInfo['sourceType'],
@@ -153,10 +168,10 @@ export function updateStreamStatus(id: string, status: string, segmentCount?: nu
 	}
 }
 
-export function updateStreamMeta(id: string, viewerCount: number | null, streamTitle: string | null): void {
+export function updateStreamMeta(id: string, viewerCount: number | null, streamTitle: string | null, gameName: string | null): void {
 	const d = getDb();
-	d.run('UPDATE streams SET viewer_count = ?, stream_title = ? WHERE id = ?',
-		[viewerCount, streamTitle, id]);
+	d.run('UPDATE streams SET viewer_count = ?, stream_title = ?, game_name = ? WHERE id = ?',
+		[viewerCount, streamTitle, gameName, id]);
 }
 
 export function updateStreamSegmentInfo(id: string, segmentCount: number, diskUsageBytes: number, status?: string): void {
@@ -309,6 +324,24 @@ export function bulkImportClipRegions(regions: ClipRegion[]): void {
 		}
 	});
 	tx();
+}
+
+// --- Ignored Channels ---
+
+export function addIgnoredChannel(login: string): void {
+	const d = getDb();
+	d.run('INSERT OR IGNORE INTO ignored_channels (login) VALUES (?)', [login.toLowerCase()]);
+}
+
+export function removeIgnoredChannel(login: string): void {
+	const d = getDb();
+	d.run('DELETE FROM ignored_channels WHERE login = ?', [login.toLowerCase()]);
+}
+
+export function loadIgnoredChannels(): string[] {
+	const d = getDb();
+	const rows = d.query('SELECT login FROM ignored_channels ORDER BY ignored_at').all() as { login: string }[];
+	return rows.map(r => r.login);
 }
 
 /**

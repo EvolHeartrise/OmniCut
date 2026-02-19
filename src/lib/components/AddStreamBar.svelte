@@ -111,6 +111,11 @@
 		return String(count);
 	}
 
+	function handleWatchlistAdd(e: Event) {
+		const login = (e as CustomEvent<string>).detail;
+		if (login) addToWatchlist(login);
+	}
+
 	onMount(() => {
 		try {
 			watchlist = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
@@ -118,11 +123,15 @@
 		fetchChannelData();
 		pollTimer = setInterval(fetchChannelData, POLL_INTERVAL);
 		tickTimer = setInterval(() => { now = Date.now(); }, 10_000);
+		window.addEventListener('watchlist-add', handleWatchlistAdd);
 	});
 
 	onDestroy(() => {
 		if (pollTimer) clearInterval(pollTimer);
 		if (tickTimer) clearInterval(tickTimer);
+		if (typeof window !== 'undefined') {
+			window.removeEventListener('watchlist-add', handleWatchlistAdd);
+		}
 	});
 </script>
 
@@ -180,6 +189,9 @@
 							<span class="channel-name">{channel.displayName || channel.login}</span>
 							{#if isCapturing}
 								<span class="rec-badge">REC</span>
+							{/if}
+							{#if channel.isLive && channel.gameName}
+								<span class="game-name">{channel.gameName}</span>
 							{/if}
 						</div>
 						{#if channel.isLive && channel.title}
@@ -375,6 +387,18 @@
 		padding: 1px 5px;
 		border-radius: 3px;
 		letter-spacing: 0.5px;
+	}
+
+	.game-name {
+		font-size: 0.65rem;
+		color: #7c3aed;
+		background: rgba(124, 58, 237, 0.12);
+		padding: 1px 6px;
+		border-radius: 3px;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		max-width: 180px;
 	}
 
 	.channel-title {
