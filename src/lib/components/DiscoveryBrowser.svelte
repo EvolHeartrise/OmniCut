@@ -352,10 +352,9 @@
 			viewerMin = saved.min ?? '';
 			viewerMax = saved.max ?? '';
 		} catch { /* ignore */ }
-		try {
-			const wl: string[] = JSON.parse(localStorage.getItem('omni-channel-history') || '[]');
-			watchlistLogins = new Set(wl);
-		} catch { /* ignore */ }
+		fetch('/api/watchlist').then(r => r.json()).then(d => {
+			watchlistLogins = new Set((d.watchlist ?? []).map((e: { login: string }) => e.login));
+		}).catch(() => {});
 		fetch('/api/browse/ignore').then(r => r.json()).then(d => {
 			ignoredLogins = new Set(d.channels ?? []);
 		}).catch(() => {});

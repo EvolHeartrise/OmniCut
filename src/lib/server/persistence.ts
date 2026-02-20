@@ -67,6 +67,7 @@ export async function initDatabase(): Promise<void> {
 		);
 
 		CREATE INDEX IF NOT EXISTS idx_chat_stream ON chat_messages(stream_id);
+		CREATE INDEX IF NOT EXISTS idx_chat_stream_time ON chat_messages(stream_id, timestamp);
 
 		CREATE TABLE IF NOT EXISTS clip_regions (
 			id TEXT PRIMARY KEY,
@@ -82,11 +83,38 @@ export async function initDatabase(): Promise<void> {
 			login TEXT PRIMARY KEY,
 			ignored_at INTEGER NOT NULL DEFAULT (unixepoch())
 		);
+
+		CREATE TABLE IF NOT EXISTS channel_settings (
+			login TEXT PRIMARY KEY,
+			language TEXT,
+			updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+		);
+
+		CREATE TABLE IF NOT EXISTS watchlist (
+			login TEXT NOT NULL,
+			platform TEXT NOT NULL DEFAULT 'twitch',
+			added_at INTEGER NOT NULL DEFAULT (unixepoch()),
+			PRIMARY KEY (login, platform)
+		);
 	`);
 
 	// Migration: add game_name column for existing databases
 	try {
 		db.exec('ALTER TABLE streams ADD COLUMN game_name TEXT');
+	} catch {
+		// Column already exists — ignore
+	}
+
+	// Migration: add platform column for existing databases
+	try {
+		db.exec("ALTER TABLE streams ADD COLUMN platform TEXT NOT NULL DEFAULT 'twitch'");
+	} catch {
+		// Column already exists — ignore
+	}
+
+	// Migration: add source_url column for VOD deduplication
+	try {
+		db.exec('ALTER TABLE streams ADD COLUMN source_url TEXT');
 	} catch {
 		// Column already exists — ignore
 	}
@@ -106,8 +134,8 @@ export function saveStream(info: StreamInfo): void {
 	d.run(
 		`INSERT OR REPLACE INTO streams
 		(id, channel, status, started_at, error, segment_count, disk_usage_bytes,
-		 viewer_count, stream_title, game_name, recording_dir, offset, source_type, parent_stream_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 viewer_count, stream_title, game_name, recording_dir, offset, source_type, parent_stream_id, platform, source_url)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		[
 			info.id,
 			info.channel,
@@ -122,7 +150,9 @@ export function saveStream(info: StreamInfo): void {
 			info.recordingDir,
 			info.offset,
 			info.sourceType,
-			info.parentStreamId
+			info.parentStreamId,
+			info.platform,
+			info.sourceUrl
 		]
 	);
 }
@@ -149,7 +179,9 @@ export function loadAllStreams(): StreamInfo[] {
 		recordingDir: r.recording_dir,
 		offset: r.offset,
 		sourceType: r.source_type as StreamInfo['sourceType'],
-		parentStreamId: r.parent_stream_id
+		parentStreamId: r.parent_stream_id,
+		platform: (r.platform || 'twitch') as StreamInfo['platform'],
+		sourceUrl: r.source_url || null
 	}));
 }
 
@@ -252,6 +284,14 @@ export function loadAllChatMessages(): Record<string, ChatMessage[]> {
 	return result;
 }
 
+export function loadChatMessagesInRange(streamId: string, fromTime: number, toTime: number): ChatMessage[] {
+	const d = getDb();
+	const rows = d.query(
+		'SELECT username, text, timestamp FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp'
+	).all(streamId, fromTime, toTime) as any[];
+	return rows.map((r) => ({ username: r.username, text: r.text, timestamp: r.timestamp }));
+}
+
 export function deleteChatMessages(streamId: string): void {
 	const d = getDb();
 	d.run('DELETE FROM chat_messages WHERE stream_id = ?', [streamId]);
@@ -342,6 +382,47 @@ export function loadIgnoredChannels(): string[] {
 	const d = getDb();
 	const rows = d.query('SELECT login FROM ignored_channels ORDER BY ignored_at').all() as { login: string }[];
 	return rows.map(r => r.login);
+}
+
+// --- Channel Settings ---
+
+export function getChannelSettings(login: string): { login: string; language: string | null } | null {
+	const d = getDb();
+	const row = d.query('SELECT login, language FROM channel_settings WHERE login = ?').get(login.toLowerCase()) as { login: string; language: string | null } | null;
+	return row ?? null;
+}
+
+export function saveChannelSettings(login: string, language: string | null): void {
+	const d = getDb();
+	d.run(
+		`INSERT INTO channel_settings (login, language, updated_at) VALUES (?, ?, unixepoch())
+		 ON CONFLICT(login) DO UPDATE SET language = excluded.language, updated_at = excluded.updated_at`,
+		[login.toLowerCase(), language]
+	);
+}
+
+export function loadAllChannelSettings(): { login: string; language: string | null }[] {
+	const d = getDb();
+	const rows = d.query('SELECT login, language FROM channel_settings ORDER BY login').all() as { login: string; language: string | null }[];
+	return rows;
+}
+
+// --- Watchlist ---
+
+export function loadWatchlist(): Array<{ login: string; platform: string }> {
+	const d = getDb();
+	const rows = d.query('SELECT login, platform FROM watchlist ORDER BY added_at').all() as { login: string; platform: string }[];
+	return rows;
+}
+
+export function addToWatchlist(login: string, platform: string): void {
+	const d = getDb();
+	d.run('INSERT OR IGNORE INTO watchlist (login, platform) VALUES (?, ?)', [login, platform]);
+}
+
+export function removeFromWatchlist(login: string, platform: string): void {
+	const d = getDb();
+	d.run('DELETE FROM watchlist WHERE login = ? AND platform = ?', [login, platform]);
 }
 
 /**

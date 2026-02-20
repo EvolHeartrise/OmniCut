@@ -1,6 +1,6 @@
 import * as path from 'node:path';
 import type { RequestHandler } from './$types.js';
-import { getStreamRecordingDir } from '$lib/server/streamManager.js';
+import { getStreamRecordingDir, getStream } from '$lib/server/streamManager.js';
 
 /**
  * GET /hls/:id/* — Serve HLS playlist and segment files
@@ -43,10 +43,26 @@ export const GET: RequestHandler = async ({ params, request }) => {
 	};
 	const contentType = contentTypes[ext] || 'application/octet-stream';
 
-	// For .m3u8 files, always return the full file (it's small and changes frequently)
-	// Disable caching so the player always gets the latest playlist
+	// For .m3u8 files, serve with appropriate caching based on stream status
 	if (ext === '.m3u8') {
-		const content = await file.text();
+		let content = await file.text();
+		const streamInfo = getStream(streamId);
+		const isStopped = !streamInfo || streamInfo.status === 'stopped' || streamInfo.status === 'error';
+
+		if (isStopped) {
+			// Stream is finished — playlist won't change, mark as VOD and cache forever
+			if (!content.includes('#EXT-X-ENDLIST')) {
+				content = content.trimEnd() + '\n#EXT-X-ENDLIST\n';
+			}
+			return new Response(content, {
+				headers: {
+					'Content-Type': contentType,
+					'Cache-Control': 'public, max-age=31536000, immutable'
+				}
+			});
+		}
+
+		// Stream is still capturing — playlist is growing, don't cache
 		return new Response(content, {
 			headers: {
 				'Content-Type': contentType,

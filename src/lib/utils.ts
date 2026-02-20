@@ -8,12 +8,13 @@ export function formatDuration(sec: number): string {
 }
 
 /** Shared HLS.js configuration for all players. */
-export function createHlsConfig(): Partial<ConstructorParameters<typeof Hls>[0]> {
+export function createHlsConfig(isLive: boolean): Partial<ConstructorParameters<typeof Hls>[0]> {
 	return {
 		enableWorker: true,
 		lowLatencyMode: false,
 		backBufferLength: 120,
-		maxBufferLength: 30,
-		maxMaxBufferLength: 600
+		maxBufferLength: isLive ? 30 : 60,
+		maxMaxBufferLength: 600,
+		...(isLive ? { liveSyncDurationCount: 3 } : {})
 	};
 }

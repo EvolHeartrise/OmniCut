@@ -17,6 +17,8 @@ export interface StreamInfo {
 	offset: number;
 	sourceType: 'live' | 'vod';
 	parentStreamId: string | null;
+	platform: 'twitch' | 'douyu';
+	sourceUrl: string | null;
 }
 
 export interface ChatMessage {
@@ -57,6 +59,7 @@ export interface SessionExport {
 		offset: number;
 		sourceType: 'live' | 'vod';
 		parentStreamId: string | null;
+		platform?: 'twitch' | 'douyu';
 	}>;
 	transcriptions: Record<string, Array<{ text: string; startTime: number; endTime: number }>>;
 	clipRegions: ClipRegion[];

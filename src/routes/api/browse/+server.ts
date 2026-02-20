@@ -66,7 +66,9 @@ function mapEdges(edges: StreamEdge[]): { streams: ChannelInfo[]; cursor: string
 		title: edge.node.title ?? null,
 		gameName: edge.node.game?.name ?? null,
 		viewerCount: edge.node.viewersCount ?? null,
-		startedAt: edge.node.createdAt ?? null
+		startedAt: edge.node.createdAt ?? null,
+		hasVod: false,
+		platform: 'twitch' as const
 	}));
 	return { streams, cursor };
 }

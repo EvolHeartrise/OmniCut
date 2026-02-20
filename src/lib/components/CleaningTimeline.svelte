@@ -117,7 +117,7 @@
 		if (!Hls.isSupported()) {
 			el.src = url;
 		} else {
-			const h = new Hls(createHlsConfig());
+			const h = new Hls(createHlsConfig(false));
 			s.hls = h;
 			h.loadSource(url);
 			h.attachMedia(el);

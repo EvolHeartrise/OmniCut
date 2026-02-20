@@ -1,91 +1,127 @@
 <script lang="ts">
 	import {
-		transcriptions,
 		streams,
 		syncOffsets,
 		focusedStreamId,
 		soloStreamId,
 		masterTime,
-		seekRequest,
-		type TranscriptionEntry
+		seekRequest
 	} from '$lib/stores/streams.js';
 	import { TRACK_COLORS as COLORS } from '$lib/constants.js';
+
+	const FETCH_WINDOW = 120; // ±120 seconds around playhead
+	const REFETCH_THRESHOLD = 30; // re-fetch when playhead drifts 30s from last center
+	const FETCH_DEBOUNCE = 300; // ms
 
 	let searchQuery = $state('');
 	let listEl = $state<HTMLDivElement | null>(null);
 	let userScrolled = $state(false);
 	let scrollTimeout: ReturnType<typeof setTimeout> | null = null;
 
-	interface TaggedEntry {
+	interface ChatEntry {
 		streamId: string;
 		channel: string;
 		color: string;
+		username: string;
 		text: string;
-		masterStart: number; // epoch seconds
-		masterEnd: number;
+		masterTime: number; // epoch seconds
 	}
 
-	// Build flat list of all entries with stream metadata, converted to master time
-	let allTaggedEntries = $derived.by(() => {
+	// Fetched chat entries (raw from server, before filtering)
+	let fetchedEntries = $state<ChatEntry[]>([]);
+	let lastFetchCenter = 0;
+	let fetchDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+	let fetchController: AbortController | null = null;
+
+	// Build stream lookup for visible streams
+	let visibleStreams = $derived.by(() => {
 		const allStreams = $streams;
-		const allTranscriptions = $transcriptions;
 		const offsets = $syncOffsets;
 		const focused = $focusedStreamId || $soloStreamId;
 
-		const result: TaggedEntry[] = [];
-
-		for (let i = 0; i < allStreams.length; i++) {
-			const stream = allStreams[i];
-			// If a stream is focused/solo, only include that stream's transcriptions
-			if (focused && stream.id !== focused) continue;
-
-			const entries = allTranscriptions[stream.id];
-			if (!entries || entries.length === 0) continue;
-
-			const anchor = stream.startedAt / 1000;
-			const offset = offsets[stream.id] || 0;
-			const color = COLORS[i % COLORS.length];
-
-			for (const entry of entries) {
-				// Convert stream-local time to master (epoch) time:
-				// localTime = masterTime - anchor + offset
-				// therefore: masterTime = localTime + anchor - offset
-				const masterStart = entry.startTime + anchor - offset;
-				const masterEnd = entry.endTime + anchor - offset;
-
-				result.push({
-					streamId: stream.id,
-					channel: stream.channel,
-					color,
-					text: entry.text,
-					masterStart,
-					masterEnd
-				});
-			}
-		}
-
-		result.sort((a, b) => a.masterStart - b.masterStart);
-		return result;
+		return allStreams
+			.filter((s) => !focused || s.id === focused)
+			.map((s, i) => ({
+				id: s.id,
+				channel: s.channel,
+				anchor: s.startedAt / 1000,
+				offset: offsets[s.id] || 0,
+				color: COLORS[allStreams.indexOf(s) % COLORS.length]
+			}));
 	});
+
+	// Trigger fetch when masterTime drifts far enough or visible streams change
+	$effect(() => {
+		const now = $masterTime;
+		const _streams = visibleStreams; // subscribe to stream changes
+		const drift = Math.abs(now - lastFetchCenter);
+
+		if (drift >= REFETCH_THRESHOLD || lastFetchCenter === 0) {
+			debouncedFetch(now);
+		}
+	});
+
+	function debouncedFetch(center: number) {
+		if (fetchDebounceTimer) clearTimeout(fetchDebounceTimer);
+		fetchDebounceTimer = setTimeout(() => fetchChat(center), FETCH_DEBOUNCE);
+	}
+
+	async function fetchChat(center: number) {
+		// Abort any in-flight request
+		if (fetchController) fetchController.abort();
+		fetchController = new AbortController();
+		const signal = fetchController.signal;
+
+		lastFetchCenter = center;
+		const strs = visibleStreams;
+		const allEntries: ChatEntry[] = [];
+
+		const fetches = strs.map(async (s) => {
+			const localCenter = center - s.anchor + s.offset;
+			const from = Math.max(0, localCenter - FETCH_WINDOW);
+			const to = localCenter + FETCH_WINDOW;
+
+			try {
+				const res = await fetch(`/api/streams/${s.id}/chat?from=${from}&to=${to}`, { signal });
+				if (!res.ok) return;
+				const data = await res.json();
+				for (const msg of data.messages) {
+					allEntries.push({
+						streamId: s.id,
+						channel: s.channel,
+						color: s.color,
+						username: msg.username,
+						text: msg.text,
+						masterTime: msg.timestamp + s.anchor - s.offset
+					});
+				}
+			} catch {
+				// Aborted or network error — ignore
+			}
+		});
+
+		await Promise.all(fetches);
+		if (signal.aborted) return;
+
+		allEntries.sort((a, b) => a.masterTime - b.masterTime);
+		fetchedEntries = allEntries;
+	}
 
 	// Apply search filter
 	let filteredEntries = $derived.by(() => {
-		if (!searchQuery.trim()) return allTaggedEntries;
+		if (!searchQuery.trim()) return fetchedEntries;
 		const q = searchQuery.trim().toLowerCase();
-		return allTaggedEntries.filter((e) => e.text.toLowerCase().includes(q));
+		return fetchedEntries.filter(
+			(e) => e.text.toLowerCase().includes(q) || e.username.toLowerCase().includes(q)
+		);
 	});
 
 	// Find the active entry based on current master playhead
 	let activeEntryIndex = $derived.by(() => {
 		const now = $masterTime;
-		// Find entry whose master time range contains the current playhead
+		// Find last entry at or before the playhead
 		for (let i = filteredEntries.length - 1; i >= 0; i--) {
-			const e = filteredEntries[i];
-			if (now >= e.masterStart && now < e.masterEnd) return i;
-		}
-		// Fallback: last entry that started before now
-		for (let i = filteredEntries.length - 1; i >= 0; i--) {
-			if (filteredEntries[i].masterStart <= now) return i;
+			if (filteredEntries[i].masterTime <= now) return i;
 		}
 		return -1;
 	});
@@ -109,8 +145,8 @@
 		}, 3000);
 	}
 
-	function seekToEntry(entry: TaggedEntry) {
-		seekRequest.update((r) => ({ time: entry.masterStart, seq: r.seq + 1 }));
+	function seekToEntry(entry: ChatEntry) {
+		seekRequest.update((r) => ({ time: entry.masterTime, seq: r.seq + 1 }));
 	}
 
 	function formatTime(epochSec: number): string {
@@ -126,9 +162,9 @@
 	}
 </script>
 
-<div class="transcript-panel">
+<div class="chat-panel">
 	<div class="panel-header">
-		<span class="panel-title">Transcript</span>
+		<span class="panel-title">Chat</span>
 		<span class="entry-count">{filteredEntries.length}</span>
 	</div>
 
@@ -136,7 +172,7 @@
 		<input
 			type="text"
 			class="search-input"
-			placeholder="Search transcripts..."
+			placeholder="Search chat..."
 			bind:value={searchQuery}
 		/>
 		{#if searchQuery}
@@ -145,7 +181,7 @@
 	</div>
 
 	<div class="entry-list" bind:this={listEl} onscroll={handleListScroll}>
-		{#each filteredEntries as entry, i (entry.masterStart.toString() + entry.streamId + entry.text.slice(0, 40))}
+		{#each filteredEntries as entry, i (entry.masterTime.toString() + entry.streamId + entry.username + entry.text.slice(0, 30))}
 			<button
 				class="entry-row"
 				class:active={i === activeEntryIndex}
@@ -154,8 +190,8 @@
 			>
 				<div class="entry-meta">
 					<span class="color-dot" style="background: {entry.color}"></span>
-					<span class="entry-channel">{entry.channel}</span>
-					<span class="entry-time">{formatTime(entry.masterStart)}</span>
+					<span class="entry-username">{entry.username}</span>
+					<span class="entry-time">{formatTime(entry.masterTime)}</span>
 				</div>
 				<p class="entry-text">{entry.text}</p>
 			</button>
@@ -166,8 +202,8 @@
 				{#if searchQuery}
 					<p>No matches for &ldquo;{searchQuery}&rdquo;</p>
 				{:else}
-					<p>No transcriptions yet</p>
-					<p class="empty-hint">Transcriptions appear as streams are captured</p>
+					<p>No chat messages nearby</p>
+					<p class="empty-hint">Chat messages appear around the playhead position</p>
 				{/if}
 			</div>
 		{/if}
@@ -175,7 +211,7 @@
 </div>
 
 <style>
-	.transcript-panel {
+	.chat-panel {
 		width: 340px;
 		flex-shrink: 0;
 		display: flex;
@@ -286,7 +322,7 @@
 		border: none;
 		border-bottom: 1px solid #111;
 		border-left: 2px solid transparent;
-		padding: 8px 12px;
+		padding: 6px 12px;
 		cursor: pointer;
 		transition: background 0.1s;
 		font-family: inherit;
@@ -305,7 +341,7 @@
 		display: flex;
 		align-items: center;
 		gap: 6px;
-		margin-bottom: 2px;
+		margin-bottom: 1px;
 	}
 
 	.color-dot {
@@ -315,10 +351,10 @@
 		flex-shrink: 0;
 	}
 
-	.entry-channel {
-		font-size: 0.65rem;
-		color: #888;
-		font-weight: 600;
+	.entry-username {
+		font-size: 0.7rem;
+		color: #a78bfa;
+		font-weight: 700;
 	}
 
 	.entry-time {
@@ -332,7 +368,7 @@
 	.entry-text {
 		font-size: 0.75rem;
 		color: #ccc;
-		line-height: 1.4;
+		line-height: 1.3;
 		margin: 0;
 		word-break: break-word;
 	}

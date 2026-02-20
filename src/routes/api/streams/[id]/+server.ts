@@ -1,6 +1,6 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types.js';
-import { getStream, removeStream, stopStream, updateStreamOffset, addClipRegion, removeClipRegion } from '$lib/server/streamManager.js';
+import { getStream, removeStream, stopStream, retranscribeStream, updateStreamOffset, addClipRegion, removeClipRegion } from '$lib/server/streamManager.js';
 
 /**
  * GET /api/streams/:id — Get info about a specific stream
@@ -33,6 +33,9 @@ export const PATCH: RequestHandler = async ({ params, request }) => {
 	}
 	if (body.stop === true) {
 		stopStream(params.id);
+	}
+	if (body.retranscribe === true) {
+		retranscribeStream(params.id);
 	}
 	const stream = getStream(params.id);
 	return json({ stream });

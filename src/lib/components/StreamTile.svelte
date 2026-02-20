@@ -8,7 +8,7 @@
 	import { get } from 'svelte/store';
 	import Hls from 'hls.js';
 	import type { StreamState } from '$lib/stores/streams.js';
-	import { syncOffsets, streamPlaybackStates, masterControl, masterPlaying, masterPlaybackRate, masterTime, transcriptions, stopStream } from '$lib/stores/streams.js';
+	import { syncOffsets, streamPlaybackStates, masterControl, masterPlaying, masterPlaybackRate, masterTime, transcriptions, stopStream, retranscribeStream } from '$lib/stores/streams.js';
 	import { createHlsConfig } from '$lib/utils.js';
 
 	let { stream, focused = false, trackNumber = 0 }: { stream: StreamState; focused?: boolean; trackNumber?: number } = $props();
@@ -31,12 +31,26 @@
 	let playlistUrl = $derived(`/hls/${stream.id}/playlist.m3u8`);
 	let offset = $derived($syncOffsets[stream.id] || 0);
 	let allCaptions = $derived($transcriptions[stream.id] || []);
-	// Show transcription that overlaps the current local playback time
-	let visibleCaption = $derived.by(() => {
-		if (allCaptions.length === 0) return '';
+	// Show current + previous transcription lines
+	let captionLines = $derived.by(() => {
+		if (allCaptions.length === 0) return { current: '', prev: '' };
 		const localTime = currentTime;
-		const match = allCaptions.find((c) => localTime >= c.startTime && localTime < c.endTime);
-		return match?.text || '';
+		const activeIdx = allCaptions.findIndex((c) => localTime >= c.startTime && localTime < c.endTime);
+		if (activeIdx !== -1) {
+			// Active caption exists — show it + the one before it
+			const current = allCaptions[activeIdx].text;
+			const prev = activeIdx > 0 ? allCaptions[activeIdx - 1].text : '';
+			return { current, prev };
+		}
+		// No active caption — find the most recent past caption and show last two
+		let lastIdx = -1;
+		for (let i = allCaptions.length - 1; i >= 0; i--) {
+			if (localTime >= allCaptions[i].endTime) { lastIdx = i; break; }
+		}
+		if (lastIdx === -1) return { current: '', prev: '' };
+		const current = allCaptions[lastIdx].text;
+		const prev = lastIdx > 0 ? allCaptions[lastIdx - 1].text : '';
+		return { current, prev };
 	});
 
 	// Sync playback rate from master
@@ -141,10 +155,8 @@
 			return;
 		}
 
-		hls = new Hls({
-			liveSyncDurationCount: 3,
-			...createHlsConfig()
-		});
+		const isLive = stream.status === 'capturing' || stream.status === 'starting';
+		hls = new Hls(createHlsConfig(isLive));
 
 		hls.loadSource(playlistUrl);
 		hls.attachMedia(videoEl);
@@ -240,9 +252,12 @@
 		</span>
 		{#if stream.status === 'capturing' && stream.sourceType === 'vod'}
 			<button class="btn-stop" onclick={() => stopStream(stream.id)} title="Stop downloading">Stop</button>
-		{:else if stream.status === 'starting' || stream.status === 'error' || stream.status === 'stopped'}
+		{:else if stream.status === 'stopped'}
+			<button class="btn-retranscribe" onclick={() => retranscribeStream(stream.id)} title="Re-transcribe entire recording">Re-transcribe</button>
+			<span class="status-badge">Stopped</span>
+		{:else if stream.status === 'starting' || stream.status === 'error'}
 			<span class="status-badge" class:error={stream.status === 'error'}>
-				{stream.status === 'starting' ? 'Starting...' : stream.status === 'error' ? 'Error' : 'Stopped'}
+				{stream.status === 'starting' ? 'Starting...' : 'Error'}
 			</span>
 		{/if}
 	</div>
@@ -263,9 +278,12 @@
 			</div>
 		{/if}
 
-		{#if visibleCaption}
+		{#if captionLines.current || captionLines.prev}
 			<div class="subtitles">
-				<p>{visibleCaption}</p>
+				{#if captionLines.prev}
+					<p class="sub-prev">{captionLines.prev}</p>
+				{/if}
+				<p class="sub-current">{captionLines.current}</p>
 			</div>
 		{/if}
 
@@ -423,6 +441,25 @@
 		color: #000;
 	}
 
+	.btn-retranscribe {
+		font-size: 0.65rem;
+		font-weight: 700;
+		padding: 2px 8px;
+		border-radius: 4px;
+		border: 1px solid #7c3aed;
+		background: transparent;
+		color: #7c3aed;
+		cursor: pointer;
+		text-transform: uppercase;
+		letter-spacing: 0.5px;
+		transition: background 0.15s, color 0.15s;
+	}
+
+	.btn-retranscribe:hover {
+		background: #7c3aed;
+		color: #fff;
+	}
+
 	.status-badge.error {
 		background: #dc2626;
 		color: white;
@@ -462,9 +499,14 @@
 		right: 8px;
 		text-align: center;
 		pointer-events: none;
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 2px;
 	}
 
 	.subtitles p {
+		margin: 0;
 		display: inline;
 		background: rgba(0, 0, 0, 0.75);
 		color: #fff;
@@ -474,6 +516,10 @@
 		border-radius: 3px;
 		-webkit-box-decoration-break: clone;
 		box-decoration-break: clone;
+	}
+
+	.sub-prev {
+		opacity: 0.45;
 	}
 
 	.spinner {

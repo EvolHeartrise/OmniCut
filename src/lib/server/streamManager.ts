@@ -1,9 +1,10 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { v4 as uuidv4 } from 'uuid';
-import { startCapture, fetchStreamMeta, type CaptureHandle } from './captureProcess.js';
-import { startTranscription, stopTranscription, shutdownTranscriber } from './transcriber.js';
+import { startCapture, fetchStreamMeta, fetchDouyuStreamMeta, fetchVodMeta, type CaptureHandle } from './captureProcess.js';
+import { startTranscription, stopTranscription, transcribeFullRecording, shutdownTranscriber } from './transcriber.js';
 import { startChatCollection } from './chatCollector.js';
+import { startVodChatFetch, extractVideoId } from './vodChatFetcher.js';
 import { exportVideo as exportVideoImpl } from './exporter.js';
 import type { StreamInfo, ClipRegion, SessionExport, ChatMessage } from './types.js';
 import * as db from './persistence.js';
@@ -166,7 +167,9 @@ function serializeStreamInfo(info: StreamInfo) {
 		gameName: info.gameName,
 		offset: info.offset,
 		sourceType: info.sourceType,
-		parentStreamId: info.parentStreamId
+		parentStreamId: info.parentStreamId,
+		platform: info.platform,
+		sourceUrl: info.sourceUrl
 	};
 }
 
@@ -177,17 +180,21 @@ function serializeStreamInfo(info: StreamInfo) {
  * Returns the stream info with an assigned ID.
  * Automatically spawns a VOD capture if the streamer has an ongoing archive.
  */
-export async function addStream(channel: string): Promise<StreamInfo> {
+export async function addStream(channel: string, language?: string | null, platform: 'twitch' | 'douyu' = 'twitch'): Promise<StreamInfo> {
 	// Check if we're already capturing this channel (live track only — allow VOD alongside)
 	for (const [, handle] of captures) {
 		if (
 			handle.info.channel.toLowerCase() === channel.toLowerCase() &&
+			handle.info.platform === platform &&
 			handle.info.sourceType === 'live' &&
 			handle.info.status !== 'stopped'
 		) {
 			throw new Error(`Already capturing channel: ${channel}`);
 		}
 	}
+
+	// Resolve transcription language: explicit arg > DB setting > null (auto-detect)
+	const transcriptionLanguage = language ?? db.getChannelSettings(channel)?.language ?? null;
 
 	const id = uuidv4();
 
@@ -205,49 +212,214 @@ export async function addStream(channel: string): Promise<StreamInfo> {
 			handle.transcriptionStarted = true;
 			startTranscription(id, info.recordingDir, (_streamId, text, startTime, endTime) => {
 				broadcastTranscription(id, text, startTime, endTime);
-			});
+			}, transcriptionLanguage);
 
-			// Start chat collection for live streams (guarded — only once per capture)
-			if (info.sourceType === 'live' && !handle.chatStarted) {
+			// Start chat collection for live streams (Twitch only — guarded)
+			if (info.sourceType === 'live' && platform === 'twitch' && !handle.chatStarted) {
 				handle.chatStarted = true;
 				handle.stopChat = startChatCollection(id, channel, info.startedAt, (_streamId, msg) => {
 					broadcastChatMessage(id, msg);
 				});
 			}
 		}
-	});
+	}, undefined, platform);
 
 	captures.set(id, handle);
 
 	// Persist initial stream state
 	db.saveStream(handle.info);
 
-	// Auto-spawn VOD capture if available
-	try {
-		const meta = await fetchStreamMeta(channel);
-		if (meta.vodId && meta.createdAt) {
-			const vodId = uuidv4();
-			const vodUrl = `https://twitch.tv/videos/${meta.vodId}`;
+	return handle.info;
+}
 
-			const vodHandle = startCapture(channel, vodId, RECORDINGS_DIR, (info) => {
-				broadcastUpdate(info);
-				db.saveStream(info);
-			}, vodUrl);
+/**
+ * Start capturing the VOD archive for a currently-live Twitch channel.
+ * Fetches stream metadata to find the VOD ID, then starts a VOD capture.
+ */
+export async function addVodStream(channel: string, language?: string | null): Promise<StreamInfo> {
+	const transcriptionLanguage = language ?? db.getChannelSettings(channel)?.language ?? null;
 
-			vodHandle.info.startedAt = Date.parse(meta.createdAt);
-			vodHandle.info.parentStreamId = id;
-			captures.set(vodId, vodHandle);
-
-			// Persist VOD stream
-			db.saveStream(vodHandle.info);
-
-			console.log(`[vod:${channel}] Auto-spawned VOD capture (video ${meta.vodId}), startedAt=${meta.createdAt}`);
-		}
-	} catch (err) {
-		console.error(`[vod:${channel}] Failed to check/spawn VOD capture:`, err);
+	const meta = await fetchStreamMeta(channel);
+	if (!meta.vodId || !meta.createdAt) {
+		throw new Error(`No VOD available for channel: ${channel}`);
 	}
 
-	return handle.info;
+	const vodUrl = `https://twitch.tv/videos/${meta.vodId}`;
+
+	// Check if this VOD is already added (by source URL or active channel capture)
+	for (const [, handle] of captures) {
+		if (handle.info.sourceUrl === vodUrl) {
+			throw new Error(`VOD already added: ${vodUrl}`);
+		}
+		if (
+			handle.info.channel.toLowerCase() === channel.toLowerCase() &&
+			handle.info.sourceType === 'vod' &&
+			handle.info.status !== 'stopped'
+		) {
+			throw new Error(`Already capturing VOD for channel: ${channel}`);
+		}
+	}
+
+	const vodId = uuidv4();
+
+	fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
+
+	const vodHandle = startCapture(channel, vodId, RECORDINGS_DIR, (info) => {
+		broadcastUpdate(info);
+		db.saveStream(info);
+
+		if (info.status === 'capturing' && !vodHandle.transcriptionStarted) {
+			vodHandle.transcriptionStarted = true;
+			startTranscription(vodId, info.recordingDir, (_streamId, text, startTime, endTime) => {
+				broadcastTranscription(vodId, text, startTime, endTime);
+			}, transcriptionLanguage);
+
+			// Start VOD chat download (guarded — only once per capture)
+			if (!vodHandle.chatStarted) {
+				vodHandle.chatStarted = true;
+				const twitchVideoId = extractVideoId(vodUrl);
+				if (twitchVideoId) {
+					vodHandle.stopChat = startVodChatFetch(vodId, twitchVideoId, (_sid, msg) => {
+						broadcastChatMessage(vodId, msg);
+					});
+				}
+			}
+		}
+	}, vodUrl);
+
+	vodHandle.info.startedAt = Date.parse(meta.createdAt);
+
+	// Link to the live capture if one exists
+	for (const [id, handle] of captures) {
+		if (
+			handle.info.channel.toLowerCase() === channel.toLowerCase() &&
+			handle.info.sourceType === 'live'
+		) {
+			vodHandle.info.parentStreamId = id;
+			break;
+		}
+	}
+
+	captures.set(vodId, vodHandle);
+	db.saveStream(vodHandle.info);
+
+	console.log(`[vod:${channel}] Started VOD capture (video ${meta.vodId}), startedAt=${meta.createdAt}`);
+
+	return vodHandle.info;
+}
+
+/**
+ * Start capturing a Twitch VOD by its URL (e.g. https://twitch.tv/videos/12345).
+ * Fetches VOD metadata to determine the channel and start time.
+ */
+export async function addVodByUrl(vodUrl: string, language?: string | null): Promise<StreamInfo> {
+	// Detect platform from URL
+	const isDouyu = /douyu\.com/.test(vodUrl);
+	const platform: 'twitch' | 'douyu' = isDouyu ? 'douyu' : 'twitch';
+
+	// Normalize the source URL for dedup: extract canonical form
+	let canonicalUrl: string;
+	if (isDouyu) {
+		const douyuMatch = vodUrl.match(/douyu\.com\/(\d+)/);
+		canonicalUrl = douyuMatch ? `https://douyu.com/${douyuMatch[1]}` : vodUrl.trim();
+	} else {
+		const twitchMatch = vodUrl.match(/(?:twitch\.tv\/videos\/|^)(\d+)/);
+		canonicalUrl = twitchMatch ? `https://twitch.tv/videos/${twitchMatch[1]}` : vodUrl.trim();
+	}
+
+	// Check for duplicate VOD by source URL
+	for (const [, handle] of captures) {
+		if (handle.info.sourceUrl === canonicalUrl) {
+			throw new Error(`VOD already added: ${canonicalUrl}`);
+		}
+	}
+
+	if (isDouyu) {
+		// Douyu VOD URL — extract room ID, capture via yt-dlp
+		const douyuMatch = vodUrl.match(/douyu\.com\/(\d+)/);
+		if (!douyuMatch) {
+			throw new Error('Invalid Douyu URL — expected douyu.com/<roomId>');
+		}
+		const roomId = douyuMatch[1];
+		const transcriptionLanguage = language ?? db.getChannelSettings(roomId)?.language ?? null;
+
+		const id = uuidv4();
+		fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
+
+		const vodHandle = startCapture(roomId, id, RECORDINGS_DIR, (info) => {
+			broadcastUpdate(info);
+			db.saveStream(info);
+
+			// Full-file transcription once VOD download completes
+			if (info.status === 'stopped' && !vodHandle.transcriptionStarted) {
+				vodHandle.transcriptionStarted = true;
+				transcribeFullRecording(id, info.recordingDir, (_streamId, text, startTime, endTime) => {
+					broadcastTranscription(id, text, startTime, endTime);
+				}, transcriptionLanguage);
+			}
+		}, vodUrl, 'douyu');
+
+		captures.set(id, vodHandle);
+		db.saveStream(vodHandle.info);
+
+		console.log(`[vod:douyu:${roomId}] Started Douyu VOD capture`);
+		return vodHandle.info;
+	}
+
+	// Twitch VOD
+	const match = vodUrl.match(/(?:twitch\.tv\/videos\/|^)(\d+)/);
+	if (!match) {
+		throw new Error('Invalid VOD URL — expected twitch.tv/videos/<id>');
+	}
+	const videoId = match[1];
+
+	const meta = await fetchVodMeta(videoId);
+	if (!meta.channel) {
+		throw new Error(`VOD not found: ${videoId}`);
+	}
+
+	const channel = meta.channel;
+	const transcriptionLanguage = language ?? db.getChannelSettings(channel)?.language ?? null;
+
+	const id = uuidv4();
+	const fullVodUrl = `https://twitch.tv/videos/${videoId}`;
+
+	fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
+
+	const vodHandle = startCapture(channel, id, RECORDINGS_DIR, (info) => {
+		broadcastUpdate(info);
+		db.saveStream(info);
+
+		if (info.status === 'capturing') {
+			// Start VOD chat download (guarded — only once per capture)
+			if (!vodHandle.chatStarted) {
+				vodHandle.chatStarted = true;
+				vodHandle.stopChat = startVodChatFetch(id, videoId, (_sid, msg) => {
+					broadcastChatMessage(id, msg);
+				});
+			}
+		}
+
+		// Full-file transcription once VOD download completes
+		if (info.status === 'stopped' && !vodHandle.transcriptionStarted) {
+			vodHandle.transcriptionStarted = true;
+			transcribeFullRecording(id, info.recordingDir, (_streamId, text, startTime, endTime) => {
+				broadcastTranscription(id, text, startTime, endTime);
+			}, transcriptionLanguage);
+		}
+	}, fullVodUrl, 'twitch');
+
+	if (meta.createdAt) {
+		vodHandle.info.startedAt = Date.parse(meta.createdAt);
+	}
+	vodHandle.info.streamTitle = meta.title;
+
+	captures.set(id, vodHandle);
+	db.saveStream(vodHandle.info);
+
+	console.log(`[vod:${channel}] Started VOD capture by URL (video ${videoId}), title=${meta.title}`);
+
+	return vodHandle.info;
 }
 
 /**
@@ -268,6 +440,31 @@ export function stopStream(id: string): boolean {
 }
 
 /**
+ * Re-transcribe a stopped stream using full-file transcription.
+ * Clears existing transcriptions and starts fresh.
+ */
+export function retranscribeStream(id: string): boolean {
+	const handle = captures.get(id);
+	if (!handle) return false;
+	if (handle.info.status !== 'stopped') return false;
+
+	// Clear existing transcriptions
+	streamTranscriptions.delete(id);
+	db.deleteTranscriptions(id);
+	broadcast(JSON.stringify({ type: 'transcription-cleared', streamId: id }));
+
+	// Resolve language
+	const language = db.getChannelSettings(handle.info.channel)?.language ?? null;
+
+	// Fire-and-forget full transcription
+	transcribeFullRecording(id, handle.info.recordingDir, (_streamId, text, startTime, endTime) => {
+		broadcastTranscription(id, text, startTime, endTime);
+	}, language);
+
+	return true;
+}
+
+/**
  * Remove a stream entirely by ID.
  */
 export function removeStream(id: string): boolean {
@@ -276,6 +473,7 @@ export function removeStream(id: string): boolean {
 
 	stopTranscription(id);
 	handle.stopChat?.();
+	handle.transcriptionStarted = true; // prevent full transcription from firing on kill
 	handle.kill();
 	captures.delete(id);
 
@@ -386,6 +584,13 @@ export function getChatMessages(id: string): ChatMessage[] {
 }
 
 /**
+ * Get chat messages for a stream within a time range (stream-local seconds).
+ */
+export function getChatMessagesInRange(id: string, fromTime: number, toTime: number): ChatMessage[] {
+	return db.loadChatMessagesInRange(id, fromTime, toTime);
+}
+
+/**
  * Get the recording directory path for a stream.
  */
 export function getStreamRecordingDir(id: string): string | null {
@@ -412,7 +617,8 @@ export function exportSession(): SessionExport {
 			recordingDir: path.relative(RECORDINGS_DIR, info.recordingDir),
 			offset: info.offset,
 			sourceType: info.sourceType,
-			parentStreamId: info.parentStreamId
+			parentStreamId: info.parentStreamId,
+			platform: info.platform
 		});
 	}
 
@@ -445,6 +651,7 @@ export function clearSession(): void {
 	for (const [id, handle] of captures) {
 		stopTranscription(id);
 		handle.stopChat?.();
+		handle.transcriptionStarted = true; // prevent full transcription from firing on kill
 		handle.kill();
 	}
 	captures.clear();
@@ -513,7 +720,9 @@ export function importSession(data: SessionExport): { imported: number; errors: 
 			recordingDir,
 			offset: stream.offset,
 			sourceType: stream.sourceType,
-			parentStreamId: stream.parentStreamId
+			parentStreamId: stream.parentStreamId,
+			platform: (stream as any).platform || 'twitch',
+			sourceUrl: (stream as any).sourceUrl || null
 		};
 
 		// Create stub CaptureHandle (no process, just data)

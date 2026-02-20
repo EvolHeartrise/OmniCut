@@ -17,6 +17,8 @@ export interface StreamState {
 	offset: number;
 	sourceType: 'live' | 'vod';
 	parentStreamId: string | null;
+	platform: 'twitch' | 'douyu';
+	sourceUrl?: string | null;
 }
 
 export type AppMode = 'sources' | 'clipping' | 'cleaning' | 'export';
@@ -85,6 +87,9 @@ export const masterControl = writable<{
 // Transcript panel toggle state (visible in clipping mode)
 export const transcriptPanelOpen = writable(false);
 
+// Chat panel toggle state (visible in clipping mode)
+export const chatPanelOpen = writable(false);
+
 // External seek request: allows components outside NLETimeline to request a playhead seek.
 // NLETimeline watches the seq and updates its internal masterCurrentTimeState accordingly.
 export const seekRequest = writable<{ time: number; seq: number }>({ time: 0, seq: 0 });
@@ -133,19 +138,6 @@ export async function refreshStreams() {
 			});
 		}
 
-		// Restore chat messages from server
-		if (data.chatMessages) {
-			chatMessages.update((current) => {
-				const merged = { ...current };
-				for (const [streamId, msgs] of Object.entries(data.chatMessages as Record<string, ChatMessageEntry[]>)) {
-					const existing = merged[streamId] || [];
-					if (msgs.length > existing.length) {
-						merged[streamId] = msgs;
-					}
-				}
-				return merged;
-			});
-		}
 	} catch (err) {
 		console.error('Failed to refresh streams:', err);
 	}
@@ -154,12 +146,17 @@ export async function refreshStreams() {
 /**
  * Add a new stream by channel name.
  */
-export async function addStream(channel: string): Promise<StreamState | null> {
+export async function addStream(channel: string, opts?: { language?: string | null; vod?: boolean; vodUrl?: string; platform?: 'twitch' | 'douyu' }): Promise<StreamState | null> {
 	try {
+		const body: Record<string, unknown> = { channel };
+		if (opts?.language) body.language = opts.language;
+		if (opts?.vod) body.vod = true;
+		if (opts?.vodUrl) body.vodUrl = opts.vodUrl;
+		if (opts?.platform) body.platform = opts.platform;
 		const res = await fetch('/api/streams', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ channel })
+			body: JSON.stringify(body)
 		});
 		const data = await res.json();
 		if (!res.ok) {
@@ -186,6 +183,21 @@ export async function stopStream(id: string): Promise<void> {
 		await refreshStreams();
 	} catch (err) {
 		console.error('Failed to stop stream:', err);
+	}
+}
+
+/**
+ * Re-transcribe a stopped stream using full-file transcription.
+ */
+export async function retranscribeStream(id: string): Promise<void> {
+	try {
+		await fetch(`/api/streams/${id}`, {
+			method: 'PATCH',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ retranscribe: true })
+		});
+	} catch (err) {
+		console.error('Failed to retranscribe stream:', err);
 	}
 }
 
@@ -345,6 +357,11 @@ export function connectSSE(): () => void {
 							{ text: data.text, startTime: data.startTime, endTime: data.endTime }
 						]
 					};
+				});
+			} else if (data.type === 'transcription-cleared') {
+				transcriptions.update((current) => {
+					const { [data.streamId]: _, ...rest } = current;
+					return rest;
 				});
 			} else if (data.type === 'chat-message') {
 				chatMessages.update((current) => {

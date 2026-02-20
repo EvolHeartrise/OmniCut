@@ -1,9 +1,103 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as crypto from 'node:crypto';
 import type { StreamInfo, CaptureHandle, StreamMeta } from './types.js';
 import { TWITCH_CLIENT_ID } from './twitchApi.js';
 
 export type { CaptureHandle };
+
+// --- Douyu stream URL resolver ---
+// Douyu requires a signed request to get the stream URL. The signing function
+// is obfuscated JS that wraps CryptoJS MD5. We fetch it from their API and
+// evaluate it in Bun's JS runtime to produce the signature.
+
+let _cryptoJsMd5Cache: string | null = null;
+
+async function getCryptoJsMd5(): Promise<string> {
+	if (_cryptoJsMd5Cache) return _cryptoJsMd5Cache;
+	const res = await fetch('https://cdnjs.cloudflare.com/ajax/libs/crypto-js/3.1.2/rollups/md5.js');
+	_cryptoJsMd5Cache = await res.text();
+	return _cryptoJsMd5Cache;
+}
+
+async function getDouyuSignParams(roomId: string): Promise<Record<string, string>> {
+	// Fetch the signing JS function for this room
+	const encRes = await fetch(`https://www.douyu.com/swf_api/homeH5Enc?rids=${roomId}`);
+	const encData = await encRes.json();
+	const signFunc: string = encData?.data?.[`room${roomId}`];
+	if (!signFunc) {
+		throw new Error(`Failed to get Douyu signing function for room ${roomId}`);
+	}
+
+	const cryptoJs = await getCryptoJsMd5();
+	const uuid = crypto.randomUUID().replace(/-/g, '');
+	const ts = Math.floor(Date.now() / 1000);
+
+	// Write script to temp file and execute in subprocess for isolation
+	// (script is ~60KB — too large for a command-line argument)
+	const tmpPath = path.join(os.tmpdir(), `douyu-sign-${Date.now()}.js`);
+	const script = `${cryptoJs};${signFunc};process.stdout.write(ub98484234("${roomId}","${uuid}","${ts}"))`;
+	fs.writeFileSync(tmpPath, script);
+
+	const proc = Bun.spawn(['bun', tmpPath], {
+		stdout: 'pipe',
+		stderr: 'pipe'
+	});
+	const output = await new Response(proc.stdout).text();
+	await proc.exited;
+
+	try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
+
+	// Parse the query string result into key-value pairs
+	const params: Record<string, string> = {};
+	for (const part of output.split('&')) {
+		const [k, v] = part.split('=');
+		if (k && v) params[decodeURIComponent(k)] = decodeURIComponent(v);
+	}
+	return params;
+}
+
+/**
+ * Resolve a Douyu live stream to a direct FLV/HLS URL.
+ * Returns the best quality stream URL or throws if unavailable.
+ */
+export async function resolveDouyuStreamUrl(roomId: string): Promise<string> {
+	const signParams = await getDouyuSignParams(roomId);
+
+	const body = new URLSearchParams({ rate: '0', ...signParams }).toString();
+	const res = await fetch(`https://www.douyu.com/lapi/live/getH5Play/${roomId}`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+		body
+	});
+	const data = await res.json();
+	const streamData = data?.data;
+	if (!streamData?.rtmp_url || !streamData?.rtmp_live) {
+		throw new Error(`Douyu room ${roomId} is not live or stream URL unavailable`);
+	}
+	return `${streamData.rtmp_url}/${streamData.rtmp_live}`;
+}
+
+export async function fetchDouyuStreamMeta(roomId: string): Promise<StreamMeta> {
+	try {
+		const res = await fetch(`https://open.douyucdn.cn/api/RoomApi/room/${roomId}`);
+		const data = await res.json();
+		const room = data?.data;
+		if (!room) {
+			return { viewerCount: null, title: null, gameName: null, createdAt: null, vodId: null };
+		}
+		return {
+			viewerCount: room.online ?? null,
+			title: room.room_name ?? null,
+			gameName: room.cate_name ?? null,
+			createdAt: room.start_time ? new Date(room.start_time + '+08:00').toISOString() : null,
+			vodId: null
+		};
+	} catch {
+		return { viewerCount: null, title: null, gameName: null, createdAt: null, vodId: null };
+	}
+}
 
 export async function fetchStreamMeta(channel: string): Promise<StreamMeta> {
 	try {
@@ -32,18 +126,55 @@ export async function fetchStreamMeta(channel: string): Promise<StreamMeta> {
 	}
 }
 
+export interface VodMeta {
+	channel: string;
+	title: string | null;
+	createdAt: string | null;
+	durationSeconds: number | null;
+}
+
+export async function fetchVodMeta(vodId: string): Promise<VodMeta> {
+	try {
+		const res = await fetch('https://gql.twitch.tv/gql', {
+			method: 'POST',
+			headers: {
+				'Client-ID': TWITCH_CLIENT_ID,
+				'Content-Type': 'application/json'
+			},
+			body: JSON.stringify({
+				query: 'query($id: ID!) { video(id: $id) { owner { login } title createdAt lengthSeconds } }',
+				variables: { id: vodId }
+			})
+		});
+		const data = await res.json();
+		const video = data?.data?.video;
+		if (!video) {
+			return { channel: '', title: null, createdAt: null, durationSeconds: null };
+		}
+		return {
+			channel: video.owner?.login ?? '',
+			title: video.title ?? null,
+			createdAt: video.createdAt ?? null,
+			durationSeconds: video.lengthSeconds ?? null
+		};
+	} catch {
+		return { channel: '', title: null, createdAt: null, durationSeconds: null };
+	}
+}
+
 /**
- * Starts capturing a Twitch stream via streamlink piped into FFmpeg,
- * outputting HLS segments to the given recording directory.
+ * Starts capturing a stream, outputting HLS segments to the given recording directory.
  *
- * Pipeline: streamlink (stdout) -> FFmpeg (stdin) -> HLS segments on disk
+ * Twitch pipeline:  streamlink (stdout) -> FFmpeg (stdin) -> HLS segments
+ * Douyu pipeline:   resolve stream URL -> FFmpeg (direct input) -> HLS segments
  */
 export function startCapture(
 	channel: string,
 	id: string,
 	recordingsBase: string,
 	onStatusChange: (info: StreamInfo) => void,
-	vodUrl?: string
+	vodUrl?: string,
+	platform: 'twitch' | 'douyu' = 'twitch'
 ): CaptureHandle {
 	const recordingDir = path.join(recordingsBase, id);
 	fs.mkdirSync(recordingDir, { recursive: true });
@@ -66,78 +197,16 @@ export function startCapture(
 		recordingDir,
 		offset: 0,
 		sourceType: isVod ? 'vod' : 'live',
-		parentStreamId: null
+		parentStreamId: null,
+		platform,
+		sourceUrl: vodUrl || null
 	};
 
-	// Start streamlink to get the raw stream data
-	const twitchUrl = vodUrl || `https://twitch.tv/${channel}`;
-	const streamlinkArgs = [twitchUrl, 'best', '--stdout'];
+	// Processes to track (populated differently per platform)
+	let sourceProc: ReturnType<typeof Bun.spawn> | null = null;
+	let ffmpegProc: ReturnType<typeof Bun.spawn> | null = null;
 
-	const twitchToken = process.env.TWITCH_OAUTH_TOKEN;
-	if (twitchToken) {
-		streamlinkArgs.push(`--twitch-api-header=Authorization=OAuth ${twitchToken}`);
-	}
-
-	const streamlinkProc = Bun.spawn(['streamlink', ...streamlinkArgs], {
-		stdin: 'ignore',
-		stdout: 'pipe',
-		stderr: 'pipe'
-	});
-
-	// Log streamlink stderr asynchronously
-	(async () => {
-		const reader = streamlinkProc.stderr.getReader();
-		const decoder = new TextDecoder();
-		try {
-			while (true) {
-				const { done, value } = await reader.read();
-				if (done) break;
-				const msg = decoder.decode(value);
-				if (msg.includes('error') || msg.includes('Error')) {
-					console.error(`[streamlink:${channel}] ${msg.trim()}`);
-				}
-			}
-		} catch { /* stream closed */ }
-	})();
-
-	// Start FFmpeg to receive streamlink's stdout and output HLS
-	const ffmpegProc = Bun.spawn(
-		[
-			'ffmpeg',
-			'-i', 'pipe:0',
-			'-c:v', 'copy',
-			'-c:a', 'copy',
-			'-f', 'hls',
-			'-hls_time', '2',
-			'-hls_list_size', '0',
-			'-hls_flags', 'append_list+independent_segments',
-			'-hls_segment_filename', segmentPattern,
-			playlistPath
-		],
-		{
-			stdin: streamlinkProc.stdout,
-			stdout: 'pipe',
-			stderr: 'pipe'
-		}
-	);
-
-	// Log ffmpeg stderr
-	(async () => {
-		const reader = ffmpegProc.stderr.getReader();
-		const decoder = new TextDecoder();
-		try {
-			while (true) {
-				const { done, value } = await reader.read();
-				if (done) break;
-				const msg = decoder.decode(value);
-				if (msg.includes('Error') || msg.includes('error')) {
-					console.error(`[ffmpeg:${channel}] ${msg.trim()}`);
-				}
-			}
-		} catch { /* stream closed */ }
-	})();
-
-	// Update status asynchronously once FFmpeg starts producing segments
+	// Common setup: segment watcher, metadata polling, kill function
 	const segmentWatchInterval = setInterval(async () => {
 		try {
 			const allFiles = await fs.promises.readdir(recordingDir);
@@ -163,60 +232,144 @@ export function startCapture(
 		}
 	}, 1000);
 
-	// Poll stream metadata every 30 seconds (skip for VODs — no live viewer count)
+	const fetchMeta = platform === 'douyu' ? fetchDouyuStreamMeta : fetchStreamMeta;
 	let streamMetaInterval: ReturnType<typeof setInterval> | null = null;
 	if (!isVod) {
 		streamMetaInterval = setInterval(async () => {
 			if (info.status === 'capturing') {
-				const meta = await fetchStreamMeta(channel);
+				const meta = await fetchMeta(channel);
 				info.viewerCount = meta.viewerCount;
 				info.streamTitle = meta.title;
 				info.gameName = meta.gameName;
 			}
 		}, 30000);
-		fetchStreamMeta(channel).then((meta) => {
+		fetchMeta(channel).then((meta) => {
 			info.viewerCount = meta.viewerCount;
 			info.streamTitle = meta.title;
 			info.gameName = meta.gameName;
 		});
 	}
 
-	// Handle process exits
-	streamlinkProc.exited.then((code) => {
-		console.log(`[streamlink:${channel}] exited with code ${code}`);
-		if (info.status !== 'stopped') {
-			info.status = code === 0 ? 'stopped' : 'error';
-			info.error = code !== 0 ? `streamlink exited with code ${code}` : undefined;
-			onStatusChange(info);
-		}
-	});
-
-	ffmpegProc.exited.then((code) => {
-		console.log(`[ffmpeg:${channel}] exited with code ${code}`);
-		if (info.status !== 'stopped') {
-			info.status = 'stopped';
-			onStatusChange(info);
-		}
-	});
-
-	onStatusChange(info);
-
 	const kill = () => {
 		info.status = 'stopped';
 		if (segmentWatchInterval) clearInterval(segmentWatchInterval);
 		if (streamMetaInterval) clearInterval(streamMetaInterval);
-		try {
-			streamlinkProc.kill();
-		} catch {
-			/* already dead */
-		}
-		try {
-			ffmpegProc.kill();
-		} catch {
-			/* already dead */
-		}
+		try { sourceProc?.kill(); } catch { /* already dead */ }
+		try { ffmpegProc?.kill(); } catch { /* already dead */ }
 		onStatusChange(info);
 	};
+
+	function logStderr(proc: ReturnType<typeof Bun.spawn>, label: string) {
+		(async () => {
+			const reader = (proc.stderr as ReadableStream<Uint8Array>).getReader();
+			const decoder = new TextDecoder();
+			try {
+				while (true) {
+					const { done, value } = await reader.read();
+					if (done) break;
+					const msg = decoder.decode(value);
+					if (msg.includes('error') || msg.includes('Error')) {
+						console.error(`[${label}:${channel}] ${msg.trim()}`);
+					}
+				}
+			} catch { /* stream closed */ }
+		})();
+	}
+
+	if (platform === 'douyu') {
+		// Douyu: resolve stream URL asynchronously, then start FFmpeg with direct input
+		(async () => {
+			try {
+				const streamUrl = await resolveDouyuStreamUrl(channel);
+				console.log(`[douyu:${channel}] Resolved stream URL`);
+
+				ffmpegProc = Bun.spawn(
+					[
+						'ffmpeg',
+						'-i', streamUrl,
+						'-c:v', 'copy',
+						'-c:a', 'copy',
+						'-f', 'hls',
+						'-hls_time', '2',
+						'-hls_list_size', '0',
+						'-hls_flags', 'append_list+independent_segments',
+						'-hls_segment_filename', segmentPattern,
+						playlistPath
+					],
+					{ stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' }
+				);
+
+				logStderr(ffmpegProc, 'ffmpeg');
+
+				ffmpegProc.exited.then((code) => {
+					console.log(`[ffmpeg:${channel}] exited with code ${code}`);
+					if (info.status !== 'stopped') {
+						info.status = 'stopped';
+						onStatusChange(info);
+					}
+				});
+			} catch (err) {
+				console.error(`[douyu:${channel}] Failed to resolve stream:`, err);
+				info.status = 'error';
+				info.error = err instanceof Error ? err.message : 'Failed to resolve Douyu stream';
+				onStatusChange(info);
+			}
+		})();
+	} else {
+		// Twitch: streamlink stdout piped into FFmpeg stdin
+		const twitchUrl = vodUrl || `https://twitch.tv/${channel}`;
+		const streamlinkArgs = [twitchUrl, 'best', '--stdout'];
+
+		const twitchToken = process.env.TWITCH_OAUTH_TOKEN;
+		if (twitchToken) {
+			streamlinkArgs.push(`--twitch-api-header=Authorization=OAuth ${twitchToken}`);
+		}
+
+		sourceProc = Bun.spawn(['streamlink', ...streamlinkArgs], {
+			stdin: 'ignore',
+			stdout: 'pipe',
+			stderr: 'pipe'
+		});
+
+		logStderr(sourceProc, 'streamlink');
+
+		ffmpegProc = Bun.spawn(
+			[
+				'ffmpeg',
+				'-i', 'pipe:0',
+				'-c:v', 'copy',
+				'-c:a', 'copy',
+				'-f', 'hls',
+				'-hls_time', '2',
+				'-hls_list_size', '0',
+				'-hls_flags', 'append_list+independent_segments',
+				'-hls_segment_filename', segmentPattern,
+				playlistPath
+			],
+			{ stdin: sourceProc.stdout, stdout: 'pipe', stderr: 'pipe' }
+		);
+
+		logStderr(ffmpegProc, 'ffmpeg');
+
+		sourceProc.exited.then((code) => {
+			console.log(`[streamlink:${channel}] exited with code ${code}`);
+			if (info.status !== 'stopped') {
+				info.status = code === 0 ? 'stopped' : 'error';
+				info.error = code !== 0 ? `streamlink exited with code ${code}` : undefined;
+				onStatusChange(info);
+			}
+		});
+
+		ffmpegProc.exited.then((code) => {
+			console.log(`[ffmpeg:${channel}] exited with code ${code}`);
+			if (info.status !== 'stopped') {
+				info.status = 'stopped';
+				onStatusChange(info);
+			}
+		});
+	}
+
+	onStatusChange(info);
 
 	return { info, kill, segmentWatchInterval };
 }

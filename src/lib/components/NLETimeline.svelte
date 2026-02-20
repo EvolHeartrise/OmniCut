@@ -68,35 +68,63 @@
 	let ignoreScrollEvents = false;
 	let lastFrameTime = 0;
 
+	// Track key: live streams get their own row, VODs from same channel share a row
+	function trackKeyFor(stream: { id: string; sourceType: string; platform: string; channel: string }): string {
+		if (stream.sourceType === 'live') return stream.id;
+		return `vod:${stream.platform}:${stream.channel}`;
+	}
+
 	// Stable track ordering: preserve insertion order
 	let trackOrder = $state<string[]>([]);
 
 	$effect.pre(() => {
-		const currentIds = $streams.map((s) => s.id);
+		const currentKeys = [...new Set($streams.map(trackKeyFor))];
 		const prevOrder = untrack(() => trackOrder);
-		const updated = prevOrder.filter((id) => currentIds.includes(id));
-		for (const id of currentIds) {
-			if (!updated.includes(id)) updated.push(id);
+		const updated = prevOrder.filter((key) => currentKeys.includes(key));
+		for (const key of currentKeys) {
+			if (!updated.includes(key)) updated.push(key);
 		}
 		trackOrder = updated;
 	});
 
-	// Derive per-track data from stores
+	// Map each track key to its constituent streams
+	let trackStreamsMap = $derived.by(() => {
+		const map = new Map<string, typeof $streams>();
+		for (const stream of $streams) {
+			const key = trackKeyFor(stream);
+			const list = map.get(key) || [];
+			list.push(stream);
+			map.set(key, list);
+		}
+		return map;
+	});
+
+	// Derive per-track data from stores — each track has an array of bars
 	let tracksData = $derived(
-		trackOrder.map((id, i) => {
-			const stream = $streams.find((s) => s.id === id);
-			const playback = $streamPlaybackStates[id];
-			const offset = $syncOffsets[id] || 0;
+		trackOrder.map((key, i) => {
+			const trackStreams = trackStreamsMap.get(key) || [];
+			const channel = trackStreams[0]?.channel || key;
+			const bars = trackStreams.map((stream) => {
+				const playback = $streamPlaybackStates[stream.id];
+				const offset = $syncOffsets[stream.id] || 0;
+				return {
+					streamId: stream.id,
+					channel: stream.channel,
+					sourceType: stream.sourceType,
+					offset,
+					anchor: (stream.startedAt || Date.now()) / 1000,
+					duration: playback?.duration || 0,
+					currentTime: playback?.currentTime || 0,
+					paused: playback?.paused ?? true
+				};
+			});
 			return {
-				id,
-				channel: stream?.channel || id,
-				sourceType: stream?.sourceType || 'live',
+				key,
+				channel,
 				color: COLORS[i % COLORS.length],
-				offset,
-				anchor: (stream?.startedAt || Date.now()) / 1000,
-				duration: playback?.duration || 0,
-				currentTime: playback?.currentTime || 0,
-				paused: playback?.paused ?? true
+				streamIds: trackStreams.map((s) => s.id),
+				bars,
+				isGrouped: trackStreams.length > 1 && trackStreams[0]?.sourceType === 'vod'
 			};
 		})
 	);
@@ -109,35 +137,37 @@
 		const result: Record<string, Array<{ startTime: number; count: number; intensity: number }>> = {};
 
 		for (const track of tracksData) {
-			const messages = allChat[track.id];
-			if (!messages || messages.length === 0) continue;
+			for (const bar of track.bars) {
+				const messages = allChat[bar.streamId];
+				if (!messages || messages.length === 0) continue;
 
-			// Bucket messages into CHAT_BUCKET_SECONDS intervals (in master/epoch time)
-			const buckets = new Map<number, number>();
-			for (const msg of messages) {
-				// Convert stream-local time to master time for positioning
-				const msgMasterTime = msg.timestamp + track.anchor - track.offset;
-				const bucketKey = Math.floor(msgMasterTime / CHAT_BUCKET_SECONDS) * CHAT_BUCKET_SECONDS;
-				buckets.set(bucketKey, (buckets.get(bucketKey) || 0) + 1);
-			}
+				// Bucket messages into CHAT_BUCKET_SECONDS intervals (in master/epoch time)
+				const buckets = new Map<number, number>();
+				for (const msg of messages) {
+					// Convert stream-local time to master time for positioning
+					const msgMasterTime = msg.timestamp + bar.anchor - bar.offset;
+					const bucketKey = Math.floor(msgMasterTime / CHAT_BUCKET_SECONDS) * CHAT_BUCKET_SECONDS;
+					buckets.set(bucketKey, (buckets.get(bucketKey) || 0) + 1);
+				}
 
-			// Find max for normalization
-			let maxCount = 0;
-			for (const count of buckets.values()) {
-				if (count > maxCount) maxCount = count;
-			}
+				// Find max for normalization
+				let maxCount = 0;
+				for (const count of buckets.values()) {
+					if (count > maxCount) maxCount = count;
+				}
 
-			// Build sorted array with normalized intensity (0-1)
-			const sorted: Array<{ startTime: number; count: number; intensity: number }> = [];
-			for (const [time, count] of buckets) {
-				sorted.push({
-					startTime: time,
-					count,
-					intensity: maxCount > 0 ? count / maxCount : 0
-				});
+				// Build sorted array with normalized intensity (0-1)
+				const sorted: Array<{ startTime: number; count: number; intensity: number }> = [];
+				for (const [time, count] of buckets) {
+					sorted.push({
+						startTime: time,
+						count,
+						intensity: maxCount > 0 ? count / maxCount : 0
+					});
+				}
+				sorted.sort((a, b) => a.startTime - b.startTime);
+				result[bar.streamId] = sorted;
 			}
-			sorted.sort((a, b) => a.startTime - b.startTime);
-			result[track.id] = sorted;
 		}
 
 		return result;
@@ -178,13 +208,13 @@
 		frozenTimelineStart !== null
 			? frozenTimelineStart
 			: tracksData.length > 0
-				? Math.min(...tracksData.map((t) => t.anchor - t.offset))
+				? Math.min(...tracksData.flatMap((t) => t.bars.map((b) => b.anchor - b.offset)))
 				: Date.now() / 1000
 	);
 
 	let timelineEnd = $derived(
 		tracksData.length > 0
-			? Math.max(...tracksData.map((t) => t.anchor + t.duration - t.offset))
+			? Math.max(...tracksData.flatMap((t) => t.bars.map((b) => b.anchor + b.duration - b.offset)))
 			: Date.now() / 1000 + 60
 	);
 
@@ -310,7 +340,7 @@
 		// Freeze timeline origin and master time to prevent jitter while dragging
 		frozenTimelineStart =
 			tracksData.length > 0
-				? Math.min(...tracksData.map((t) => t.anchor - t.offset))
+				? Math.min(...tracksData.flatMap((t) => t.bars.map((b) => b.anchor - b.offset)))
 				: Date.now() / 1000;
 		frozenMasterTime = masterCurrentTime;
 		window.addEventListener('mousemove', handleTrackMouseMove);
@@ -650,8 +680,17 @@
 				{#each tracksData as track}
 					<div class="label-row">
 						<span class="color-dot" style="background: {track.color}"></span>
-						<span class="label-text">{track.channel}{#if track.sourceType === 'vod'} <span class="vod-suffix">(VOD)</span>{/if}</span>
-						<button class="btn-remove-track" onclick={() => removeStream(track.id)} title="Remove stream">✕</button>
+						<span class="label-text">
+							{track.channel}
+							{#if track.isGrouped}
+								<span class="vod-suffix">({track.bars.length} VODs)</span>
+							{:else if track.bars[0]?.sourceType === 'vod'}
+								<span class="vod-suffix">(VOD)</span>
+							{/if}
+						</span>
+						<button class="btn-remove-track" onclick={() => {
+							for (const sid of track.streamIds) removeStream(sid);
+						}} title="Remove track">✕</button>
 					</div>
 				{/each}
 			</div>
@@ -674,39 +713,43 @@
 					</div>
 
 					{#each tracksData as track}
-						{@const barLeft = (track.anchor - track.offset - effectiveTimelineStart) * pixelsPerSecond}
-						{@const barWidth = track.duration * pixelsPerSecond}
 						<!-- svelte-ignore a11y_no_static_element_interactions -->
 						<div class="track-row">
-							{#if barWidth > 0}
-								<!-- svelte-ignore a11y_no_static_element_interactions -->
-								<div
-									class="track-bar"
-									class:dragging={draggingStreamId === track.id}
-									style="left: {barLeft}px; width: {barWidth}px; background: {track.color};"
-									onmousedown={(e) => handleTrackMouseDown(e, track.id)}
-								>
+							{#each track.bars as bar}
+								{@const barLeft = (bar.anchor - bar.offset - effectiveTimelineStart) * pixelsPerSecond}
+								{@const barWidth = bar.duration * pixelsPerSecond}
+								{#if barWidth > 0}
+									<!-- svelte-ignore a11y_no_static_element_interactions -->
 									<div
-										class="bar-progress"
-										style="width: {((track.currentTime / track.duration) * 100).toFixed(1)}%"
-									></div>
-									<span class="bar-label">{track.channel}{track.sourceType === 'vod' ? ' (VOD)' : ''}</span>
-								</div>
-							{/if}
-							{#if chatHeatmapData[track.id]}
-								{#each chatHeatmapData[track.id] as bucket}
-									{@const heatLeft = (bucket.startTime - effectiveTimelineStart) * pixelsPerSecond}
-									{@const heatWidth = CHAT_BUCKET_SECONDS * pixelsPerSecond}
-									{#if bucket.intensity > 0.05}
+										class="track-bar"
+										class:dragging={draggingStreamId === bar.streamId}
+										style="left: {barLeft}px; width: {barWidth}px; background: {track.color};"
+										onmousedown={(e) => handleTrackMouseDown(e, bar.streamId)}
+									>
 										<div
-											class="chat-heatmap-bar"
-											style="left: {heatLeft}px; width: {heatWidth}px; opacity: {0.15 + bucket.intensity * 0.7}"
+											class="bar-progress"
+											style="width: {((bar.currentTime / bar.duration) * 100).toFixed(1)}%"
 										></div>
-									{/if}
-								{/each}
-							{/if}
-							{#each $clipRegions.filter((r) => r.streamId === track.id) as region}
-								{@const dragShift = draggingStreamId === track.id ? -dragOffsetDelta : 0}
+										<span class="bar-label">{bar.channel}{bar.sourceType === 'vod' ? ' (VOD)' : ''}</span>
+									</div>
+								{/if}
+							{/each}
+							{#each track.streamIds as sid}
+								{#if chatHeatmapData[sid]}
+									{#each chatHeatmapData[sid] as bucket}
+										{@const heatLeft = (bucket.startTime - effectiveTimelineStart) * pixelsPerSecond}
+										{@const heatWidth = CHAT_BUCKET_SECONDS * pixelsPerSecond}
+										{#if bucket.intensity > 0.05}
+											<div
+												class="chat-heatmap-bar"
+												style="left: {heatLeft}px; width: {heatWidth}px; opacity: {0.15 + bucket.intensity * 0.7}"
+											></div>
+										{/if}
+									{/each}
+								{/if}
+							{/each}
+							{#each $clipRegions.filter((r) => track.streamIds.includes(r.streamId)) as region}
+								{@const dragShift = draggingStreamId === region.streamId ? -dragOffsetDelta : 0}
 								{@const clipLeft = (region.startTime + dragShift - effectiveTimelineStart) * pixelsPerSecond}
 								{@const clipWidth = (region.endTime - region.startTime) * pixelsPerSecond}
 								<div class="clip-region" style="left: {clipLeft}px; width: {clipWidth}px">
@@ -714,7 +757,7 @@
 									<div class="clip-edge clip-edge-end"></div>
 								</div>
 							{/each}
-							{#if markingStreamId === track.id}
+							{#if track.streamIds.includes(markingStreamId ?? '')}
 								{@const markLeft = (markingStartTime - effectiveTimelineStart) * pixelsPerSecond}
 								{@const markWidth = (masterCurrentTime - markingStartTime) * pixelsPerSecond}
 								<div class="clip-region clip-region-active" style="left: {markLeft}px; width: {markWidth}px">

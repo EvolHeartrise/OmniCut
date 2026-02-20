@@ -1,6 +1,6 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types.js';
-import { addStream, listStreams, getTranscriptions, getAllClipRegions, getChatMessages } from '$lib/server/streamManager.js';
+import { addStream, addVodStream, addVodByUrl, listStreams, getTranscriptions, getAllClipRegions } from '$lib/server/streamManager.js';
 
 /**
  * GET /api/streams — List all active streams (includes stored transcriptions)
@@ -14,15 +14,8 @@ export const GET: RequestHandler = async () => {
 			transcriptions[s.id] = entries;
 		}
 	}
-	const chatMessages: Record<string, Array<{ username: string; text: string; timestamp: number }>> = {};
-	for (const s of streams) {
-		const msgs = getChatMessages(s.id);
-		if (msgs.length > 0) {
-			chatMessages[s.id] = msgs;
-		}
-	}
 	const clipRegions = getAllClipRegions();
-	return json({ streams, transcriptions, clipRegions, chatMessages });
+	return json({ streams, transcriptions, clipRegions });
 };
 
 /**
@@ -31,7 +24,18 @@ export const GET: RequestHandler = async () => {
  */
 export const POST: RequestHandler = async ({ request }) => {
 	const body = await request.json();
-	const { channel } = body;
+	const { channel, language, vod, vodUrl, platform } = body;
+
+	// Direct VOD URL mode — no channel needed
+	if (vodUrl && typeof vodUrl === 'string') {
+		try {
+			const streamInfo = await addVodByUrl(vodUrl.trim(), language ?? null);
+			return json({ stream: streamInfo }, { status: 201 });
+		} catch (err: unknown) {
+			const message = err instanceof Error ? err.message : 'Unknown error';
+			return json({ error: message }, { status: 409 });
+		}
+	}
 
 	if (!channel || typeof channel !== 'string') {
 		return json({ error: 'Missing or invalid "channel" field' }, { status: 400 });
@@ -39,7 +43,7 @@ export const POST: RequestHandler = async ({ request }) => {
 
 	// Clean the channel name (remove URL parts if pasted as a full URL)
 	const cleanChannel = channel
-		.replace(/^https?:\/\/(www\.)?twitch\.tv\//, '')
+		.replace(/^https?:\/\/(www\.)?(twitch\.tv|douyu\.com)\//, '')
 		.replace(/\/.*$/, '')
 		.trim()
 		.toLowerCase();
@@ -49,7 +53,9 @@ export const POST: RequestHandler = async ({ request }) => {
 	}
 
 	try {
-		const streamInfo = await addStream(cleanChannel);
+		const streamInfo = vod
+			? await addVodStream(cleanChannel, language ?? null)
+			: await addStream(cleanChannel, language ?? null, platform || 'twitch');
 		return json({ stream: streamInfo }, { status: 201 });
 	} catch (err: unknown) {
 		const message = err instanceof Error ? err.message : 'Unknown error';

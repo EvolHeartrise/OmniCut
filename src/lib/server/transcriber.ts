@@ -1,7 +1,7 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 
-const BATCH_SIZE = 3; // segments per batch (~6 seconds at 2s/segment)
+const BATCH_SIZE = 15; // segments per batch (~30 seconds at 2s/segment, Whisper's full context window)
 const POLL_INTERVAL = 3000; // check for new segments every 3s
 const SEGMENT_DURATION = 2; // seconds per HLS segment (matches -hls_time 2)
 const POOL_SIZE = 3; // number of concurrent transcription workers
@@ -23,9 +23,18 @@ interface PoolWorker {
 	id: number;
 }
 
+interface Sentence {
+	text: string;
+	start: number;
+	end: number;
+	partial?: boolean;
+}
+
 interface QueueItem {
 	wavPath: string;
-	resolve: (text: string) => void;
+	language: string | null;
+	task: string;
+	resolve: (sentences: Sentence[]) => void;
 	reject: (err: Error) => void;
 }
 
@@ -96,10 +105,10 @@ function spawnWorker(workerId: number): PoolWorker | null {
 							}
 							// Transcription response — resolve the current item
 							if (worker.busy && (worker as any)._currentResolve) {
-								const resolve = (worker as any)._currentResolve as (text: string) => void;
+								const resolve = (worker as any)._currentResolve as (sentences: Sentence[]) => void;
 								(worker as any)._currentResolve = null;
 								worker.busy = false;
-								resolve(data.text || '');
+								resolve(data.sentences || []);
 								processQueue();
 							}
 						} catch {
@@ -127,12 +136,12 @@ function spawnWorker(workerId: number): PoolWorker | null {
 		// Handle worker exit
 		proc.exited.then((code) => {
 			console.warn(`[transcriber:w${workerId}] Worker exited with code ${code}`);
-			// Resolve any pending request with empty string
+			// Resolve any pending request with empty array
 			if (worker.busy && (worker as any)._currentResolve) {
-				const resolve = (worker as any)._currentResolve as (text: string) => void;
+				const resolve = (worker as any)._currentResolve as (sentences: Sentence[]) => void;
 				(worker as any)._currentResolve = null;
 				worker.busy = false;
-				resolve('');
+				resolve([]);
 			}
 			removeWorker(worker);
 			// Try to respawn if the pool is still active
@@ -198,7 +207,9 @@ function processQueue() {
 	const req = requestQueue.shift()!;
 	worker.busy = true;
 	(worker as any)._currentResolve = req.resolve;
-	worker.proc.stdin.write(req.wavPath + '\n');
+	const payload: Record<string, unknown> = { wav_path: req.wavPath, task: req.task };
+	if (req.language) payload.language = req.language;
+	worker.proc.stdin.write(JSON.stringify(payload) + '\n');
 
 	// Process more items if there are more idle workers
 	if (requestQueue.length > 0) {
@@ -206,13 +217,14 @@ function processQueue() {
 	}
 }
 
-function transcribeAudio(wavPath: string): Promise<string> {
+function transcribeAudio(wavPath: string, language: string | null): Promise<Sentence[]> {
+	const task = language && language !== 'en' ? 'translate' : 'transcribe';
 	return new Promise((resolve, reject) => {
 		if (!ensurePool() && poolWorkers.length === 0) {
-			resolve('');
+			resolve([]);
 			return;
 		}
-		requestQueue.push({ wavPath, resolve, reject });
+		requestQueue.push({ wavPath, language, task, resolve, reject });
 		processQueue();
 	});
 }
@@ -266,10 +278,12 @@ export type TranscriptionCallback = (
 
 interface StreamTracker {
 	recordingDir: string;
+	language: string | null;
 	lastProcessedIndex: number;
 	interval: ReturnType<typeof setInterval>;
 	callback: TranscriptionCallback;
 	active: boolean;
+	pendingPartial: { text: string; startTime: number; endTime: number } | null;
 }
 
 const streamTrackers = new Map<string, StreamTracker>();
@@ -314,11 +328,34 @@ async function checkForNewSegments(streamId: string) {
 	if (!wavPath) return;
 
 	try {
-		const text = await transcribeAudio(wavPath);
-		if (text.trim()) {
-			const startTime = startIdx * SEGMENT_DURATION;
-			const endTime = (startIdx + batch.length) * SEGMENT_DURATION;
-			tracker.callback(streamId, text.trim(), startTime, endTime);
+		const sentences = await transcribeAudio(wavPath, tracker.language);
+		const batchOffset = startIdx * SEGMENT_DURATION;
+
+		for (let i = 0; i < sentences.length; i++) {
+			const s = sentences[i];
+			let text = s.text;
+			let startTime = batchOffset + s.start;
+			const endTime = batchOffset + s.end;
+
+			// Merge pending partial from previous batch into the first sentence
+			if (i === 0 && tracker.pendingPartial) {
+				text = tracker.pendingPartial.text + ' ' + text;
+				startTime = tracker.pendingPartial.startTime;
+				tracker.pendingPartial = null;
+			}
+
+			// Hold back partial (incomplete) sentences for merging with next batch
+			if (s.partial) {
+				tracker.pendingPartial = { text, startTime, endTime };
+			} else {
+				tracker.callback(streamId, text, startTime, endTime);
+			}
+		}
+
+		// If no sentences came back, clear any stale partial
+		if (sentences.length === 0 && tracker.pendingPartial) {
+			tracker.callback(streamId, tracker.pendingPartial.text, tracker.pendingPartial.startTime, tracker.pendingPartial.endTime);
+			tracker.pendingPartial = null;
 		}
 	} finally {
 		try {
@@ -334,7 +371,8 @@ async function checkForNewSegments(streamId: string) {
 export function startTranscription(
 	streamId: string,
 	recordingDir: string,
-	onResult: TranscriptionCallback
+	onResult: TranscriptionCallback,
+	language?: string | null
 ): void {
 	// Don't start if already tracking or worker pool is known to be broken
 	if (streamTrackers.has(streamId)) return;
@@ -345,10 +383,12 @@ export function startTranscription(
 
 	const tracker: StreamTracker = {
 		recordingDir,
+		language: language ?? null,
 		lastProcessedIndex: -1,
 		interval: setInterval(() => checkForNewSegments(streamId), POLL_INTERVAL),
 		callback: onResult,
-		active: true
+		active: true,
+		pendingPartial: null
 	};
 
 	streamTrackers.set(streamId, tracker);
@@ -361,9 +401,69 @@ export function startTranscription(
 export function stopTranscription(streamId: string): void {
 	const tracker = streamTrackers.get(streamId);
 	if (!tracker) return;
+	// Flush any pending partial sentence before stopping
+	if (tracker.pendingPartial) {
+		tracker.callback(streamId, tracker.pendingPartial.text, tracker.pendingPartial.startTime, tracker.pendingPartial.endTime);
+		tracker.pendingPartial = null;
+	}
 	tracker.active = false;
 	clearInterval(tracker.interval);
 	streamTrackers.delete(streamId);
+}
+
+/**
+ * Transcribe an entire finished recording in one pass.
+ * Concatenates all segments into a single WAV and sends to Whisper,
+ * which handles cross-window context continuity internally.
+ */
+export async function transcribeFullRecording(
+	streamId: string,
+	recordingDir: string,
+	onResult: TranscriptionCallback,
+	language?: string | null
+): Promise<void> {
+	// Enumerate all seg*.ts files, sort numerically
+	const allFiles = fs.readdirSync(recordingDir);
+	const segFiles = allFiles
+		.filter((f) => /^seg\d+\.ts$/.test(f))
+		.sort((a, b) => {
+			const numA = parseInt(a.match(/\d+/)![0], 10);
+			const numB = parseInt(b.match(/\d+/)![0], 10);
+			return numA - numB;
+		});
+
+	if (segFiles.length === 0) {
+		console.log(`[transcriber] No segments found in ${recordingDir}, skipping full transcription`);
+		return;
+	}
+
+	console.log(`[transcriber] Starting full transcription for stream ${streamId} (${segFiles.length} segments)`);
+
+	// Ensure worker pool is started; wait until at least one worker is ready
+	ensurePool();
+	while (poolReadyCount === 0 && !poolFailed) {
+		await new Promise((r) => setTimeout(r, 500));
+		ensurePool();
+	}
+	if (poolFailed) {
+		console.warn(`[transcriber] Pool failed, cannot transcribe stream ${streamId}`);
+		return;
+	}
+
+	const wavPath = await extractAudio(recordingDir, segFiles);
+	if (!wavPath) return;
+
+	try {
+		const sentences = await transcribeAudio(wavPath, language ?? null);
+		for (const s of sentences) {
+			onResult(streamId, s.text, s.start, s.end);
+		}
+		console.log(`[transcriber] Full transcription complete for stream ${streamId}: ${sentences.length} sentences`);
+	} finally {
+		try {
+			fs.unlinkSync(wavPath);
+		} catch {}
+	}
 }
 
 /**

@@ -7,7 +7,8 @@
 	import CleaningTimeline from '$lib/components/CleaningTimeline.svelte';
 	import ExportPanel from '$lib/components/ExportPanel.svelte';
 	import TranscriptPanel from '$lib/components/TranscriptPanel.svelte';
-	import { refreshStreams, connectSSE, streams, focusedStreamId, soloStreamId, appMode, transcriptPanelOpen, exportSessionFile, importSessionFile, clearSession } from '$lib/stores/streams.js';
+	import ChatPanel from '$lib/components/ChatPanel.svelte';
+	import { refreshStreams, connectSSE, streams, focusedStreamId, soloStreamId, appMode, transcriptPanelOpen, chatPanelOpen, exportSessionFile, importSessionFile, clearSession, transcriptions, syncOffsets, masterTime, clipRegions, saveClipRegion, type ClipRegion } from '$lib/stores/streams.js';
 
 	onMount(() => {
 		refreshStreams();
@@ -21,6 +22,11 @@
 	let fileInput: HTMLInputElement;
 	let clearConfirm = $state(false);
 	let clearConfirmTimer: ReturnType<typeof setTimeout> | undefined;
+
+	// T-key hold state for transcription-based clip region creation
+	let tHeld = $state(false);
+	let tClipId = $state<string | null>(null);
+	let tClipStreamId = $state<string | null>(null);
 
 	async function handleExport() {
 		await exportSessionFile();
@@ -106,14 +112,110 @@
 				focusedStreamId.set(null);
 				break;
 			case 't':
-			case 'T':
+			case 'T': {
+				if (e.repeat || tHeld) break;
+				// Start a held clip region from the current or recent transcription
+				const focused = $focusedStreamId || $soloStreamId;
+				if (focused) {
+					const stream = $streams.find((s) => s.id === focused);
+					const entries = $transcriptions[focused];
+					if (stream && entries && entries.length > 0) {
+						const now = $masterTime;
+						const anchor = stream.startedAt / 1000;
+						const offset = $syncOffsets[focused] || 0;
+						// Find active transcription at playhead
+						let entry = entries.find((ent) => {
+							const ms = ent.startTime + anchor - offset;
+							const me = ent.endTime + anchor - offset;
+							return now >= ms && now < me;
+						});
+						// Fallback: most recent past transcription within 5 seconds
+						if (!entry) {
+							for (let i = entries.length - 1; i >= 0; i--) {
+								const me = entries[i].endTime + anchor - offset;
+								if (me <= now && now - me <= 5) {
+									entry = entries[i];
+									break;
+								}
+							}
+						}
+						if (entry) {
+							const region: ClipRegion = {
+								id: crypto.randomUUID(),
+								streamId: focused,
+								startTime: entry.startTime + anchor - offset,
+								endTime: entry.endTime + anchor - offset
+							};
+							clipRegions.update((regions) => [...regions, region]);
+							tHeld = true;
+							tClipId = region.id;
+							tClipStreamId = focused;
+						}
+					}
+				}
+				break;
+			}
+			case 'p':
+			case 'P':
 				transcriptPanelOpen.update((v) => !v);
+				break;
+			case 'c':
+			case 'C':
+				chatPanelOpen.update((v) => !v);
 				break;
 		}
 	}
+
+	function handleKeyup(e: KeyboardEvent) {
+		if ((e.key === 't' || e.key === 'T') && tHeld) {
+			tHeld = false;
+			// Persist the finalized clip region to the server
+			if (tClipId) {
+				const regions = $clipRegions;
+				const region = regions.find((r) => r.id === tClipId);
+				if (region) saveClipRegion(region);
+			}
+			tClipId = null;
+			tClipStreamId = null;
+		}
+	}
+
+	// While T is held, extend the in-progress clip region as the playhead crosses new transcriptions
+	$effect(() => {
+		if (!tHeld || !tClipId || !tClipStreamId) return;
+		const now = $masterTime;
+		const stream = $streams.find((s) => s.id === tClipStreamId);
+		const entries = $transcriptions[tClipStreamId!];
+		if (!stream || !entries) return;
+		const anchor = stream.startedAt / 1000;
+		const offset = $syncOffsets[tClipStreamId!] || 0;
+
+		// Find the latest transcription whose start the playhead has passed
+		let latestEnd = -1;
+		for (let i = entries.length - 1; i >= 0; i--) {
+			const ms = entries[i].startTime + anchor - offset;
+			const me = entries[i].endTime + anchor - offset;
+			if (now >= ms) {
+				latestEnd = me;
+				break;
+			}
+		}
+		if (latestEnd < 0) return;
+
+		const clipId = tClipId;
+		clipRegions.update((regions) => {
+			const idx = regions.findIndex((r) => r.id === clipId);
+			if (idx === -1) return regions;
+			const existing = regions[idx];
+			if (latestEnd <= existing.endTime) return regions;
+			const updated = [...regions];
+			updated[idx] = { ...existing, endTime: latestEnd };
+			return updated;
+		});
+	});
 </script>
 
-<svelte:window onkeydown={handleKeydown} />
+<svelte:window onkeydown={handleKeydown} onkeyup={handleKeyup} />
 
 <div class="app">
 	<header class="app-header">
@@ -165,8 +267,13 @@
 					class:btn-tool-active={$transcriptPanelOpen}
 					onclick={() => $transcriptPanelOpen = !$transcriptPanelOpen}
 				>Transcript</button>
+				<button
+					class="btn-tool"
+					class:btn-tool-active={$chatPanelOpen}
+					onclick={() => $chatPanelOpen = !$chatPanelOpen}
+				>Chat</button>
 			{/if}
-			<span class="shortcut-hint">Tab: Switch mode | 1-6: Focus | Esc: Unfocus | T: Transcript</span>
+			<span class="shortcut-hint">Tab: Switch mode | 1-6: Focus | Esc: Unfocus | T (hold): Clip transcript | P: Transcript | C: Chat</span>
 		</div>
 	</header>
 
@@ -180,6 +287,9 @@
 			<StreamGrid />
 			{#if $transcriptPanelOpen}
 				<TranscriptPanel />
+			{/if}
+			{#if $chatPanelOpen}
+				<ChatPanel />
 			{/if}
 		</main>
 		<NLETimeline />
