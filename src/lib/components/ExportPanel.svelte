@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { clipRegions, streams, syncOffsets, exportLog } from '$lib/stores/streams.js';
 	import { formatDuration } from '$lib/utils.js';
+	import { exportVideoCmd } from '$lib/streams.remote.js';
 
 	let filename = $state('export');
 	let exporting = $state(false);
@@ -39,17 +40,8 @@
 		result = null;
 		exportLog.set([]);
 		try {
-			const res = await fetch('/api/export', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ filename: filename.trim() })
-			});
-			const data = await res.json();
-			if (res.ok) {
-				result = { success: true, message: `Saved to ${data.outputPath}` };
-			} else {
-				result = { success: false, message: data.error || 'Export failed' };
-			}
+			const data = await exportVideoCmd({ filename: filename.trim() });
+			result = { success: true, message: `Saved to ${data.outputPath}` };
 		} catch (err) {
 			result = { success: false, message: err instanceof Error ? err.message : 'Export failed' };
 		} finally {

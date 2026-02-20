@@ -1,7 +1,5 @@
 import { TWITCH_CLIENT_ID } from './twitchApi.js';
-import type { ChatMessage } from './types.js';
-
-export type ChatCallback = (streamId: string, msg: ChatMessage) => void;
+import type { ChatMessage, ChatCallback } from './types.js';
 
 const PAGE_DELAY_MS = 150;
 const MAX_RETRIES = 5;
@@ -104,8 +102,6 @@ async function fetchAllPages(entry: QueueEntry) {
 				console.error(`[vod-chat:${entry.videoId}] HTTP ${res.status} — aborting`);
 				break;
 			}
-
-			if (!data) data = await res.json();
 
 			if (data.errors) {
 				console.error(`[vod-chat:${entry.videoId}] GQL errors:`, data.errors.map((e: any) => e.message).join('; '));

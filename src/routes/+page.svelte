@@ -11,6 +11,7 @@
 	import ChatPanel from '$lib/components/ChatPanel.svelte';
 	import { refreshStreams, connectSSE, streams, focusedStreamId, soloStreamId, appMode, transcriptPanelOpen, chatPanelOpen, transcriptions, syncOffsets, streamPlaybackStates, masterTime, clipRegions, saveClipRegion, type ClipRegion, type TranscriptionEntry } from '$lib/stores/streams.js';
 	import { getMultiStreamTranscriptions } from '$lib/streams.remote';
+	import { trackKeyFor } from '$lib/utils.js';
 
 	const CAPTION_WINDOW = 60; // ±60 seconds around playhead for StreamTile captions
 	const CAPTION_REFETCH_THRESHOLD = 10; // re-fetch when playhead drifts 10s
@@ -38,6 +39,12 @@
 				captionCenter = snap;
 			}, 300);
 		}
+		return () => {
+			if (captionDebounceTimer) {
+				clearTimeout(captionDebounceTimer);
+				captionDebounceTimer = null;
+			}
+		};
 	});
 
 	let captionRanges = $derived(
@@ -108,7 +115,7 @@
 				const tKeys: string[] = [];
 				const tMembers = new Map<string, typeof activeStreams>();
 				for (const s of activeStreams) {
-					const key = s.sourceType === 'live' ? s.id : `vod:${s.platform}:${s.channel}`;
+					const key = trackKeyFor(s);
 					if (!seen.has(key)) {
 						seen.add(key);
 						tKeys.push(key);
@@ -138,8 +145,8 @@
 					// Check if this track is already focused/solo'd
 					const focusedSrc = $focusedStreamId ? activeStreams.find((s) => s.id === $focusedStreamId) : null;
 					const soloSrc = $soloStreamId ? activeStreams.find((s) => s.id === $soloStreamId) : null;
-					const focusedKey = focusedSrc ? (focusedSrc.sourceType === 'live' ? focusedSrc.id : `vod:${focusedSrc.platform}:${focusedSrc.channel}`) : null;
-					const soloKey = soloSrc ? (soloSrc.sourceType === 'live' ? soloSrc.id : `vod:${soloSrc.platform}:${soloSrc.channel}`) : null;
+					const focusedKey = focusedSrc ? trackKeyFor(focusedSrc) : null;
+					const soloKey = soloSrc ? trackKeyFor(soloSrc) : null;
 
 					if (soloKey === trackKey) {
 						// solo → unfocused

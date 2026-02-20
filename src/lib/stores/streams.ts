@@ -100,6 +100,19 @@ export const chatPanelOpen = writable(false);
 // NLETimeline watches the seq and updates its internal masterCurrentTimeState accordingly.
 export const seekRequest = writable<{ time: number; seq: number }>({ time: 0, seq: 0 });
 
+/** Build visible stream metadata for panels (TranscriptPanel, ChatPanel). */
+export function deriveVisibleStreams(allStreams: StreamState[], offsets: Record<string, number>, focused: string | null, COLORS: readonly string[]) {
+	return allStreams
+		.filter((s) => !focused || s.id === focused)
+		.map((s, i) => ({
+			id: s.id,
+			channel: s.channel,
+			anchor: s.startedAt / 1000,
+			offset: offsets[s.id] || 0,
+			color: COLORS[allStreams.indexOf(s) % COLORS.length]
+		}));
+}
+
 /**
  * Fetch all streams from the API and update the store.
  * Also restores saved offsets from the server.
@@ -136,7 +149,7 @@ export async function refreshStreams() {
 /**
  * Add a new stream by channel name.
  */
-export async function addStream(channel: string, opts?: { language?: string | null; vod?: boolean; vodUrl?: string; platform?: 'twitch' | 'douyu' }): Promise<StreamState | null> {
+export async function addStream(channel: string, opts?: { language?: string | null; vod?: boolean; vodUrl?: string; platform?: 'twitch' | 'douyu' }): Promise<void> {
 	try {
 		await addStreamCmd({
 			channel,
@@ -146,7 +159,7 @@ export async function addStream(channel: string, opts?: { language?: string | nu
 			platform: opts?.platform
 		});
 		await refreshStreams();
-		return null;
+		return;
 	} catch (err) {
 		console.error('Failed to add stream:', err);
 		throw err;
@@ -256,7 +269,7 @@ export async function saveClipRegion(region: ClipRegion) {
 /**
  * Delete a clip region from the server.
  */
-export async function deleteClipRegion(id: string, _streamId: string) {
+export async function deleteClipRegion(id: string) {
 	try {
 		await deleteClipCmd({ id });
 	} catch (err) {

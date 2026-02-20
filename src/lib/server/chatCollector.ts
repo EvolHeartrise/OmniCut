@@ -1,6 +1,4 @@
-import type { ChatMessage } from './types.js';
-
-export type ChatCallback = (streamId: string, msg: ChatMessage) => void;
+import type { ChatMessage, ChatCallback } from './types.js';
 
 const TWITCH_IRC_WS = 'wss://irc-ws.chat.twitch.tv:443';
 const RECONNECT_DELAY = 3000;

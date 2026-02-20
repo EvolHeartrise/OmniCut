@@ -68,8 +68,8 @@ interface Pool {
 const livePool: Pool = { workers: [], queue: [], readyCount: 0, initStarted: false, failed: false, size: LIVE_POOL_SIZE, label: 'live' };
 const vodPool: Pool = { workers: [], queue: [], readyCount: 0, initStarted: false, failed: false, size: VOD_POOL_SIZE, label: 'vod' };
 
-// Map worker → pending resolve callback (replaces unsafe `(worker as any)._currentResolve`)
-const workerResolvers = new Map<PoolWorker, (sentences: Sentence[]) => void>();
+// Map worker → pending resolve/reject callbacks
+const workerResolvers = new Map<PoolWorker, { resolve: (sentences: Sentence[]) => void; reject: (err: Error) => void }>();
 
 function getScriptPath(): string {
 	return path.join(process.cwd(), 'scripts', 'transcribe_worker.py');
@@ -131,7 +131,7 @@ function spawnWorker(pool: Pool, workerId: number): PoolWorker | null {
 							}
 							// Transcription response — resolve the current item
 							if (worker.busy && workerResolvers.has(worker)) {
-								const resolve = workerResolvers.get(worker)!;
+								const { resolve } = workerResolvers.get(worker)!;
 								workerResolvers.delete(worker);
 								worker.busy = false;
 								resolve(data.sentences || []);
@@ -162,12 +162,12 @@ function spawnWorker(pool: Pool, workerId: number): PoolWorker | null {
 		// Handle worker exit
 		proc.exited.then((code) => {
 			console.warn(`[transcriber:${pool.label}:w${workerId}] Worker exited with code ${code}`);
-			// Resolve any pending request with empty array
+			// Reject any pending request
 			if (worker.busy && workerResolvers.has(worker)) {
-				const resolve = workerResolvers.get(worker)!;
+				const { reject } = workerResolvers.get(worker)!;
 				workerResolvers.delete(worker);
 				worker.busy = false;
-				resolve([]);
+				reject(new Error(`Worker exited with code ${code}`));
 			}
 			removeWorker(pool, worker);
 			// Try to respawn if the pool is still active
@@ -233,7 +233,7 @@ function processQueue(pool: Pool) {
 
 	const req = pool.queue.shift()!;
 	worker.busy = true;
-	workerResolvers.set(worker, req.resolve);
+	workerResolvers.set(worker, { resolve: req.resolve, reject: req.reject });
 	const payload: Record<string, unknown> = { wav_path: req.wavPath, task: req.task };
 	if (req.language) payload.language = req.language;
 	worker.proc.stdin.write(JSON.stringify(payload) + '\n');

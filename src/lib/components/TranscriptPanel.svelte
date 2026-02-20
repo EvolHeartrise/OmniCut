@@ -5,10 +5,12 @@
 		focusedStreamId,
 		soloStreamId,
 		masterTime,
-		seekRequest
+		seekRequest,
+		deriveVisibleStreams
 	} from '$lib/stores/streams.js';
 	import { TRACK_COLORS as COLORS } from '$lib/constants.js';
 	import { getMultiStreamTranscriptions } from '$lib/streams.remote';
+	import { formatTime } from '$lib/utils.js';
 
 	const FETCH_WINDOW = 120; // ±120 seconds around playhead
 	const REFETCH_THRESHOLD = 30; // re-fetch when playhead drifts 30s from last center
@@ -43,21 +45,7 @@
 	});
 
 	// Build stream lookup for visible streams
-	let visibleStreams = $derived.by(() => {
-		const allStreams = $streams;
-		const offsets = $syncOffsets;
-		const focused = $focusedStreamId || $soloStreamId;
-
-		return allStreams
-			.filter((s) => !focused || s.id === focused)
-			.map((s) => ({
-				id: s.id,
-				channel: s.channel,
-				anchor: s.startedAt / 1000,
-				offset: offsets[s.id] || 0,
-				color: COLORS[allStreams.indexOf(s) % COLORS.length]
-			}));
-	});
+	let visibleStreams = $derived(deriveVisibleStreams($streams, $syncOffsets, $focusedStreamId || $soloStreamId, COLORS));
 
 	// Derive query ranges from debounced center + visible streams
 	let transcriptRanges = $derived(
@@ -98,19 +86,26 @@
 		return fetchedEntries.filter((e) => e.text.toLowerCase().includes(q));
 	});
 
-	// Find the active entry based on current master playhead
+	// Find the active entry based on current master playhead (binary search)
 	let activeEntryIndex = $derived.by(() => {
 		const now = $masterTime;
-		// Find entry whose master time range contains the current playhead
-		for (let i = filteredEntries.length - 1; i >= 0; i--) {
-			const e = filteredEntries[i];
-			if (now >= e.masterStart && now < e.masterEnd) return i;
+		const entries = filteredEntries;
+		if (entries.length === 0) return -1;
+
+		// Binary search: find the last entry whose masterStart <= now
+		let lo = 0, hi = entries.length;
+		while (lo < hi) {
+			const mid = (lo + hi) >>> 1;
+			if (entries[mid].masterStart <= now) lo = mid + 1;
+			else hi = mid;
 		}
+		// lo is now the first entry with masterStart > now; lo-1 is the candidate
+		if (lo === 0) return -1;
+		const candidate = lo - 1;
+		// Prefer exact match (playhead within range)
+		if (now < entries[candidate].masterEnd) return candidate;
 		// Fallback: last entry that started before now
-		for (let i = filteredEntries.length - 1; i >= 0; i--) {
-			if (filteredEntries[i].masterStart <= now) return i;
-		}
-		return -1;
+		return candidate;
 	});
 
 	// Auto-scroll to active entry (suppressed briefly after manual scroll)
@@ -142,14 +137,6 @@
 
 	function seekToEntry(entry: TaggedEntry) {
 		seekRequest.update((r) => ({ time: entry.masterStart, seq: r.seq + 1 }));
-	}
-
-	function formatTime(epochSec: number): string {
-		const d = new Date(epochSec * 1000);
-		const h = d.getHours();
-		const m = d.getMinutes();
-		const s = d.getSeconds();
-		return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
 	}
 
 	function clearSearch() {

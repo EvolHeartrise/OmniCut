@@ -1,6 +1,5 @@
 <script lang="ts">
 	import { tick } from 'svelte';
-	import { get } from 'svelte/store';
 	import Hls from 'hls.js';
 	import {
 		streams,
@@ -514,18 +513,19 @@
 				const wasPaused = !playing;
 				if (playing) { playing = false; videoEl?.pause(); cancelAnimationFrame(rafId); }
 				removeClip(seg.clip);
-				// After removing, jump to the segment that now occupies this index
-				if (segments.length > 0) {
-					const newIdx = Math.min(currentSegIndex, segments.length - 1);
-					cleaningTime = segments[newIdx]?.cumulativeStart ?? 0;
-					loadSegment(newIdx);
-					if (!wasPaused) { playing = true; lastFrameTime = performance.now(); videoEl?.play().catch(() => {}); rafId = requestAnimationFrame(advanceLoop); }
-				} else {
-					cleaningTime = 0;
-					slots.A.streamId = null;
-					slots.B.streamId = null;
-					preloadedForSeg = null;
-				}
+				tick().then(() => {
+					if (segments.length > 0) {
+						const newIdx = Math.min(currentSegIndex, segments.length - 1);
+						cleaningTime = segments[newIdx]?.cumulativeStart ?? 0;
+						loadSegment(newIdx);
+						if (!wasPaused) { playing = true; lastFrameTime = performance.now(); videoEl?.play().catch(() => {}); rafId = requestAnimationFrame(advanceLoop); }
+					} else {
+						cleaningTime = 0;
+						slots.A.streamId = null;
+						slots.B.streamId = null;
+						preloadedForSeg = null;
+					}
+				});
 			}
 		}
 	}

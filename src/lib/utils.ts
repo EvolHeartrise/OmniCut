@@ -43,6 +43,36 @@ export function usernameColor(name: string): string {
 	return USERNAME_COLORS[Math.abs(hash) % USERNAME_COLORS.length];
 }
 
+/** Generate a stable track key: live streams get their ID, VODs from same channel share a key. */
+export function trackKeyFor(s: { id: string; sourceType: string; platform: string; channel: string }): string {
+	if (s.sourceType === 'live') return s.id;
+	return `vod:${s.platform}:${s.channel}`;
+}
+
+/** Format epoch seconds as HH:MM:SS local time. */
+export function formatTime(epochSec: number): string {
+	const d = new Date(epochSec * 1000);
+	const h = d.getHours();
+	const m = d.getMinutes();
+	const s = d.getSeconds();
+	return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+}
+
+/** Format viewer count with K suffix. */
+export function formatViewers(count: number): string {
+	if (count >= 1000) return `${(count / 1000).toFixed(1)}K`;
+	return String(count);
+}
+
+/** Format stream uptime from ISO start time. */
+export function formatUptime(startedAt: string, now: number): string {
+	const elapsed = now - new Date(startedAt).getTime();
+	const hours = Math.floor(elapsed / 3_600_000);
+	const minutes = Math.floor((elapsed % 3_600_000) / 60_000);
+	if (hours > 0) return `${hours}h ${minutes}m`;
+	return `${minutes}m`;
+}
+
 /** Shared HLS.js configuration for all players. */
 export function createHlsConfig(isLive: boolean): Partial<ConstructorParameters<typeof Hls>[0]> {
 	return {

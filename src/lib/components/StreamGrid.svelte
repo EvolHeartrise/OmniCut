@@ -1,10 +1,7 @@
 <script lang="ts">
 	import StreamTile from './StreamTile.svelte';
 	import { streams, focusedStreamId, soloStreamId, masterTime, syncOffsets, streamPlaybackStates } from '$lib/stores/streams.js';
-
-	function trackKeyFor(s: { id: string; sourceType: string; platform: string; channel: string }): string {
-		return s.sourceType === 'live' ? s.id : `vod:${s.platform}:${s.channel}`;
-	}
+	import { trackKeyFor } from '$lib/utils.js';
 
 	let activeStreams = $derived($streams);
 

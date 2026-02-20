@@ -2,6 +2,16 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { addStream, streams } from '$lib/stores/streams.js';
 	import type { ChannelInfo, VodInfo } from '$lib/types.js';
+	import { formatUptime, formatViewers } from '$lib/utils.js';
+	import {
+		getWatchlist,
+		addToWatchlistCmd,
+		removeFromWatchlistCmd,
+		lookupChannels,
+		getAllChannelSettings,
+		saveChannelSettingsCmd,
+		getChannelVods
+	} from '$lib/streams.remote.js';
 
 	type Platform = 'twitch' | 'douyu';
 	interface WatchlistEntry { login: string; platform: Platform; }
@@ -97,10 +107,9 @@
 		return [...live, ...offline];
 	});
 
-	async function loadWatchlist() {
+	async function loadWatchlistData() {
 		try {
-			const res = await fetch('/api/watchlist');
-			const data = await res.json();
+			const data = await getWatchlist();
 			watchlist = data.watchlist.map((e: { login: string; platform: string }) => ({
 				login: e.login,
 				platform: e.platform as Platform
@@ -115,11 +124,7 @@
 		if (!lower) return;
 		if (watchlist.some(w => w.login === lower && w.platform === platform)) return;
 		try {
-			await fetch('/api/watchlist', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ login: lower, platform })
-			});
+			await addToWatchlistCmd({ login: lower, platform });
 			watchlist = [...watchlist, { login: lower, platform }];
 			fetchChannelData();
 		} catch (err) {
@@ -129,11 +134,7 @@
 
 	async function removeFromWatchlist(login: string, platform: Platform) {
 		try {
-			await fetch('/api/watchlist', {
-				method: 'DELETE',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ login, platform })
-			});
+			await removeFromWatchlistCmd({ login, platform });
 			watchlist = watchlist.filter(w => !(w.login === login && w.platform === platform));
 			channelData = channelData.filter(c => !(c.login === login && c.platform === platform));
 		} catch (err) {
@@ -157,12 +158,7 @@
 
 			const results: ChannelInfo[] = [];
 			const fetches = [...byPlatform.entries()].map(async ([platform, channels]) => {
-				const res = await fetch('/api/channels/lookup', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ channels, platform })
-				});
-				const data = await res.json();
+				const data = await lookupChannels({ channels, platform });
 				results.push(...data.channels);
 			});
 			await Promise.all(fetches);
@@ -174,8 +170,7 @@
 
 	async function fetchChannelSettings() {
 		try {
-			const res = await fetch('/api/channels/settings');
-			const data = await res.json();
+			const data = await getAllChannelSettings();
 			const map = new Map<string, string | null>();
 			for (const s of data.settings) {
 				map.set(s.login, s.language);
@@ -196,11 +191,7 @@
 		const login = settingsModalLogin;
 		const language = settingsLanguage || null;
 		try {
-			await fetch('/api/channels/settings', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ login, language })
-			});
+			await saveChannelSettingsCmd({ login, language });
 			const updated = new Map(channelSettings);
 			if (language) {
 				updated.set(login, language);
@@ -279,12 +270,7 @@
 	async function fetchVods(login: string, after?: string) {
 		vodsLoading = true;
 		try {
-			const res = await fetch('/api/channels/vods', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ login, first: 20, after })
-			});
-			const data = await res.json();
+			const data = await getChannelVods({ login, first: 20, after });
 			if (after) {
 				vodsData = [...vodsData, ...data.vods];
 			} else {
@@ -384,19 +370,6 @@
 		}
 	}
 
-	function formatUptime(startedAt: string): string {
-		const elapsed = now - new Date(startedAt).getTime();
-		const hours = Math.floor(elapsed / 3_600_000);
-		const minutes = Math.floor((elapsed % 3_600_000) / 60_000);
-		if (hours > 0) return `${hours}h ${minutes}m`;
-		return `${minutes}m`;
-	}
-
-	function formatViewers(count: number): string {
-		if (count >= 1000) return `${(count / 1000).toFixed(1)}K`;
-		return String(count);
-	}
-
 	function handleWatchlistAdd(e: Event) {
 		const login = (e as CustomEvent<string>).detail;
 		if (login) addToWatchlist(login, 'twitch');
@@ -412,13 +385,9 @@
 				localStorage.removeItem(LEGACY_STORAGE_KEY);
 				return;
 			}
-			// POST each to server as Twitch
+			// Add each to server as Twitch
 			await Promise.all(old.map(login =>
-				fetch('/api/watchlist', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ login: login.toLowerCase().trim(), platform: 'twitch' })
-				})
+				addToWatchlistCmd({ login: login.toLowerCase().trim(), platform: 'twitch' })
 			));
 			localStorage.removeItem(LEGACY_STORAGE_KEY);
 		} catch {
@@ -428,7 +397,7 @@
 
 	onMount(async () => {
 		await migrateLocalStorage();
-		await loadWatchlist();
+		await loadWatchlistData();
 		fetchChannelData();
 		fetchChannelSettings();
 		pollTimer = setInterval(fetchChannelData, POLL_INTERVAL);
@@ -520,7 +489,7 @@
 								<span class="viewer-count">{formatViewers(channel.viewerCount)}</span>
 							{/if}
 							{#if channel.startedAt}
-								<span class="uptime">{formatUptime(channel.startedAt)}</span>
+								<span class="uptime">{formatUptime(channel.startedAt, now)}</span>
 							{/if}
 						</div>
 

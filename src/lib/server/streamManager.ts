@@ -1,7 +1,7 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import * as crypto from 'node:crypto';
-import { startCapture, fetchStreamMeta, fetchDouyuStreamMeta, fetchVodMeta, type CaptureHandle } from './captureProcess.js';
+import { startCapture, fetchStreamMeta, fetchVodMeta, type CaptureHandle } from './captureProcess.js';
 import { startTranscription, stopTranscription, transcribeFullRecording, shutdownTranscriber } from './transcriber.js';
 import { startChatCollection } from './chatCollector.js';
 import { startVodChatFetch, extractVideoId } from './vodChatFetcher.js';
@@ -14,19 +14,14 @@ const RECORDINGS_DIR = path.resolve(process.env.RECORDINGS_DIR || path.join(proc
 // In-memory store of active captures (hot cache; persisted to SQLite on changes)
 const captures = new Map<string, CaptureHandle>();
 
-// In-memory store of transcriptions per stream (hot cache; persisted to SQLite)
-const streamTranscriptions = new Map<string, Array<{ text: string; startTime: number; endTime: number }>>();
-
-
 // In-memory store of clip regions (hot cache; persisted to SQLite)
 const clipRegionsStore: ClipRegion[] = [];
 
+// In-memory cache of chat message counts per stream (avoids COUNT(*) on every broadcast)
+const chatMessageCounts = new Map<string, number>();
+
 // SSE clients for real-time updates
 const sseClients = new Set<(data: string) => void>();
-
-export function getRecordingsDir(): string {
-	return RECORDINGS_DIR;
-}
 
 // --- Initialization: restore state from SQLite ---
 
@@ -36,6 +31,7 @@ export function getRecordingsDir(): string {
  */
 export async function initStreamManager(): Promise<void> {
 	await db.initDatabase();
+	fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
 
 	// Restore streams as stopped stub handles
 	const savedStreams = db.loadAllStreams();
@@ -58,14 +54,6 @@ export async function initStreamManager(): Promise<void> {
 		captures.set(info.id, stubHandle);
 	}
 
-	// Restore transcriptions
-	const savedTranscriptions = db.loadAllTranscriptions();
-	for (const [streamId, entries] of Object.entries(savedTranscriptions)) {
-		if (captures.has(streamId)) {
-			streamTranscriptions.set(streamId, entries);
-		}
-	}
-
 	// Restore clip regions
 	const savedClips = db.loadAllClipRegions();
 	for (const region of savedClips) {
@@ -74,9 +62,13 @@ export async function initStreamManager(): Promise<void> {
 		}
 	}
 
+	// Initialize chat message counts
+	for (const [, handle] of captures) {
+		chatMessageCounts.set(handle.info.id, db.countChatMessages(handle.info.id));
+	}
+
 	const streamCount = captures.size;
-	const transcriptionCount = Object.values(savedTranscriptions).reduce((n, e) => n + e.length, 0);
-	console.log(`[init] Restored ${streamCount} streams, ${transcriptionCount} transcriptions, ${clipRegionsStore.length} clip regions`);
+	console.log(`[init] Restored ${streamCount} streams, ${clipRegionsStore.length} clip regions`);
 }
 
 // --- Broadcasting ---
@@ -96,23 +88,14 @@ function broadcastUpdate(info: StreamInfo) {
 }
 
 function broadcastTranscription(streamId: string, text: string, startTime: number, endTime: number) {
-	// Persist in memory
-	let entries = streamTranscriptions.get(streamId);
-	if (!entries) {
-		entries = [];
-		streamTranscriptions.set(streamId, entries);
-	}
-	entries.push({ text, startTime, endTime });
-
-	// Persist to SQLite
 	db.saveTranscription(streamId, text, startTime, endTime);
-
 	broadcast(JSON.stringify({ type: 'transcription', streamId, text, startTime, endTime }));
 }
 
-function broadcastChatMessage(streamId: string, msg: ChatMessage) {
+function persistChatMessage(streamId: string, msg: ChatMessage) {
 	try {
 		db.saveChatMessage(streamId, msg);
+		chatMessageCounts.set(streamId, (chatMessageCounts.get(streamId) ?? 0) + 1);
 	} catch (err) {
 		console.error(`[chat] Failed to save message for stream ${streamId}:`, err);
 	}
@@ -144,7 +127,7 @@ function serializeStreamInfo(info: StreamInfo) {
 		parentStreamId: info.parentStreamId,
 		platform: info.platform,
 		sourceUrl: info.sourceUrl,
-		chatMessageCount: db.countChatMessages(info.id),
+		chatMessageCount: chatMessageCounts.get(info.id) ?? 0,
 		chatComplete: info.chatComplete
 	};
 }
@@ -190,9 +173,6 @@ export async function addStream(channel: string, language?: string | null, platf
 
 	const id = crypto.randomUUID();
 
-	// Ensure recordings directory exists
-	fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
-
 	const handle = startCapture(channel, id, RECORDINGS_DIR, (info) => {
 		broadcastUpdate(info);
 
@@ -210,7 +190,7 @@ export async function addStream(channel: string, language?: string | null, platf
 			if (info.sourceType === 'live' && platform === 'twitch' && !handle.chatStarted) {
 				handle.chatStarted = true;
 				handle.stopChat = startChatCollection(id, channel, info.startedAt, (_streamId, msg) => {
-					broadcastChatMessage(id, msg);
+					persistChatMessage(id, msg);
 				});
 			}
 		}
@@ -248,8 +228,6 @@ export async function addVodStream(channel: string, language?: string | null): P
 
 	const vodId = crypto.randomUUID();
 
-	fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
-
 	const vodHandle = startCapture(channel, vodId, RECORDINGS_DIR, (info) => {
 		broadcastUpdate(info);
 		db.saveStream(info);
@@ -266,7 +244,7 @@ export async function addVodStream(channel: string, language?: string | null): P
 				const twitchVideoId = extractVideoId(vodUrl);
 				if (twitchVideoId) {
 					vodHandle.stopChat = startVodChatFetch(vodId, twitchVideoId, (_sid, msg) => {
-						broadcastChatMessage(vodId, msg);
+						persistChatMessage(vodId, msg);
 					}, (success) => {
 						if (success) {
 							vodHandle.info.chatComplete = true;
@@ -334,7 +312,6 @@ export async function addVodByUrl(vodUrl: string, language?: string | null): Pro
 		const transcriptionLanguage = language ?? db.getChannelSettings(roomId)?.language ?? null;
 
 		const id = crypto.randomUUID();
-		fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
 
 		const vodHandle = startCapture(roomId, id, RECORDINGS_DIR, (info) => {
 			broadcastUpdate(info);
@@ -374,8 +351,6 @@ export async function addVodByUrl(vodUrl: string, language?: string | null): Pro
 	const id = crypto.randomUUID();
 	const fullVodUrl = `https://twitch.tv/videos/${videoId}`;
 
-	fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
-
 	const vodHandle = startCapture(channel, id, RECORDINGS_DIR, (info) => {
 		broadcastUpdate(info);
 		db.saveStream(info);
@@ -385,7 +360,7 @@ export async function addVodByUrl(vodUrl: string, language?: string | null): Pro
 			if (!vodHandle.chatStarted) {
 				vodHandle.chatStarted = true;
 				vodHandle.stopChat = startVodChatFetch(id, videoId, (_sid, msg) => {
-					broadcastChatMessage(id, msg);
+					persistChatMessage(id, msg);
 				}, (success) => {
 					if (success) {
 						vodHandle.info.chatComplete = true;
@@ -535,7 +510,7 @@ export function refetchVodChat(id: string): boolean {
 	broadcastUpdate(handle.info);
 
 	handle.stopChat = startVodChatFetch(id, videoId, (_sid, msg) => {
-		broadcastChatMessage(id, msg);
+		persistChatMessage(id, msg);
 	}, (success) => {
 		if (success) {
 			handle.info.chatComplete = true;
@@ -558,7 +533,6 @@ export function retranscribeStream(id: string): boolean {
 	if (handle.info.status !== 'stopped') return false;
 
 	// Clear existing transcriptions
-	streamTranscriptions.delete(id);
 	db.deleteTranscriptions(id);
 	broadcast(JSON.stringify({ type: 'transcription-cleared', streamId: id }));
 
@@ -587,12 +561,13 @@ export function removeStream(id: string): boolean {
 	captures.delete(id);
 
 	// Remove from in-memory caches
-	streamTranscriptions.delete(id);
 	for (let i = clipRegionsStore.length - 1; i >= 0; i--) {
 		if (clipRegionsStore[i].streamId === id) {
 			clipRegionsStore.splice(i, 1);
 		}
 	}
+
+	chatMessageCounts.delete(id);
 
 	// Remove from SQLite (cascades to transcriptions, chat, clips)
 	db.deleteStream(id);
@@ -682,13 +657,6 @@ export function removeClipRegion(id: string): boolean {
  */
 export function getAllClipRegions(): ClipRegion[] {
 	return clipRegionsStore;
-}
-
-/**
- * Get all stored transcriptions for a stream.
- */
-export function getTranscriptions(id: string): Array<{ text: string; startTime: number; endTime: number }> {
-	return streamTranscriptions.get(id) || [];
 }
 
 export function getTranscriptionsInRange(id: string, fromTime: number, toTime: number): Array<{ text: string; startTime: number; endTime: number }> {

@@ -30,7 +30,7 @@ export function splitClipRegion(
 		firstHalf,
 		secondHalf
 	]);
-	deleteClipRegion(clip.id, clip.streamId);
+	deleteClipRegion(clip.id);
 	saveClipRegion(firstHalf);
 	saveClipRegion(secondHalf);
 
@@ -42,5 +42,5 @@ export function splitClipRegion(
  */
 export function removeClipRegionAction(clip: ClipRegion): void {
 	clipRegions.update((regions) => regions.filter((r) => r.id !== clip.id));
-	deleteClipRegion(clip.id, clip.streamId);
+	deleteClipRegion(clip.id);
 }

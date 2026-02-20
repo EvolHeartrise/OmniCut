@@ -6,7 +6,8 @@
 		soloStreamId,
 		masterTime,
 		masterPlaying,
-		seekRequest
+		seekRequest,
+		deriveVisibleStreams
 	} from '$lib/stores/streams.js';
 	import { TRACK_COLORS as COLORS } from '$lib/constants.js';
 	import { usernameColor } from '$lib/utils.js';
@@ -46,21 +47,7 @@
 	});
 
 	// Build stream lookup for visible streams
-	let visibleStreams = $derived.by(() => {
-		const allStreams = $streams;
-		const offsets = $syncOffsets;
-		const focused = $focusedStreamId || $soloStreamId;
-
-		return allStreams
-			.filter((s) => !focused || s.id === focused)
-			.map((s) => ({
-				id: s.id,
-				channel: s.channel,
-				anchor: s.startedAt / 1000,
-				offset: offsets[s.id] || 0,
-				color: COLORS[allStreams.indexOf(s) % COLORS.length]
-			}));
-	});
+	let visibleStreams = $derived(deriveVisibleStreams($streams, $syncOffsets, $focusedStreamId || $soloStreamId, COLORS));
 
 	// Derive query ranges from debounced center + visible streams
 	let chatRanges = $derived(
@@ -154,11 +141,6 @@
 	function scrollToBottom() {
 		userScrolled = false;
 		if (listEl) listEl.scrollTop = listEl.scrollHeight;
-	}
-
-	function formatTime(epochSec: number): string {
-		const d = new Date(epochSec * 1000);
-		return `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}:${d.getSeconds().toString().padStart(2, '0')}`;
 	}
 
 	function clearSearch() {
@@ -330,23 +312,6 @@
 
 	.chat-line:hover {
 		background: #26262c;
-	}
-
-	.ts {
-		font-size: 11px;
-		color: #53535f;
-		font-family: monospace;
-		font-variant-numeric: tabular-nums;
-		margin-right: 4px;
-	}
-
-	.stream-dot {
-		display: inline-block;
-		width: 6px;
-		height: 6px;
-		border-radius: 50%;
-		margin-right: 3px;
-		vertical-align: middle;
 	}
 
 	.user {

@@ -29,6 +29,8 @@ export interface ChatMessage {
 	color?: string | null; // user's chat color (hex string like "#FF69B4")
 }
 
+export type ChatCallback = (streamId: string, msg: ChatMessage) => void;
+
 export interface CaptureHandle {
 	info: StreamInfo;
 	kill: () => void;

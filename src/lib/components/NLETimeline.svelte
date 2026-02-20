@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { tick, untrack } from 'svelte';
+	import { untrack } from 'svelte';
 	import {
 		streams,
 		streamPlaybackStates,
@@ -19,6 +19,7 @@
 	import { splitClipRegion, removeClipRegionAction } from '$lib/clipActions.js';
 	import { TRACK_COLORS as COLORS } from '$lib/constants.js';
 	import { getChatHeatmap } from '$lib/streams.remote';
+	import { trackKeyFor, formatTime } from '$lib/utils.js';
 
 	const MIN_PPS = 0.1;
 	const MAX_PPS = 200;
@@ -89,12 +90,6 @@
 		if (!scrollAreaEl) return;
 		viewportLeft = scrollAreaEl.scrollLeft;
 		viewportWidth = scrollAreaEl.clientWidth;
-	}
-
-	// Track key: live streams get their own row, VODs from same channel share a row
-	function trackKeyFor(stream: { id: string; sourceType: string; platform: string; channel: string }): string {
-		if (stream.sourceType === 'live') return stream.id;
-		return `vod:${stream.platform}:${stream.channel}`;
 	}
 
 	// Stable track ordering: preserve insertion order
@@ -185,6 +180,31 @@
 			};
 		})
 	);
+
+	// Pre-compute clip regions grouped by stream ID for O(1) lookup in template
+	let clipRegionsByStream = $derived.by(() => {
+		const map = new Map<string, ClipRegion[]>();
+		for (const r of $clipRegions) {
+			const list = map.get(r.streamId);
+			if (list) list.push(r);
+			else map.set(r.streamId, [r]);
+		}
+		return map;
+	});
+
+	// Clip regions for each track (union of all stream IDs in the track)
+	let trackClipRegions = $derived.by(() => {
+		const map = new Map<string, ClipRegion[]>();
+		for (const track of tracksData) {
+			const regions: ClipRegion[] = [];
+			for (const sid of track.streamIds) {
+				const streamRegions = clipRegionsByStream.get(sid);
+				if (streamRegions) regions.push(...streamRegions);
+			}
+			map.set(track.key, regions);
+		}
+		return map;
+	});
 
 	// Progress per stream — only used for bar-progress width, changes at ~4/sec.
 	// Isolated from tracksData so it doesn't cascade recomputation.
@@ -315,14 +335,6 @@
 		}
 		return result;
 	});
-
-	function formatTime(epochSec: number): string {
-		const d = new Date(epochSec * 1000);
-		const h = d.getHours();
-		const m = d.getMinutes();
-		const s = d.getSeconds();
-		return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-	}
 
 	// --- Auto-scroll + self-advance ---
 	function scrollLoop() {
@@ -846,7 +858,7 @@
 									{/each}
 								{/if}
 							{/each}
-							{#each $clipRegions.filter((r) => track.streamIds.includes(r.streamId)) as region}
+							{#each trackClipRegions.get(track.key) ?? [] as region}
 								{@const dragShift = draggingStreamId === region.streamId ? -dragOffsetDelta : 0}
 								{@const clipLeft = (region.startTime + dragShift - effectiveTimelineStart) * pixelsPerSecond}
 								{@const clipWidth = (region.endTime - region.startTime) * pixelsPerSecond}

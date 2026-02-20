@@ -209,23 +209,32 @@ export function startCapture(
 	let ffmpegProc: ReturnType<typeof Bun.spawn> | null = null;
 
 	// Common setup: segment watcher, metadata polling, kill function
+	let lastKnownSegCount = 0;
+	let lastKnownDiskUsage = 0;
 	const segmentWatchInterval = setInterval(async () => {
 		try {
 			const allFiles = await fs.promises.readdir(recordingDir);
 			const tsFiles = allFiles.filter((f) => f.endsWith('.ts'));
-			info.segmentCount = tsFiles.length;
+			const newSegCount = tsFiles.length;
 
-			const stats = await Promise.all(
-				allFiles.map(async (f) => {
-					try {
-						const stat = await fs.promises.stat(path.join(recordingDir, f));
-						return stat.size;
-					} catch { return 0; }
-				})
-			);
-			info.diskUsageBytes = stats.reduce((a, b) => a + b, 0);
+			if (newSegCount !== lastKnownSegCount) {
+				// Only re-stat when file count changes
+				const stats = await Promise.all(
+					allFiles.map(async (f) => {
+						try {
+							const stat = await fs.promises.stat(path.join(recordingDir, f));
+							return stat.size;
+						} catch { return 0; }
+					})
+				);
+				lastKnownDiskUsage = stats.reduce((a, b) => a + b, 0);
+				lastKnownSegCount = newSegCount;
+			}
 
-			if (tsFiles.length > 0 && info.status === 'starting') {
+			info.segmentCount = newSegCount;
+			info.diskUsageBytes = lastKnownDiskUsage;
+
+			if (newSegCount > 0 && info.status === 'starting') {
 				info.status = 'capturing';
 			}
 			onStatusChange(info);
@@ -313,6 +322,8 @@ export function startCapture(
 					}
 				});
 			} catch (err) {
+				clearInterval(segmentWatchInterval);
+				if (streamMetaInterval) clearInterval(streamMetaInterval);
 				console.error(`[douyu:${channel}] Failed to resolve stream:`, err);
 				info.status = 'error';
 				info.error = err instanceof Error ? err.message : 'Failed to resolve Douyu stream';

@@ -2,6 +2,14 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { streams } from '$lib/stores/streams.js';
 	import type { ChannelInfo } from '$lib/types.js';
+	import { formatUptime, formatViewers } from '$lib/utils.js';
+	import {
+		browseStreams,
+		searchCategories,
+		ignoreChannelCmd,
+		getIgnoredChannels,
+		getWatchlist
+	} from '$lib/streams.remote.js';
 
 	const STORAGE_KEY = 'omni-discovery-categories';
 	const VIEWER_STORAGE_KEY = 'omni-discovery-viewers';
@@ -141,19 +149,14 @@
 		if (wasInclude) fetchStreams();
 	}
 
-	async function fetchSuggestions(query: string) {
-		if (!query.trim()) {
+	async function fetchSuggestions(q: string) {
+		if (!q.trim()) {
 			suggestions = [];
 			showSuggestions = false;
 			return;
 		}
 		try {
-			const res = await fetch('/api/browse/categories', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ query })
-			});
-			const data = await res.json();
+			const data = await searchCategories({ query: q });
 			const cats: CategorySuggestion[] = data.categories ?? [];
 			suggestions = cats;
 			showSuggestions = suggestions.length > 0;
@@ -210,16 +213,7 @@
 	}
 
 	async function fetchBrowse(gameId?: string, after?: string): Promise<{ streams: ChannelInfo[]; cursor: string | null; hasNextPage: boolean }> {
-		const body: Record<string, unknown> = {};
-		if (gameId) body.gameId = gameId;
-		if (after) body.after = after;
-
-		const res = await fetch('/api/browse', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify(body)
-		});
-		return res.json();
+		return browseStreams({ gameId, after });
 	}
 
 	async function fetchStreams() {
@@ -319,28 +313,11 @@
 		if (ignoredLogins.has(login)) return;
 		ignoredLogins = new Set([...ignoredLogins, login]);
 		try {
-			await fetch('/api/browse/ignore', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ login })
-			});
+			await ignoreChannelCmd({ login });
 		} catch {
 			// Revert on failure
 			ignoredLogins = new Set([...ignoredLogins].filter(l => l !== login));
 		}
-	}
-
-	function formatUptime(startedAt: string): string {
-		const elapsed = now - new Date(startedAt).getTime();
-		const hours = Math.floor(elapsed / 3_600_000);
-		const minutes = Math.floor((elapsed % 3_600_000) / 60_000);
-		if (hours > 0) return `${hours}h ${minutes}m`;
-		return `${minutes}m`;
-	}
-
-	function formatViewers(count: number): string {
-		if (count >= 1000) return `${(count / 1000).toFixed(1)}K`;
-		return String(count);
 	}
 
 	onMount(() => {
@@ -352,10 +329,10 @@
 			viewerMin = saved.min ?? '';
 			viewerMax = saved.max ?? '';
 		} catch { /* ignore */ }
-		fetch('/api/watchlist').then(r => r.json()).then(d => {
+		getWatchlist().then(d => {
 			watchlistLogins = new Set((d.watchlist ?? []).map((e: { login: string }) => e.login));
 		}).catch(() => {});
-		fetch('/api/browse/ignore').then(r => r.json()).then(d => {
+		getIgnoredChannels().then(d => {
 			ignoredLogins = new Set(d.channels ?? []);
 		}).catch(() => {});
 		fetchStreams();
@@ -525,7 +502,7 @@
 								<span class="viewer-count">{formatViewers(channel.viewerCount)}</span>
 							{/if}
 							{#if channel.startedAt}
-								<span class="uptime">{formatUptime(channel.startedAt)}</span>
+								<span class="uptime">{formatUptime(channel.startedAt, now)}</span>
 							{/if}
 						</div>
 					{/if}
