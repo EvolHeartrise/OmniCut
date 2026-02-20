@@ -200,7 +200,8 @@ export function startCapture(
 		sourceType: isVod ? 'vod' : 'live',
 		parentStreamId: null,
 		platform,
-		sourceUrl: vodUrl || null
+		sourceUrl: vodUrl || null,
+		chatComplete: false
 	};
 
 	// Processes to track (populated differently per platform)
@@ -238,10 +239,12 @@ export function startCapture(
 	if (!isVod) {
 		streamMetaInterval = setInterval(async () => {
 			if (info.status === 'capturing') {
-				const meta = await fetchMeta(channel);
-				info.viewerCount = meta.viewerCount;
-				info.streamTitle = meta.title;
-				info.gameName = meta.gameName;
+				try {
+					const meta = await fetchMeta(channel);
+					info.viewerCount = meta.viewerCount;
+					info.streamTitle = meta.title;
+					info.gameName = meta.gameName;
+				} catch { /* network error — will retry next interval */ }
 			}
 		}, 30000);
 		fetchMeta(channel).then((meta) => {

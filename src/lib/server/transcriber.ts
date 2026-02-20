@@ -4,7 +4,8 @@ import * as fs from 'node:fs';
 const BATCH_SIZE = 15; // segments per batch (~30 seconds at 2s/segment, Whisper's full context window)
 const POLL_INTERVAL = 3000; // check for new segments every 3s
 const SEGMENT_DURATION = 2; // seconds per HLS segment (matches -hls_time 2)
-const POOL_SIZE = 2; // number of concurrent transcription workers
+const LIVE_POOL_SIZE = 2; // number of concurrent live transcription workers
+const VOD_POOL_SIZE = 1; // number of concurrent VOD transcription workers
 
 // --- Worker pool ---
 
@@ -54,22 +55,31 @@ interface QueueItem {
 	reject: (err: Error) => void;
 }
 
-let poolWorkers: PoolWorker[] = [];
-let poolInitStarted = false;
-let poolFailed = false;
-let poolReadyCount = 0;
+interface Pool {
+	workers: PoolWorker[];
+	queue: QueueItem[];
+	readyCount: number;
+	initStarted: boolean;
+	failed: boolean;
+	size: number;
+	label: string;
+}
 
-const requestQueue: QueueItem[] = [];
+const livePool: Pool = { workers: [], queue: [], readyCount: 0, initStarted: false, failed: false, size: LIVE_POOL_SIZE, label: 'live' };
+const vodPool: Pool = { workers: [], queue: [], readyCount: 0, initStarted: false, failed: false, size: VOD_POOL_SIZE, label: 'vod' };
+
+// Map worker → pending resolve callback (replaces unsafe `(worker as any)._currentResolve`)
+const workerResolvers = new Map<PoolWorker, (sentences: Sentence[]) => void>();
 
 function getScriptPath(): string {
 	return path.join(process.cwd(), 'scripts', 'transcribe_worker.py');
 }
 
-function spawnWorker(workerId: number): PoolWorker | null {
+function spawnWorker(pool: Pool, workerId: number): PoolWorker | null {
 	const scriptPath = getScriptPath();
 	if (!fs.existsSync(scriptPath)) {
-		console.warn('[transcriber] scripts/transcribe_worker.py not found, transcription disabled');
-		poolFailed = true;
+		console.warn(`[transcriber:${pool.label}] scripts/transcribe_worker.py not found, transcription disabled`);
+		pool.failed = true;
 		return null;
 	}
 
@@ -108,24 +118,24 @@ function spawnWorker(workerId: number): PoolWorker | null {
 						try {
 							const data = JSON.parse(line);
 							if (data.ready) {
-								console.log(`[transcriber:w${workerId}] Model loaded, ready for transcription`);
+								console.log(`[transcriber:${pool.label}:w${workerId}] Model loaded, ready for transcription`);
 								worker.ready = true;
-								poolReadyCount++;
-								processQueue();
+								pool.readyCount++;
+								processQueue(pool);
 								continue;
 							}
 							if (data.error && !worker.ready) {
-								console.error(`[transcriber:w${workerId}] Worker error: ${data.error}`);
-								removeWorker(worker);
+								console.error(`[transcriber:${pool.label}:w${workerId}] Worker error: ${data.error}`);
+								removeWorker(pool, worker);
 								return;
 							}
 							// Transcription response — resolve the current item
-							if (worker.busy && (worker as any)._currentResolve) {
-								const resolve = (worker as any)._currentResolve as (sentences: Sentence[]) => void;
-								(worker as any)._currentResolve = null;
+							if (worker.busy && workerResolvers.has(worker)) {
+								const resolve = workerResolvers.get(worker)!;
+								workerResolvers.delete(worker);
 								worker.busy = false;
 								resolve(data.sentences || []);
-								processQueue();
+								processQueue(pool);
 							}
 						} catch {
 							// ignore malformed lines
@@ -144,104 +154,105 @@ function spawnWorker(workerId: number): PoolWorker | null {
 					const { done, value } = await reader.read();
 					if (done) break;
 					const msg = decoder.decode(value).trim();
-					if (msg) console.error(`[transcriber:w${workerId}] ${msg}`);
+					if (msg) console.error(`[transcriber:${pool.label}:w${workerId}] ${msg}`);
 				}
 			} catch { /* stream closed */ }
 		})();
 
 		// Handle worker exit
 		proc.exited.then((code) => {
-			console.warn(`[transcriber:w${workerId}] Worker exited with code ${code}`);
+			console.warn(`[transcriber:${pool.label}:w${workerId}] Worker exited with code ${code}`);
 			// Resolve any pending request with empty array
-			if (worker.busy && (worker as any)._currentResolve) {
-				const resolve = (worker as any)._currentResolve as (sentences: Sentence[]) => void;
-				(worker as any)._currentResolve = null;
+			if (worker.busy && workerResolvers.has(worker)) {
+				const resolve = workerResolvers.get(worker)!;
+				workerResolvers.delete(worker);
 				worker.busy = false;
 				resolve([]);
 			}
-			removeWorker(worker);
+			removeWorker(pool, worker);
 			// Try to respawn if the pool is still active
-			if (!poolFailed && poolWorkers.length < POOL_SIZE) {
-				const newWorker = spawnWorker(workerId);
+			if (!pool.failed && pool.workers.length < pool.size) {
+				const newWorker = spawnWorker(pool, workerId);
 				if (newWorker) {
-					poolWorkers.push(newWorker);
+					pool.workers.push(newWorker);
 				}
 			}
 		});
 
 		return worker;
 	} catch (err) {
-		console.warn(`[transcriber:w${workerId}] Failed to spawn Python worker:`, err);
+		console.warn(`[transcriber:${pool.label}:w${workerId}] Failed to spawn Python worker:`, err);
 		return null;
 	}
 }
 
-function removeWorker(worker: PoolWorker) {
-	if (worker.ready) poolReadyCount--;
+function removeWorker(pool: Pool, worker: PoolWorker) {
+	if (worker.ready) pool.readyCount--;
 	worker.ready = false;
-	const idx = poolWorkers.indexOf(worker);
-	if (idx !== -1) poolWorkers.splice(idx, 1);
+	workerResolvers.delete(worker);
+	const idx = pool.workers.indexOf(worker);
+	if (idx !== -1) pool.workers.splice(idx, 1);
 }
 
-function ensurePool(): boolean {
-	if (poolFailed) return false;
-	if (poolReadyCount > 0) return true;
-	if (poolInitStarted) return false; // still starting up
+function ensurePool(pool: Pool): boolean {
+	if (pool.failed) return false;
+	if (pool.readyCount > 0) return true;
+	if (pool.initStarted) return false; // still starting up
 
-	poolInitStarted = true;
+	pool.initStarted = true;
 
 	const scriptPath = getScriptPath();
 	if (!fs.existsSync(scriptPath)) {
-		console.warn('[transcriber] scripts/transcribe_worker.py not found, transcription disabled');
-		poolFailed = true;
+		console.warn(`[transcriber:${pool.label}] scripts/transcribe_worker.py not found, transcription disabled`);
+		pool.failed = true;
 		return false;
 	}
 
-	console.log(`[transcriber] Spawning worker pool (size=${POOL_SIZE})`);
-	for (let i = 0; i < POOL_SIZE; i++) {
-		const worker = spawnWorker(i);
+	console.log(`[transcriber] Spawning ${pool.label} worker pool (size=${pool.size})`);
+	for (let i = 0; i < pool.size; i++) {
+		const worker = spawnWorker(pool, i);
 		if (worker) {
-			poolWorkers.push(worker);
+			pool.workers.push(worker);
 		}
 	}
 
-	if (poolWorkers.length === 0) {
-		poolFailed = true;
+	if (pool.workers.length === 0) {
+		pool.failed = true;
 		return false;
 	}
 
 	return false; // not ready yet, workers are loading models
 }
 
-function processQueue() {
-	if (requestQueue.length === 0) return;
+function processQueue(pool: Pool) {
+	if (pool.queue.length === 0) return;
 
 	// Find an idle, ready worker
-	const worker = poolWorkers.find((w) => w.ready && !w.busy);
+	const worker = pool.workers.find((w) => w.ready && !w.busy);
 	if (!worker) return;
 
-	const req = requestQueue.shift()!;
+	const req = pool.queue.shift()!;
 	worker.busy = true;
-	(worker as any)._currentResolve = req.resolve;
+	workerResolvers.set(worker, req.resolve);
 	const payload: Record<string, unknown> = { wav_path: req.wavPath, task: req.task };
 	if (req.language) payload.language = req.language;
 	worker.proc.stdin.write(JSON.stringify(payload) + '\n');
 
 	// Process more items if there are more idle workers
-	if (requestQueue.length > 0) {
-		processQueue();
+	if (pool.queue.length > 0) {
+		processQueue(pool);
 	}
 }
 
-function transcribeAudio(wavPath: string, language: string | null): Promise<Sentence[]> {
+function transcribeAudio(pool: Pool, wavPath: string, language: string | null): Promise<Sentence[]> {
 	const task = language && language !== 'en' ? 'translate' : 'transcribe';
 	return new Promise((resolve, reject) => {
-		if (!ensurePool() && poolWorkers.length === 0) {
+		if (!ensurePool(pool) && pool.workers.length === 0) {
 			resolve([]);
 			return;
 		}
-		requestQueue.push({ wavPath, language, task, resolve, reject });
-		processQueue();
+		pool.queue.push({ wavPath, language, task, resolve, reject });
+		processQueue(pool);
 	});
 }
 
@@ -307,27 +318,28 @@ const streamTrackers = new Map<string, StreamTracker>();
 async function checkForNewSegments(streamId: string) {
 	const tracker = streamTrackers.get(streamId);
 	if (!tracker || !tracker.active) return;
-	if (poolFailed) return;
+	if (livePool.failed) return;
 
 	// Ensure pool is started (non-blocking)
-	ensurePool();
-	if (poolReadyCount === 0) return; // model(s) still loading
+	ensurePool(livePool);
+	if (livePool.readyCount === 0) return; // model(s) still loading
 
-	// Probe for sequential segment files instead of listing the full directory.
-	// Segments are named seg000000.ts, seg000001.ts, ... so we just check
-	// if the next expected files exist.
+	// Probe for sequential segment files in parallel instead of one-by-one.
+	// Segments are named seg000000.ts, seg000001.ts, ... so we check
+	// if the next expected files exist concurrently.
 	const startIdx = tracker.lastProcessedIndex + 1;
 	const needed = BATCH_SIZE + 1; // need BATCH_SIZE for transcription + 1 buffer
-	let availableCount = 0;
 
-	for (let i = 0; i < needed; i++) {
-		const segPath = path.join(tracker.recordingDir, segmentFilename(startIdx + i));
-		try {
-			await fs.promises.access(segPath);
-			availableCount++;
-		} catch {
-			break;
-		}
+	const probes = Array.from({ length: needed }, (_, i) =>
+		fs.promises.access(path.join(tracker.recordingDir, segmentFilename(startIdx + i)))
+			.then(() => true, () => false)
+	);
+	const results = await Promise.all(probes);
+	// Count consecutive available segments from the start
+	let availableCount = 0;
+	for (const ok of results) {
+		if (!ok) break;
+		availableCount++;
 	}
 
 	if (availableCount < needed) return;
@@ -344,7 +356,7 @@ async function checkForNewSegments(streamId: string) {
 	if (!wavPath) return;
 
 	try {
-		const sentences = deduplicateSentences(await transcribeAudio(wavPath, tracker.language));
+		const sentences = deduplicateSentences(await transcribeAudio(livePool, wavPath, tracker.language));
 		const batchOffset = startIdx * SEGMENT_DURATION;
 
 		for (let i = 0; i < sentences.length; i++) {
@@ -392,10 +404,10 @@ export function startTranscription(
 ): void {
 	// Don't start if already tracking or worker pool is known to be broken
 	if (streamTrackers.has(streamId)) return;
-	if (poolFailed) return;
+	if (livePool.failed) return;
 
 	// Kick off worker pool startup early
-	ensurePool();
+	ensurePool(livePool);
 
 	const tracker: StreamTracker = {
 		recordingDir,
@@ -427,17 +439,35 @@ export function stopTranscription(streamId: string): void {
 	streamTrackers.delete(streamId);
 }
 
-/**
- * Transcribe an entire finished recording in one pass.
- * Concatenates all segments into a single WAV and sends to Whisper,
- * which handles cross-window context continuity internally.
- */
-export async function transcribeFullRecording(
-	streamId: string,
-	recordingDir: string,
-	onResult: TranscriptionCallback,
-	language?: string | null
-): Promise<void> {
+// --- VOD job queue ---
+
+interface VodJob {
+	streamId: string;
+	recordingDir: string;
+	onResult: TranscriptionCallback;
+	language: string | null;
+	resolve: () => void;
+}
+
+const vodJobQueue: VodJob[] = [];
+let vodJobActive = false;
+
+async function processVodJobQueue() {
+	if (vodJobActive || vodJobQueue.length === 0) return;
+	vodJobActive = true;
+	const job = vodJobQueue.shift()!;
+	try {
+		await doFullTranscription(job);
+	} finally {
+		job.resolve();
+		vodJobActive = false;
+		processVodJobQueue();
+	}
+}
+
+async function doFullTranscription(job: VodJob): Promise<void> {
+	const { streamId, recordingDir, onResult, language } = job;
+
 	// Enumerate all seg*.ts files, sort numerically
 	const allFiles = fs.readdirSync(recordingDir);
 	const segFiles = allFiles
@@ -449,20 +479,20 @@ export async function transcribeFullRecording(
 		});
 
 	if (segFiles.length === 0) {
-		console.log(`[transcriber] No segments found in ${recordingDir}, skipping full transcription`);
+		console.log(`[transcriber:vod] No segments found in ${recordingDir}, skipping full transcription`);
 		return;
 	}
 
-	console.log(`[transcriber] Starting full transcription for stream ${streamId} (${segFiles.length} segments)`);
+	console.log(`[transcriber:vod] Starting full transcription for stream ${streamId} (${segFiles.length} segments)`);
 
-	// Ensure worker pool is started; wait until at least one worker is ready
-	ensurePool();
-	while (poolReadyCount === 0 && !poolFailed) {
+	// Ensure VOD worker pool is started; wait until at least one worker is ready
+	ensurePool(vodPool);
+	while (vodPool.readyCount === 0 && !vodPool.failed) {
 		await new Promise((r) => setTimeout(r, 500));
-		ensurePool();
+		ensurePool(vodPool);
 	}
-	if (poolFailed) {
-		console.warn(`[transcriber] Pool failed, cannot transcribe stream ${streamId}`);
+	if (vodPool.failed) {
+		console.warn(`[transcriber:vod] Pool failed, cannot transcribe stream ${streamId}`);
 		return;
 	}
 
@@ -470,13 +500,13 @@ export async function transcribeFullRecording(
 	if (!wavPath) return;
 
 	try {
-		const raw = await transcribeAudio(wavPath, language ?? null);
+		const raw = await transcribeAudio(vodPool, wavPath, language);
 		const sentences = deduplicateSentences(raw);
 		const skipped = raw.length - sentences.length;
 		for (const s of sentences) {
 			onResult(streamId, s.text, s.start, s.end);
 		}
-		console.log(`[transcriber] Full transcription complete for stream ${streamId}: ${sentences.length} sentences${skipped > 0 ? ` (${skipped} duplicates removed)` : ''}`);
+		console.log(`[transcriber:vod] Full transcription complete for stream ${streamId}: ${sentences.length} sentences${skipped > 0 ? ` (${skipped} duplicates removed)` : ''}`);
 	} finally {
 		try {
 			fs.unlinkSync(wavPath);
@@ -485,18 +515,45 @@ export async function transcribeFullRecording(
 }
 
 /**
+ * Transcribe an entire finished recording in one pass.
+ * Concatenates all segments into a single WAV and sends to Whisper,
+ * which handles cross-window context continuity internally.
+ * VOD jobs are serialized so only one runs at a time.
+ */
+export function transcribeFullRecording(
+	streamId: string,
+	recordingDir: string,
+	onResult: TranscriptionCallback,
+	language?: string | null
+): Promise<void> {
+	return new Promise<void>((resolve) => {
+		vodJobQueue.push({ streamId, recordingDir, onResult, language: language ?? null, resolve });
+		const pending = vodJobQueue.length;
+		if (pending > 1) {
+			console.log(`[transcriber:vod] Queued transcription for ${streamId} (${pending - 1} ahead)`);
+		}
+		processVodJobQueue();
+	});
+}
+
+/**
  * Shut down all transcription workers.
  */
 export function shutdownTranscriber(): void {
+	// Stop live trackers
 	for (const [id] of streamTrackers) {
 		stopTranscription(id);
 	}
-	for (const worker of poolWorkers) {
-		try {
-			worker.proc.kill();
-		} catch {}
+	// Kill both pools
+	for (const pool of [livePool, vodPool]) {
+		for (const w of pool.workers) {
+			try {
+				w.proc.kill();
+			} catch {}
+		}
+		pool.workers = [];
+		pool.readyCount = 0;
+		pool.initStarted = false;
 	}
-	poolWorkers = [];
-	poolReadyCount = 0;
-	poolInitStarted = false;
+	workerResolvers.clear();
 }

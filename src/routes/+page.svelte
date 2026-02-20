@@ -9,7 +9,11 @@
 	import ExportPanel from '$lib/components/ExportPanel.svelte';
 	import TranscriptPanel from '$lib/components/TranscriptPanel.svelte';
 	import ChatPanel from '$lib/components/ChatPanel.svelte';
-	import { refreshStreams, connectSSE, streams, focusedStreamId, soloStreamId, appMode, transcriptPanelOpen, chatPanelOpen, transcriptions, syncOffsets, masterTime, clipRegions, saveClipRegion, type ClipRegion } from '$lib/stores/streams.js';
+	import { refreshStreams, connectSSE, streams, focusedStreamId, soloStreamId, appMode, transcriptPanelOpen, chatPanelOpen, transcriptions, syncOffsets, streamPlaybackStates, masterTime, clipRegions, saveClipRegion, type ClipRegion, type TranscriptionEntry } from '$lib/stores/streams.js';
+	import { getMultiStreamTranscriptions } from '$lib/streams.remote';
+
+	const CAPTION_WINDOW = 60; // ±60 seconds around playhead for StreamTile captions
+	const CAPTION_REFETCH_THRESHOLD = 10; // re-fetch when playhead drifts 10s
 
 	onMount(() => {
 		refreshStreams();
@@ -18,6 +22,57 @@
 	});
 
 	let mode = $derived($appMode);
+
+	// --- Windowed caption fetch (feeds StreamTile subtitles via transcriptions store) ---
+
+	let captionCenter = $state($masterTime);
+	let captionDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+	$effect(() => {
+		if ($appMode !== 'clipping') return;
+		const now = $masterTime;
+		if (Math.abs(now - captionCenter) >= CAPTION_REFETCH_THRESHOLD && !captionDebounceTimer) {
+			const snap = now;
+			captionDebounceTimer = setTimeout(() => {
+				captionDebounceTimer = null;
+				captionCenter = snap;
+			}, 300);
+		}
+	});
+
+	let captionRanges = $derived(
+		$appMode === 'clipping'
+			? $streams.map((s) => {
+					const anchor = s.startedAt / 1000;
+					const offset = $syncOffsets[s.id] || 0;
+					const localCenter = captionCenter - anchor + offset;
+					return {
+						streamId: s.id,
+						from: Math.max(0, localCenter - CAPTION_WINDOW),
+						to: localCenter + CAPTION_WINDOW
+					};
+				})
+			: []
+	);
+
+	const captionResults = $derived(
+		captionRanges.length > 0
+			? await getMultiStreamTranscriptions({ ranges: captionRanges })
+			: []
+	);
+
+	// Push windowed caption data into the transcriptions store for StreamTile
+	$effect(() => {
+		const data = captionResults;
+		if (!data) return;
+		const grouped: Record<string, TranscriptionEntry[]> = {};
+		for (const r of data) {
+			if (!grouped[r.streamId]) grouped[r.streamId] = [];
+			grouped[r.streamId].push({ text: r.text, startTime: r.startTime, endTime: r.endTime });
+		}
+		transcriptions.set(grouped);
+	});
+	let sourcesTab = $state<'library' | 'browse'>('browse');
 
 	// T-key hold state for transcription-based clip region creation
 	let tHeld = $state(false);
@@ -48,19 +103,55 @@
 			case '5':
 			case '6': {
 				const idx = parseInt(e.key) - 1;
-				if (idx < activeStreams.length) {
-					const stream = activeStreams[idx];
-					if ($soloStreamId === stream.id) {
+				// Build ordered unique track keys (same grouping as NLETimeline/StreamGrid)
+				const seen = new Set<string>();
+				const tKeys: string[] = [];
+				const tMembers = new Map<string, typeof activeStreams>();
+				for (const s of activeStreams) {
+					const key = s.sourceType === 'live' ? s.id : `vod:${s.platform}:${s.channel}`;
+					if (!seen.has(key)) {
+						seen.add(key);
+						tKeys.push(key);
+						tMembers.set(key, []);
+					}
+					tMembers.get(key)!.push(s);
+				}
+
+				if (idx < tKeys.length) {
+					const trackKey = tKeys[idx];
+					const members = tMembers.get(trackKey)!;
+
+					// Pick the best stream: the one whose time range contains the playhead
+					let target = members[0];
+					for (const s of members) {
+						const pb = $streamPlaybackStates[s.id];
+						if (pb && pb.duration > 0) {
+							const offset = $syncOffsets[s.id] || 0;
+							const anchor = s.startedAt / 1000;
+							if ($masterTime >= anchor - offset && $masterTime <= anchor + pb.duration - offset) {
+								target = s;
+								break;
+							}
+						}
+					}
+
+					// Check if this track is already focused/solo'd
+					const focusedSrc = $focusedStreamId ? activeStreams.find((s) => s.id === $focusedStreamId) : null;
+					const soloSrc = $soloStreamId ? activeStreams.find((s) => s.id === $soloStreamId) : null;
+					const focusedKey = focusedSrc ? (focusedSrc.sourceType === 'live' ? focusedSrc.id : `vod:${focusedSrc.platform}:${focusedSrc.channel}`) : null;
+					const soloKey = soloSrc ? (soloSrc.sourceType === 'live' ? soloSrc.id : `vod:${soloSrc.platform}:${soloSrc.channel}`) : null;
+
+					if (soloKey === trackKey) {
 						// solo → unfocused
 						soloStreamId.set(null);
 						focusedStreamId.set(null);
-					} else if ($focusedStreamId === stream.id) {
+					} else if (focusedKey === trackKey) {
 						// focused → solo
-						soloStreamId.set(stream.id);
+						soloStreamId.set(target.id);
 					} else {
 						// unfocused → focused
 						soloStreamId.set(null);
-						focusedStreamId.set(stream.id);
+						focusedStreamId.set(target.id);
 					}
 				}
 				break;
@@ -219,9 +310,16 @@
 
 	{#if mode === 'sources'}
 		<main class="sources-content">
-			<AddStreamBar />
-			<MediaLibrary />
-			<DiscoveryBrowser />
+			<div class="sources-tabs">
+				<button class="sources-tab" class:active={sourcesTab === 'library'} onclick={() => sourcesTab = 'library'}>Library</button>
+				<button class="sources-tab" class:active={sourcesTab === 'browse'} onclick={() => sourcesTab = 'browse'}>Browse</button>
+			</div>
+			{#if sourcesTab === 'library'}
+				<MediaLibrary />
+			{:else}
+				<AddStreamBar />
+				<DiscoveryBrowser />
+			{/if}
 		</main>
 	{:else if mode === 'clipping'}
 		<main class="main-content">
@@ -273,10 +371,44 @@
 	.sources-content {
 		flex: 1;
 		min-height: 0;
-		overflow: auto;
+		overflow: hidden;
 		padding: 24px;
 		display: flex;
-		gap: 24px;
+		flex-direction: column;
+		gap: 16px;
+	}
+
+	.sources-tabs {
+		display: flex;
+		gap: 2px;
+		background: #1a1a2e;
+		border-radius: 6px;
+		padding: 2px;
+		align-self: flex-start;
+		flex-shrink: 0;
+	}
+
+	.sources-tab {
+		background: none;
+		border: none;
+		color: #666;
+		font-size: 0.75rem;
+		font-weight: 600;
+		padding: 4px 14px;
+		border-radius: 4px;
+		cursor: pointer;
+		text-transform: uppercase;
+		letter-spacing: 0.5px;
+		transition: background 0.15s, color 0.15s;
+	}
+
+	.sources-tab:hover {
+		color: #aaa;
+	}
+
+	.sources-tab.active {
+		background: #7c3aed;
+		color: #fff;
 	}
 
 	.mode-tabs {

@@ -19,12 +19,14 @@ export interface StreamInfo {
 	parentStreamId: string | null;
 	platform: 'twitch' | 'douyu';
 	sourceUrl: string | null;
+	chatComplete: boolean;
 }
 
 export interface ChatMessage {
 	username: string;
 	text: string;
 	timestamp: number; // stream-local seconds (seconds since capture startedAt)
+	color?: string | null; // user's chat color (hex string like "#FF69B4")
 }
 
 export interface CaptureHandle {

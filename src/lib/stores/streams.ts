@@ -6,6 +6,7 @@ import {
 	stopStreamCmd,
 	removeStreamCmd,
 	retranscribeCmd,
+	refetchVodChatCmd,
 	resumeVodCmd,
 	updateOffsetCmd,
 	saveClipCmd,
@@ -31,6 +32,7 @@ export interface StreamState {
 	platform: 'twitch' | 'douyu';
 	sourceUrl?: string | null;
 	chatMessageCount: number;
+	chatComplete: boolean;
 }
 
 export type AppMode = 'sources' | 'clipping' | 'cleaning' | 'export';
@@ -126,21 +128,6 @@ export async function refreshStreams() {
 			clipRegions.set(data.clipRegions);
 		}
 
-		// Restore transcriptions from server
-		if (data.transcriptions) {
-			transcriptions.update((current) => {
-				const merged = { ...current };
-				for (const [streamId, entries] of Object.entries(data.transcriptions as Record<string, TranscriptionEntry[]>)) {
-					// Server has the full history; replace if client has fewer entries
-					const existing = merged[streamId] || [];
-					if (entries.length > existing.length) {
-						merged[streamId] = entries;
-					}
-				}
-				return merged;
-			});
-		}
-
 	} catch (err) {
 		console.error('Failed to refresh streams:', err);
 	}
@@ -186,6 +173,17 @@ export async function retranscribeStream(id: string): Promise<void> {
 		await retranscribeCmd({ id });
 	} catch (err) {
 		console.error('Failed to retranscribe stream:', err);
+	}
+}
+
+/**
+ * Refetch VOD chat for a Twitch VOD.
+ */
+export async function refetchVodChat(id: string): Promise<void> {
+	try {
+		await refetchVodChatCmd({ id });
+	} catch (err) {
+		console.error('Failed to refetch VOD chat:', err);
 	}
 }
 
@@ -284,17 +282,6 @@ export function connectSSE(): () => void {
 					} else {
 						return [...current, data.stream];
 					}
-				});
-			} else if (data.type === 'transcription') {
-				transcriptions.update((current) => {
-					const entries = current[data.streamId] || [];
-					return {
-						...current,
-						[data.streamId]: [
-							...entries,
-							{ text: data.text, startTime: data.startTime, endTime: data.endTime }
-						]
-					};
 				});
 			} else if (data.type === 'transcription-cleared') {
 				transcriptions.update((current) => {

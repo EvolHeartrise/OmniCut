@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { streams, removeStream } from '$lib/stores/streams.js';
+	import { streams, removeStream, retranscribeStream, resumeVodStream, refetchVodChat, stopStream } from '$lib/stores/streams.js';
 	import { formatBytes } from '$lib/utils.js';
 
 	let confirmingId = $state<string | null>(null);
@@ -28,13 +28,11 @@
 
 	function handleDelete(id: string) {
 		if (confirmingId === id) {
-			// Second click — confirmed
 			if (confirmTimer) clearTimeout(confirmTimer);
 			confirmTimer = null;
 			confirmingId = null;
 			removeStream(id);
 		} else {
-			// First click — arm confirmation
 			if (confirmTimer) clearTimeout(confirmTimer);
 			confirmingId = id;
 			confirmTimer = setTimeout(() => {
@@ -46,8 +44,6 @@
 </script>
 
 <div class="media-library">
-	<h3 class="lib-title">Media Library</h3>
-
 	{#if sorted.length === 0}
 		<p class="empty">No media recorded yet</p>
 	{:else}
@@ -77,6 +73,21 @@
 
 					<span class="meta date">{formatDate(stream.startedAt)}</span>
 
+					<span class="actions">
+						{#if stream.status === 'capturing' && stream.sourceType === 'vod'}
+							<button class="btn-action btn-stop" onclick={() => stopStream(stream.id)} title="Stop downloading">Stop</button>
+						{/if}
+						{#if stream.status === 'stopped'}
+							{#if stream.sourceType === 'vod' && stream.platform === 'twitch'}
+								<button class="btn-action btn-resume" onclick={() => resumeVodStream(stream.id)} title="Resume VOD download">Resume</button>
+							{/if}
+							{#if stream.platform === 'twitch' && !stream.chatComplete}
+								<button class="btn-action btn-refetch" onclick={() => refetchVodChat(stream.id)} title="Refetch VOD chat from Twitch">Chat</button>
+							{/if}
+							<button class="btn-action btn-retranscribe" onclick={() => retranscribeStream(stream.id)} title="Re-transcribe entire recording">Transcribe</button>
+						{/if}
+					</span>
+
 					<button
 						class="btn-delete"
 						class:confirming={confirmingId === stream.id}
@@ -96,20 +107,10 @@
 		border: 1px solid #1a1a2e;
 		border-radius: 8px;
 		padding: 16px;
-		min-width: 320px;
 		flex: 1;
 		display: flex;
 		flex-direction: column;
 		overflow: hidden;
-	}
-
-	.lib-title {
-		margin: 0 0 12px 0;
-		font-size: 0.85rem;
-		font-weight: 700;
-		color: #e0e0ff;
-		text-transform: uppercase;
-		letter-spacing: 0.5px;
 	}
 
 	.empty {
@@ -204,6 +205,66 @@
 
 	.meta.date {
 		color: #555;
+	}
+
+	.actions {
+		display: flex;
+		gap: 4px;
+		flex-shrink: 0;
+	}
+
+	.btn-action {
+		font-size: 0.6rem;
+		font-weight: 700;
+		padding: 2px 6px;
+		border-radius: 4px;
+		border: 1px solid;
+		background: transparent;
+		cursor: pointer;
+		text-transform: uppercase;
+		letter-spacing: 0.5px;
+		transition: background 0.15s, color 0.15s;
+		flex-shrink: 0;
+	}
+
+	.btn-stop {
+		border-color: #d97706;
+		color: #d97706;
+	}
+
+	.btn-stop:hover {
+		background: #d97706;
+		color: #000;
+	}
+
+	.btn-resume {
+		border-color: #22c55e;
+		color: #22c55e;
+	}
+
+	.btn-resume:hover {
+		background: #22c55e;
+		color: #000;
+	}
+
+	.btn-refetch {
+		border-color: #3b82f6;
+		color: #3b82f6;
+	}
+
+	.btn-refetch:hover {
+		background: #3b82f6;
+		color: #fff;
+	}
+
+	.btn-retranscribe {
+		border-color: #7c3aed;
+		color: #7c3aed;
+	}
+
+	.btn-retranscribe:hover {
+		background: #7c3aed;
+		color: #fff;
 	}
 
 	.btn-delete {

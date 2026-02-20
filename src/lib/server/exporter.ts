@@ -192,8 +192,11 @@ async function runFfmpeg(args: string[]): Promise<void> {
 	}
 }
 
-/** Test if NVENC is available by encoding a tiny synthetic video. */
+let nvencCached: boolean | null = null;
+
+/** Test if NVENC is available by encoding a tiny synthetic video (result cached). */
 async function detectNvenc(): Promise<boolean> {
+	if (nvencCached !== null) return nvencCached;
 	try {
 		const proc = Bun.spawn([
 			'ffmpeg',
@@ -209,8 +212,10 @@ async function detectNvenc(): Promise<boolean> {
 		});
 
 		const code = await proc.exited;
-		return code === 0;
+		nvencCached = code === 0;
+		return nvencCached;
 	} catch {
+		nvencCached = false;
 		return false;
 	}
 }

@@ -1,15 +1,17 @@
 <script lang="ts">
 	import {
-		transcriptions,
 		streams,
 		syncOffsets,
 		focusedStreamId,
 		soloStreamId,
 		masterTime,
-		seekRequest,
-		type TranscriptionEntry
+		seekRequest
 	} from '$lib/stores/streams.js';
 	import { TRACK_COLORS as COLORS } from '$lib/constants.js';
+	import { getMultiStreamTranscriptions } from '$lib/streams.remote';
+
+	const FETCH_WINDOW = 120; // ±120 seconds around playhead
+	const REFETCH_THRESHOLD = 30; // re-fetch when playhead drifts 30s from last center
 
 	let searchQuery = $state('');
 	let listEl = $state<HTMLDivElement | null>(null);
@@ -25,54 +27,75 @@
 		masterEnd: number;
 	}
 
-	// Build flat list of all entries with stream metadata, converted to master time
-	let allTaggedEntries = $derived.by(() => {
+	// Debounced center for query args — only updates when playhead drifts far enough.
+	let debouncedCenter = $state($masterTime);
+	let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+	$effect(() => {
+		const now = $masterTime;
+		if (Math.abs(now - debouncedCenter) >= REFETCH_THRESHOLD && !debounceTimer) {
+			const snapshotTime = now;
+			debounceTimer = setTimeout(() => {
+				debounceTimer = null;
+				debouncedCenter = snapshotTime;
+			}, 300);
+		}
+	});
+
+	// Build stream lookup for visible streams
+	let visibleStreams = $derived.by(() => {
 		const allStreams = $streams;
-		const allTranscriptions = $transcriptions;
 		const offsets = $syncOffsets;
 		const focused = $focusedStreamId || $soloStreamId;
 
-		const result: TaggedEntry[] = [];
+		return allStreams
+			.filter((s) => !focused || s.id === focused)
+			.map((s) => ({
+				id: s.id,
+				channel: s.channel,
+				anchor: s.startedAt / 1000,
+				offset: offsets[s.id] || 0,
+				color: COLORS[allStreams.indexOf(s) % COLORS.length]
+			}));
+	});
 
-		for (let i = 0; i < allStreams.length; i++) {
-			const stream = allStreams[i];
-			// If a stream is focused/solo, only include that stream's transcriptions
-			if (focused && stream.id !== focused) continue;
+	// Derive query ranges from debounced center + visible streams
+	let transcriptRanges = $derived(
+		visibleStreams.map((s) => {
+			const localCenter = debouncedCenter - s.anchor + s.offset;
+			return {
+				streamId: s.id,
+				from: Math.max(0, localCenter - FETCH_WINDOW),
+				to: localCenter + FETCH_WINDOW
+			};
+		})
+	);
 
-			const entries = allTranscriptions[stream.id];
-			if (!entries || entries.length === 0) continue;
+	// Fetch transcriptions via remote query — re-fetches when ranges change
+	const rawEntries = $derived(await getMultiStreamTranscriptions({ ranges: transcriptRanges }));
 
-			const anchor = stream.startedAt / 1000;
-			const offset = offsets[stream.id] || 0;
-			const color = COLORS[i % COLORS.length];
-
-			for (const entry of entries) {
-				// Convert stream-local time to master (epoch) time:
-				// localTime = masterTime - anchor + offset
-				// therefore: masterTime = localTime + anchor - offset
-				const masterStart = entry.startTime + anchor - offset;
-				const masterEnd = entry.endTime + anchor - offset;
-
-				result.push({
-					streamId: stream.id,
-					channel: stream.channel,
-					color,
-					text: entry.text,
-					masterStart,
-					masterEnd
-				});
-			}
-		}
-
-		result.sort((a, b) => a.masterStart - b.masterStart);
-		return result;
+	// Transform server data to TaggedEntry format with master-time positioning
+	let fetchedEntries = $derived.by(() => {
+		if (!rawEntries || rawEntries.length === 0) return [] as TaggedEntry[];
+		const streamLookup = new Map(visibleStreams.map((s) => [s.id, s]));
+		return rawEntries.map((e) => {
+			const s = streamLookup.get(e.streamId);
+			return {
+				streamId: e.streamId,
+				channel: s?.channel || '',
+				color: s?.color || '#888',
+				text: e.text,
+				masterStart: e.startTime + (s ? s.anchor - s.offset : 0),
+				masterEnd: e.endTime + (s ? s.anchor - s.offset : 0)
+			};
+		});
 	});
 
 	// Apply search filter
 	let filteredEntries = $derived.by(() => {
-		if (!searchQuery.trim()) return allTaggedEntries;
+		if (!searchQuery.trim()) return fetchedEntries;
 		const q = searchQuery.trim().toLowerCase();
-		return allTaggedEntries.filter((e) => e.text.toLowerCase().includes(q));
+		return fetchedEntries.filter((e) => e.text.toLowerCase().includes(q));
 	});
 
 	// Find the active entry based on current master playhead
@@ -108,6 +131,14 @@
 			userScrolled = false;
 		}, 3000);
 	}
+
+	// Clean up scroll timeout and debounce timer on unmount
+	$effect(() => {
+		return () => {
+			if (scrollTimeout) clearTimeout(scrollTimeout);
+			if (debounceTimer) clearTimeout(debounceTimer);
+		};
+	});
 
 	function seekToEntry(entry: TaggedEntry) {
 		seekRequest.update((r) => ({ time: entry.masterStart, seq: r.seq + 1 }));

@@ -611,7 +611,7 @@
 			onmousedown={handleTimelineClick}
 		>
 			<div class="track-content" style="width: {contentWidth}px">
-				{#each segments as seg, i}
+				{#each segments as seg, i (seg.clip.id)}
 					{@const left = seg.cumulativeStart * pixelsPerSecond}
 					{@const width = seg.duration * pixelsPerSecond}
 					<div

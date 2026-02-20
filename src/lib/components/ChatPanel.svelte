@@ -5,9 +5,11 @@
 		focusedStreamId,
 		soloStreamId,
 		masterTime,
+		masterPlaying,
 		seekRequest
 	} from '$lib/stores/streams.js';
 	import { TRACK_COLORS as COLORS } from '$lib/constants.js';
+	import { usernameColor } from '$lib/utils.js';
 	import { getMultiStreamChat } from '$lib/streams.remote';
 
 	const FETCH_WINDOW = 120; // ±120 seconds around playhead
@@ -21,15 +23,14 @@
 	interface ChatEntry {
 		streamId: string;
 		channel: string;
-		color: string;
+		streamColor: string;
 		username: string;
 		text: string;
 		masterTime: number; // epoch seconds
+		userColor: string; // resolved chat color (real or fallback)
 	}
 
 	// Debounced center for query args — only updates when playhead drifts far enough.
-	// IMPORTANT: we must NOT clear+reschedule on every frame, or the timeout never fires
-	// during continuous playback. Instead, only schedule if no timer is already pending.
 	let debouncedCenter = $state($masterTime);
 	let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -52,7 +53,7 @@
 
 		return allStreams
 			.filter((s) => !focused || s.id === focused)
-			.map((s, i) => ({
+			.map((s) => ({
 				id: s.id,
 				channel: s.channel,
 				anchor: s.startedAt / 1000,
@@ -85,16 +86,17 @@
 			return {
 				streamId: m.streamId,
 				channel: s?.channel || '',
-				color: s?.color || '#888',
+				streamColor: s?.color || '#888',
 				username: m.username,
 				text: m.text,
-				masterTime: m.timestamp + (s ? s.anchor - s.offset : 0)
+				masterTime: m.timestamp + (s ? s.anchor - s.offset : 0),
+				userColor: m.color || usernameColor(m.username)
 			};
 		});
 	});
 
 	// Apply search filter
-	let filteredEntries = $derived.by(() => {
+	let searchFiltered = $derived.by(() => {
 		if (!searchQuery.trim()) return fetchedEntries;
 		const q = searchQuery.trim().toLowerCase();
 		return fetchedEntries.filter(
@@ -102,45 +104,61 @@
 		);
 	});
 
-	// Find the active entry based on current master playhead
-	let activeEntryIndex = $derived.by(() => {
+	// Only show messages at or before the current playhead (no future messages)
+	let displayEntries = $derived.by(() => {
 		const now = $masterTime;
-		// Find last entry at or before the playhead
-		for (let i = filteredEntries.length - 1; i >= 0; i--) {
-			if (filteredEntries[i].masterTime <= now) return i;
+		// Binary search for the cutoff: first entry with masterTime > now
+		let lo = 0, hi = searchFiltered.length;
+		while (lo < hi) {
+			const mid = (lo + hi) >>> 1;
+			if (searchFiltered[mid].masterTime <= now) lo = mid + 1;
+			else hi = mid;
 		}
-		return -1;
+		const all = searchFiltered.slice(0, lo);
+		return all.length > 100 ? all.slice(all.length - 100) : all;
 	});
 
-	// Auto-scroll to active entry (suppressed briefly after manual scroll)
+	// Auto-scroll to bottom while playing and not manually scrolled up
 	$effect(() => {
-		const idx = activeEntryIndex;
-		if (idx < 0 || !listEl || userScrolled) return;
-
-		const activeEl = listEl.querySelector(`[data-index="${idx}"]`);
-		if (activeEl) {
-			activeEl.scrollIntoView({ block: 'center', behavior: 'smooth' });
-		}
+		const _len = displayEntries.length;
+		if (!listEl || userScrolled || !$masterPlaying) return;
+		listEl.scrollTop = listEl.scrollHeight;
 	});
 
 	function handleListScroll() {
+		if (!listEl) return;
+		// If near the bottom, re-enable auto-scroll
+		const atBottom = listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight < 50;
+		if (atBottom) {
+			userScrolled = false;
+			if (scrollTimeout) { clearTimeout(scrollTimeout); scrollTimeout = null; }
+			return;
+		}
 		userScrolled = true;
 		if (scrollTimeout) clearTimeout(scrollTimeout);
-		scrollTimeout = setTimeout(() => {
-			userScrolled = false;
-		}, 3000);
+		scrollTimeout = setTimeout(() => { userScrolled = false; }, 5000);
 	}
+
+	// Clean up scroll timeout and debounce timer on unmount
+	$effect(() => {
+		return () => {
+			if (scrollTimeout) clearTimeout(scrollTimeout);
+			if (debounceTimer) clearTimeout(debounceTimer);
+		};
+	});
 
 	function seekToEntry(entry: ChatEntry) {
 		seekRequest.update((r) => ({ time: entry.masterTime, seq: r.seq + 1 }));
 	}
 
+	function scrollToBottom() {
+		userScrolled = false;
+		if (listEl) listEl.scrollTop = listEl.scrollHeight;
+	}
+
 	function formatTime(epochSec: number): string {
 		const d = new Date(epochSec * 1000);
-		const h = d.getHours();
-		const m = d.getMinutes();
-		const s = d.getSeconds();
-		return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+		return `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}:${d.getSeconds().toString().padStart(2, '0')}`;
 	}
 
 	function clearSearch() {
@@ -149,16 +167,16 @@
 </script>
 
 <div class="chat-panel">
-	<div class="panel-header">
-		<span class="panel-title">Chat</span>
-		<span class="entry-count">{filteredEntries.length}</span>
+	<div class="chat-header">
+		<span class="header-title">Stream Chat</span>
+		<span class="msg-count">{displayEntries.length}</span>
 	</div>
 
 	<div class="search-bar">
 		<input
 			type="text"
 			class="search-input"
-			placeholder="Search chat..."
+			placeholder="Filter..."
 			bind:value={searchQuery}
 		/>
 		{#if searchQuery}
@@ -166,34 +184,30 @@
 		{/if}
 	</div>
 
-	<div class="entry-list" bind:this={listEl} onscroll={handleListScroll}>
-		{#each filteredEntries as entry, i (i)}
-			<button
-				class="entry-row"
-				class:active={i === activeEntryIndex}
-				data-index={i}
-				onclick={() => seekToEntry(entry)}
-			>
-				<div class="entry-meta">
-					<span class="color-dot" style="background: {entry.color}"></span>
-					<span class="entry-username">{entry.username}</span>
-					<span class="entry-time">{formatTime(entry.masterTime)}</span>
-				</div>
-				<p class="entry-text">{entry.text}</p>
+	<div class="chat-log" bind:this={listEl} onscroll={handleListScroll}>
+		{#each displayEntries as entry (entry.masterTime.toString() + entry.username + entry.text.slice(0, 30))}
+			<button class="chat-line" onclick={() => seekToEntry(entry)}>
+				<span class="user" style="color:{entry.userColor}">{entry.username}</span><span class="sep">:</span>
+				<span class="msg">{entry.text}</span>
 			</button>
 		{/each}
 
-		{#if filteredEntries.length === 0}
-			<div class="empty-entries">
+		{#if displayEntries.length === 0}
+			<div class="chat-empty">
 				{#if searchQuery}
 					<p>No matches for &ldquo;{searchQuery}&rdquo;</p>
 				{:else}
-					<p>No chat messages nearby</p>
-					<p class="empty-hint">Chat messages appear around the playhead position</p>
+					<p>No chat messages</p>
 				{/if}
 			</div>
 		{/if}
 	</div>
+
+	{#if userScrolled}
+		<button class="scroll-bottom" onclick={scrollToBottom}>
+			More messages below
+		</button>
+	{/if}
 </div>
 
 <style>
@@ -202,73 +216,71 @@
 		flex-shrink: 0;
 		display: flex;
 		flex-direction: column;
-		background: #0f0f23;
-		border-left: 1px solid #1a1a2e;
+		background: #18181b;
+		border-left: 1px solid #2a2a2e;
 		height: 100%;
 		overflow: hidden;
+		position: relative;
 	}
 
-	.panel-header {
+	.chat-header {
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
-		padding: 8px 12px;
-		background: #0a0a1a;
-		border-bottom: 1px solid #1a1a2e;
+		padding: 10px 12px;
+		border-bottom: 1px solid #2a2a2e;
 		flex-shrink: 0;
 	}
 
-	.panel-title {
-		font-size: 0.75rem;
-		font-weight: 600;
-		color: #e0e0ff;
-		text-transform: uppercase;
-		letter-spacing: 0.5px;
+	.header-title {
+		font-size: 0.8rem;
+		font-weight: 700;
+		color: #efeff1;
 	}
 
-	.entry-count {
+	.msg-count {
 		font-size: 0.65rem;
-		color: #666;
-		background: #1a1a2e;
+		color: #adadb8;
+		background: #26262c;
 		padding: 2px 6px;
 		border-radius: 8px;
 	}
 
 	.search-bar {
-		padding: 8px;
-		border-bottom: 1px solid #1a1a2e;
+		padding: 6px 10px;
+		border-bottom: 1px solid #2a2a2e;
 		flex-shrink: 0;
 		position: relative;
 	}
 
 	.search-input {
 		width: 100%;
-		background: #0a0a1a;
-		border: 1px solid #2a2a4a;
+		background: #0e0e10;
+		border: 1px solid #3a3a3e;
 		border-radius: 4px;
-		color: #e0e0ff;
+		color: #efeff1;
 		font-size: 0.75rem;
-		padding: 6px 28px 6px 8px;
+		padding: 5px 26px 5px 8px;
 		outline: none;
 		box-sizing: border-box;
 	}
 
 	.search-input:focus {
-		border-color: #7c3aed;
+		border-color: #9147ff;
 	}
 
 	.search-input::placeholder {
-		color: #555;
+		color: #53535f;
 	}
 
 	.search-clear {
 		position: absolute;
-		right: 14px;
+		right: 16px;
 		top: 50%;
 		transform: translateY(-50%);
 		background: none;
 		border: none;
-		color: #666;
+		color: #53535f;
 		cursor: pointer;
 		font-size: 0.85rem;
 		padding: 2px 4px;
@@ -276,111 +288,117 @@
 	}
 
 	.search-clear:hover {
-		color: #aaa;
+		color: #adadb8;
 	}
 
-	.entry-list {
+	.chat-log {
 		flex: 1;
 		overflow-y: auto;
 		overflow-x: hidden;
+		padding: 4px 0;
 		scrollbar-width: thin;
-		scrollbar-color: #2a2a4a #0f0f23;
+		scrollbar-color: #3a3a3e #18181b;
 	}
 
-	.entry-list::-webkit-scrollbar {
+	.chat-log::-webkit-scrollbar {
 		width: 6px;
 	}
 
-	.entry-list::-webkit-scrollbar-track {
-		background: #0f0f23;
+	.chat-log::-webkit-scrollbar-track {
+		background: #18181b;
 	}
 
-	.entry-list::-webkit-scrollbar-thumb {
-		background: #2a2a4a;
+	.chat-log::-webkit-scrollbar-thumb {
+		background: #3a3a3e;
 		border-radius: 3px;
 	}
 
-	.entry-row {
+	.chat-line {
 		display: block;
 		width: 100%;
 		text-align: left;
 		background: none;
 		border: none;
-		border-bottom: 1px solid #111;
-		border-left: 2px solid transparent;
-		padding: 6px 12px;
+		padding: 2px 12px;
 		cursor: pointer;
-		transition: background 0.1s;
 		font-family: inherit;
-	}
-
-	.entry-row:hover {
-		background: #1a1a2e;
-	}
-
-	.entry-row.active {
-		background: rgba(124, 58, 237, 0.15);
-		border-left-color: #7c3aed;
-	}
-
-	.entry-meta {
-		display: flex;
-		align-items: center;
-		gap: 6px;
-		margin-bottom: 1px;
-	}
-
-	.color-dot {
-		width: 6px;
-		height: 6px;
-		border-radius: 50%;
-		flex-shrink: 0;
-	}
-
-	.entry-username {
-		font-size: 0.7rem;
-		color: #a78bfa;
-		font-weight: 700;
-	}
-
-	.entry-time {
-		font-size: 0.6rem;
-		color: #555;
-		font-family: monospace;
-		font-variant-numeric: tabular-nums;
-		margin-left: auto;
-	}
-
-	.entry-text {
-		font-size: 0.75rem;
-		color: #ccc;
-		line-height: 1.3;
-		margin: 0;
+		font-size: 13px;
+		line-height: 1.4;
+		color: #efeff1;
 		word-break: break-word;
 	}
 
-	.entry-row.active .entry-text {
-		color: #e0e0ff;
+	.chat-line:hover {
+		background: #26262c;
 	}
 
-	.empty-entries {
+	.ts {
+		font-size: 11px;
+		color: #53535f;
+		font-family: monospace;
+		font-variant-numeric: tabular-nums;
+		margin-right: 4px;
+	}
+
+	.stream-dot {
+		display: inline-block;
+		width: 6px;
+		height: 6px;
+		border-radius: 50%;
+		margin-right: 3px;
+		vertical-align: middle;
+	}
+
+	.user {
+		font-weight: 700;
+		font-size: 13px;
+	}
+
+	.sep {
+		color: #efeff1;
+		margin-right: 4px;
+	}
+
+	.msg {
+		color: #efeff1;
+		font-size: 13px;
+	}
+
+	.chat-empty {
 		display: flex;
 		flex-direction: column;
 		align-items: center;
 		justify-content: center;
-		padding: 24px 12px;
-		color: #555;
-		font-size: 0.75rem;
+		padding: 32px 12px;
+		color: #53535f;
+		font-size: 0.8rem;
 		text-align: center;
-		gap: 4px;
 	}
 
-	.empty-entries p {
+	.chat-empty p {
 		margin: 0;
 	}
 
-	.empty-hint {
-		font-size: 0.65rem;
-		color: #444;
+	.scroll-bottom {
+		position: absolute;
+		bottom: 8px;
+		left: 50%;
+		transform: translateX(-50%);
+		background: #9147ff;
+		color: #fff;
+		border: none;
+		border-radius: 4px;
+		padding: 6px 16px;
+		font-size: 0.7rem;
+		font-weight: 600;
+		cursor: pointer;
+		opacity: 0.95;
+		z-index: 10;
+		box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+	}
+
+	.scroll-bottom:hover {
+		opacity: 1;
+		background: #772ce8;
 	}
 </style>

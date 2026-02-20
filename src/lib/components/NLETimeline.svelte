@@ -80,6 +80,17 @@
 	let ignoreScrollEvents = false;
 	let lastFrameTime = 0;
 
+	// Visible viewport range (updated on scroll/resize for culling)
+	let viewportLeft = $state(0);
+	let viewportWidth = $state(2000);
+	const CULL_MARGIN = 200; // px overdraw on each side
+
+	function updateViewport() {
+		if (!scrollAreaEl) return;
+		viewportLeft = scrollAreaEl.scrollLeft;
+		viewportWidth = scrollAreaEl.clientWidth;
+	}
+
 	// Track key: live streams get their own row, VODs from same channel share a row
 	function trackKeyFor(stream: { id: string; sourceType: string; platform: string; channel: string }): string {
 		if (stream.sourceType === 'live') return stream.id;
@@ -130,13 +141,30 @@
 		return map;
 	});
 
-	// Derive per-track data from stores — each track has an array of bars
+	// Extract stable durations — only changes when a stream finishes loading, not every tick.
+	// Keyed by stream ID, updated via $effect to avoid re-deriving tracksData on every tick.
+	let streamDurations = $state<Record<string, number>>({});
+	$effect.pre(() => {
+		const states = $streamPlaybackStates;
+		let changed = false;
+		const next = { ...streamDurations };
+		for (const id in states) {
+			const dur = states[id]?.duration || 0;
+			if (dur > 0 && next[id] !== dur) {
+				next[id] = dur;
+				changed = true;
+			}
+		}
+		if (changed) streamDurations = next;
+	});
+
+	// Derive per-track data from stores — does NOT depend on $streamPlaybackStates directly,
+	// only on streamDurations (stable) and $syncOffsets (changes on drag).
 	let tracksData = $derived(
 		trackOrder.map((key, i) => {
 			const trackStreams = trackStreamsMap.get(key) || [];
 			const channel = trackStreams[0]?.channel || key;
 			const bars = trackStreams.map((stream) => {
-				const playback = $streamPlaybackStates[stream.id];
 				const offset = $syncOffsets[stream.id] || 0;
 				return {
 					streamId: stream.id,
@@ -144,9 +172,7 @@
 					sourceType: stream.sourceType,
 					offset,
 					anchor: (stream.startedAt || Date.now()) / 1000,
-					duration: playback?.duration || 0,
-					currentTime: playback?.currentTime || 0,
-					paused: playback?.paused ?? true
+					duration: streamDurations[stream.id] || 0
 				};
 			});
 			return {
@@ -159,6 +185,18 @@
 			};
 		})
 	);
+
+	// Progress per stream — only used for bar-progress width, changes at ~4/sec.
+	// Isolated from tracksData so it doesn't cascade recomputation.
+	let barProgress = $derived.by(() => {
+		const result: Record<string, number> = {};
+		const states = $streamPlaybackStates;
+		for (const id in states) {
+			const dur = streamDurations[id] || 0;
+			result[id] = dur > 0 ? (states[id].currentTime / dur) * 100 : 0;
+		}
+		return result;
+	});
 
 	// Chat heatmap: fetch once per stream via remote query, store in $state
 	const CHAT_BUCKET_SECONDS = 5;
@@ -263,10 +301,15 @@
 
 	let ticks = $derived.by(() => {
 		const result: { x: number; label: string }[] = [];
-		const start = Math.ceil(effectiveTimelineStart / tickInterval) * tickInterval;
+		const visMin = viewportLeft - CULL_MARGIN;
+		const visMax = viewportLeft + viewportWidth + CULL_MARGIN;
+		// Start from the first tick visible in the viewport
+		const tMin = effectiveTimelineStart + visMin / pixelsPerSecond;
+		const start = Math.ceil(tMin / tickInterval) * tickInterval;
 		for (let t = start; t <= timelineEnd + tickInterval; t += tickInterval) {
 			const x = (t - effectiveTimelineStart) * pixelsPerSecond;
-			if (x >= 0 && x <= contentWidth) {
+			if (x > visMax) break;
+			if (x >= 0) {
 				result.push({ x, label: formatTime(t) });
 			}
 		}
@@ -296,6 +339,7 @@
 			const targetScrollLeft = playheadX - scrollAreaEl.clientWidth / 2;
 			ignoreScrollEvents = true;
 			scrollAreaEl.scrollLeft = targetScrollLeft;
+			updateViewport();
 		}
 		rafId = requestAnimationFrame(scrollLoop);
 	}
@@ -305,6 +349,7 @@
 		if (labelsEl && scrollAreaEl) {
 			labelsEl.scrollTop = scrollAreaEl.scrollTop;
 		}
+		updateViewport();
 		if (ignoreScrollEvents) {
 			ignoreScrollEvents = false;
 			return;
@@ -679,13 +724,24 @@
 		const el = scrollAreaEl;
 		if (!el) return;
 		el.addEventListener('wheel', handleWheel, { passive: false });
-		return () => el.removeEventListener('wheel', handleWheel);
+		updateViewport();
+		const ro = new ResizeObserver(() => updateViewport());
+		ro.observe(el);
+		return () => {
+			el.removeEventListener('wheel', handleWheel);
+			ro.disconnect();
+		};
 	});
 
 	// RAF loop — runs for component lifetime
 	$effect(() => {
 		rafId = requestAnimationFrame(scrollLoop);
-		return () => cancelAnimationFrame(rafId);
+		return () => {
+			cancelAnimationFrame(rafId);
+			// Clean up any drag listeners if component unmounts mid-drag
+			window.removeEventListener('mousemove', handleTrackMouseMove);
+			window.removeEventListener('mouseup', handleTrackMouseUp);
+		};
 	});
 </script>
 
@@ -768,7 +824,7 @@
 									>
 										<div
 											class="bar-progress"
-											style="width: {((bar.currentTime / bar.duration) * 100).toFixed(1)}%"
+											style="width: {(barProgress[bar.streamId] ?? 0).toFixed(1)}%"
 										></div>
 										<span class="bar-label">{bar.channel}{bar.sourceType === 'vod' ? ' (VOD)' : ''}</span>
 									</div>
@@ -776,10 +832,12 @@
 							{/each}
 							{#each track.streamIds as sid}
 								{#if chatHeatmapData[sid]}
+									{@const visMin = viewportLeft - CULL_MARGIN}
+									{@const visMax = viewportLeft + viewportWidth + CULL_MARGIN}
+									{@const heatWidth = CHAT_BUCKET_SECONDS * pixelsPerSecond}
 									{#each chatHeatmapData[sid] as bucket}
 										{@const heatLeft = (bucket.startTime - effectiveTimelineStart) * pixelsPerSecond}
-										{@const heatWidth = CHAT_BUCKET_SECONDS * pixelsPerSecond}
-										{#if bucket.intensity > 0.05}
+										{#if bucket.intensity > 0.05 && heatLeft + heatWidth > visMin && heatLeft < visMax}
 											<div
 												class="chat-heatmap-bar"
 												style="left: {heatLeft}px; width: {heatWidth}px; opacity: {0.15 + bucket.intensity * 0.7}"

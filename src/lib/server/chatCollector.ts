@@ -5,15 +5,27 @@ export type ChatCallback = (streamId: string, msg: ChatMessage) => void;
 const TWITCH_IRC_WS = 'wss://irc-ws.chat.twitch.tv:443';
 const RECONNECT_DELAY = 3000;
 
-// Regex to parse PRIVMSG lines from Twitch IRC
-// Format: :username!username@username.tmi.twitch.tv PRIVMSG #channel :message text
-const PRIVMSG_RE = /^:(\w+)!\w+@\w+\.tmi\.twitch\.tv PRIVMSG #\w+ :(.+)$/;
+// Regex to parse PRIVMSG lines (with optional @tags prefix)
+// Tagged format: @badge-info=...;color=#FF0000;display-name=User;... :user!user@user.tmi.twitch.tv PRIVMSG #channel :message
+// Untagged format: :user!user@user.tmi.twitch.tv PRIVMSG #channel :message
+const PRIVMSG_RE = /^(?:@(\S+) )?:(\w+)!\w+@\w+\.tmi\.twitch\.tv PRIVMSG #\w+ :(.+)$/;
+
+function extractTag(tags: string, key: string): string | null {
+	const prefix = key + '=';
+	const start = tags.indexOf(prefix);
+	if (start === -1) return null;
+	const valueStart = start + prefix.length;
+	const end = tags.indexOf(';', valueStart);
+	const value = end === -1 ? tags.slice(valueStart) : tags.slice(valueStart, end);
+	return value || null;
+}
 
 /**
  * Connect to a Twitch channel's IRC chat via anonymous WebSocket
  * and call onMessage for each chat message received.
  *
  * Uses the "justinfan" anonymous read-only connection method.
+ * Requests twitch.tv/tags capability to get user chat colors.
  * Returns a cleanup function that closes the WebSocket.
  */
 export function startChatCollection(
@@ -39,11 +51,13 @@ export function startChatCollection(
 
 		ws.onopen = () => {
 			if (!ws || stopped) return;
+			// Request tags capability for user colors and display names
+			ws.send('CAP REQ :twitch.tv/tags\r\n');
 			// Anonymous read-only connection using justinfan nickname
 			const nick = `justinfan${Math.floor(10000 + Math.random() * 90000)}`;
 			ws.send(`NICK ${nick}\r\n`);
 			ws.send(`JOIN #${channel.toLowerCase()}\r\n`);
-			console.log(`[chat:${channel}] Connected to Twitch IRC`);
+			console.log(`[chat:${channel}] Connected to Twitch IRC (with tags)`);
 		};
 
 		ws.onmessage = (event) => {
@@ -63,11 +77,16 @@ export function startChatCollection(
 				// Parse PRIVMSG (chat messages)
 				const match = line.match(PRIVMSG_RE);
 				if (match) {
-					const username = match[1];
-					const text = match[2];
+					const tags = match[1] || '';
+					const fallbackUsername = match[2];
+					const text = match[3];
 					const timestamp = (Date.now() - startedAt) / 1000; // stream-local seconds
 
-					onMessage(streamId, { username, text, timestamp });
+					// Prefer display-name from tags (proper casing), fall back to IRC nick
+					const username = extractTag(tags, 'display-name') || fallbackUsername;
+					const color = extractTag(tags, 'color');
+
+					onMessage(streamId, { username, text, timestamp, color });
 				}
 			}
 		};

@@ -1,7 +1,7 @@
 import { query, command } from '$app/server';
+import { normalizeChannel } from '$lib/utils.js';
 import {
 	listStreams,
-	getTranscriptions,
 	getAllClipRegions,
 	addStream as smAddStream,
 	addVodStream,
@@ -10,11 +10,13 @@ import {
 	removeStream as smRemoveStream,
 	retranscribeStream as smRetranscribe,
 	resumeVodStream as smResumeVod,
+	refetchVodChat as smRefetchVodChat,
 	updateStreamOffset,
 	addClipRegion,
 	removeClipRegion,
 	getChatHeatmap as smGetChatHeatmap,
-	getChatMessagesInRange as smGetChatMessagesInRange
+	getChatMessagesInRange as smGetChatMessagesInRange,
+	getTranscriptionsInRange as smGetTranscriptionsInRange
 } from '$lib/server/streamManager.js';
 import type { ChatMessage } from '$lib/server/types.js';
 
@@ -22,18 +24,11 @@ import type { ChatMessage } from '$lib/server/types.js';
 // Queries
 // ---------------------------------------------------------------------------
 
-/** List all streams with transcriptions and clip regions. */
+/** List all streams with clip regions (transcriptions fetched on demand via windowed query). */
 export const getStreams = query(async () => {
 	const streams = listStreams();
-	const transcriptions: Record<string, Array<{ text: string; startTime: number; endTime: number }>> = {};
-	for (const s of streams) {
-		const entries = getTranscriptions(s.id);
-		if (entries.length > 0) {
-			transcriptions[s.id] = entries;
-		}
-	}
 	const clipRegions = getAllClipRegions();
-	return { streams, transcriptions, clipRegions };
+	return { streams, clipRegions };
 });
 
 /** Pre-bucketed chat heatmap for a single stream. */
@@ -53,6 +48,22 @@ export const getMultiStreamChat = query(
 			}
 		}
 		results.sort((a, b) => a.timestamp - b.timestamp);
+		return results;
+	}
+);
+
+/** Transcriptions in a time range for multiple streams (merged & sorted). */
+export const getMultiStreamTranscriptions = query(
+	'unchecked',
+	async (args: { ranges: Array<{ streamId: string; from: number; to: number }> }) => {
+		const results: Array<{ streamId: string; text: string; startTime: number; endTime: number }> = [];
+		for (const range of args.ranges) {
+			const entries = smGetTranscriptionsInRange(range.streamId, range.from, range.to);
+			for (const e of entries) {
+				results.push({ streamId: range.streamId, ...e });
+			}
+		}
+		results.sort((a, b) => a.startTime - b.startTime);
 		return results;
 	}
 );
@@ -77,11 +88,7 @@ export const addStreamCmd = command(
 			return info;
 		}
 
-		const cleanChannel = args.channel
-			.replace(/^https?:\/\/(www\.)?(twitch\.tv|douyu\.com)\//, '')
-			.replace(/\/.*$/, '')
-			.trim()
-			.toLowerCase();
+		const cleanChannel = normalizeChannel(args.channel);
 
 		if (!cleanChannel) throw new Error('Invalid channel name');
 
@@ -110,6 +117,12 @@ export const removeStreamCmd = command('unchecked', async (args: { id: string })
 /** Re-transcribe a stopped stream. */
 export const retranscribeCmd = command('unchecked', async (args: { id: string }) => {
 	smRetranscribe(args.id);
+});
+
+/** Refetch VOD chat for a stopped Twitch VOD. */
+export const refetchVodChatCmd = command('unchecked', async (args: { id: string }) => {
+	const success = smRefetchVodChat(args.id);
+	if (!success) throw new Error('Cannot refetch chat: stream must be a Twitch VOD');
 });
 
 /** Resume a stopped Twitch VOD capture. */
