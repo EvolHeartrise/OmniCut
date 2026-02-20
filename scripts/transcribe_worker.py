@@ -64,6 +64,10 @@ def main():
                 word_timestamps=True,
                 vad_filter=True,
                 vad_parameters=dict(min_silence_duration_ms=500),
+                condition_on_previous_text=False,
+                repetition_penalty=1.1,
+                no_repeat_ngram_size=3,
+                hallucination_silence_threshold=2.0,
                 task=task,
                 language="en" if use_english else language,
             )

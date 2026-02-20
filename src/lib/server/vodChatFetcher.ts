@@ -4,8 +4,10 @@ import type { ChatMessage } from './types.js';
 export type ChatCallback = (streamId: string, msg: ChatMessage) => void;
 
 const PAGE_DELAY_MS = 150;
+const MAX_RETRIES = 5;
+const INITIAL_BACKOFF_MS = 1000;
 
-const VOD_COMMENTS_QUERY = `query($videoID: ID!, $cursor: String) {
+const VOD_COMMENTS_QUERY = `query($videoID: ID!, $cursor: Cursor) {
   video(id: $videoID) {
     comments(after: $cursor) {
       edges {
@@ -50,24 +52,52 @@ export function startVodChatFetch(
 
 		try {
 			while (!stopped) {
-				const res = await fetch('https://gql.twitch.tv/gql', {
-					method: 'POST',
-					headers: {
-						'Client-ID': TWITCH_CLIENT_ID,
-						'Content-Type': 'application/json'
-					},
-					body: JSON.stringify({
-						query: VOD_COMMENTS_QUERY,
-						variables: { videoID: videoId, cursor: cursor ?? null }
-					})
-				});
+				let res: Response | undefined;
+				let data: any;
+
+				for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+					if (stopped) break;
+
+					res = await fetch('https://gql.twitch.tv/gql', {
+						method: 'POST',
+						headers: {
+							'Client-ID': TWITCH_CLIENT_ID,
+							'Content-Type': 'application/json'
+						},
+						body: JSON.stringify({
+							query: VOD_COMMENTS_QUERY,
+							variables: { videoID: videoId, cursor: cursor ?? null }
+						})
+					});
+
+					if (res.status === 429 || (res.status >= 500 && res.status < 600)) {
+						if (attempt === MAX_RETRIES) {
+							console.error(`[vod-chat:${videoId}] HTTP ${res.status} after ${MAX_RETRIES} retries — aborting`);
+							break;
+						}
+						const delay = INITIAL_BACKOFF_MS * 2 ** attempt;
+						console.warn(`[vod-chat:${videoId}] HTTP ${res.status}, retrying in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
+						await new Promise((r) => setTimeout(r, delay));
+						continue;
+					}
+
+					break;
+				}
+
+				if (!res || stopped) break;
 
 				if (!res.ok) {
 					console.error(`[vod-chat:${videoId}] HTTP ${res.status} — aborting`);
 					break;
 				}
 
-				const data = await res.json();
+				data = await res.json();
+
+				if (data.errors) {
+					console.error(`[vod-chat:${videoId}] GQL errors:`, data.errors.map((e: any) => e.message).join('; '));
+					break;
+				}
+
 				const comments = data?.data?.video?.comments;
 
 				if (!comments) {

@@ -1,5 +1,15 @@
 import { writable, get } from 'svelte/store';
 import type { ClipRegion } from '$lib/types.js';
+import {
+	getStreams,
+	addStreamCmd,
+	stopStreamCmd,
+	removeStreamCmd,
+	retranscribeCmd,
+	updateOffsetCmd,
+	saveClipCmd,
+	deleteClipCmd
+} from '$lib/streams.remote';
 
 export type { ClipRegion };
 
@@ -19,6 +29,7 @@ export interface StreamState {
 	parentStreamId: string | null;
 	platform: 'twitch' | 'douyu';
 	sourceUrl?: string | null;
+	chatMessageCount: number;
 }
 
 export type AppMode = 'sources' | 'clipping' | 'cleaning' | 'export';
@@ -52,14 +63,6 @@ export interface TranscriptionEntry {
 	endTime: number;
 }
 export const transcriptions = writable<Record<string, TranscriptionEntry[]>>({});
-
-// Per-stream chat messages
-export interface ChatMessageEntry {
-	username: string;
-	text: string;
-	timestamp: number; // stream-local seconds
-}
-export const chatMessages = writable<Record<string, ChatMessageEntry[]>>({});
 
 // Clip regions marked by the user (W key hold-to-mark)
 export const clipRegions = writable<ClipRegion[]>([]);
@@ -100,8 +103,7 @@ export const seekRequest = writable<{ time: number; seq: number }>({ time: 0, se
  */
 export async function refreshStreams() {
 	try {
-		const res = await fetch('/api/streams');
-		const data = await res.json();
+		const data = await getStreams();
 		streams.set(data.streams);
 
 		// Restore offsets from server (only set offsets we don't already have locally)
@@ -148,22 +150,15 @@ export async function refreshStreams() {
  */
 export async function addStream(channel: string, opts?: { language?: string | null; vod?: boolean; vodUrl?: string; platform?: 'twitch' | 'douyu' }): Promise<StreamState | null> {
 	try {
-		const body: Record<string, unknown> = { channel };
-		if (opts?.language) body.language = opts.language;
-		if (opts?.vod) body.vod = true;
-		if (opts?.vodUrl) body.vodUrl = opts.vodUrl;
-		if (opts?.platform) body.platform = opts.platform;
-		const res = await fetch('/api/streams', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify(body)
+		await addStreamCmd({
+			channel,
+			language: opts?.language,
+			vod: opts?.vod,
+			vodUrl: opts?.vodUrl,
+			platform: opts?.platform
 		});
-		const data = await res.json();
-		if (!res.ok) {
-			throw new Error(data.error || 'Failed to add stream');
-		}
 		await refreshStreams();
-		return data.stream;
+		return null;
 	} catch (err) {
 		console.error('Failed to add stream:', err);
 		throw err;
@@ -175,11 +170,7 @@ export async function addStream(channel: string, opts?: { language?: string | nu
  */
 export async function stopStream(id: string): Promise<void> {
 	try {
-		await fetch(`/api/streams/${id}`, {
-			method: 'PATCH',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ stop: true })
-		});
+		await stopStreamCmd({ id });
 		await refreshStreams();
 	} catch (err) {
 		console.error('Failed to stop stream:', err);
@@ -191,11 +182,7 @@ export async function stopStream(id: string): Promise<void> {
  */
 export async function retranscribeStream(id: string): Promise<void> {
 	try {
-		await fetch(`/api/streams/${id}`, {
-			method: 'PATCH',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ retranscribe: true })
-		});
+		await retranscribeCmd({ id });
 	} catch (err) {
 		console.error('Failed to retranscribe stream:', err);
 	}
@@ -206,7 +193,7 @@ export async function retranscribeStream(id: string): Promise<void> {
  */
 export async function removeStream(id: string): Promise<void> {
 	try {
-		await fetch(`/api/streams/${id}`, { method: 'DELETE' });
+		await removeStreamCmd({ id });
 		await refreshStreams();
 		streamPlaybackStates.update((s) => {
 			const { [id]: _, ...rest } = s;
@@ -236,11 +223,7 @@ export function saveOffset(id: string, offset: number) {
 		setTimeout(async () => {
 			pendingOffsetSaves.delete(id);
 			try {
-				await fetch(`/api/streams/${id}`, {
-					method: 'PATCH',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ offset })
-				});
+				await updateOffsetCmd({ id, offset });
 			} catch (err) {
 				console.error(`Failed to save offset for ${id}:`, err);
 			}
@@ -253,11 +236,7 @@ export function saveOffset(id: string, offset: number) {
  */
 export async function saveClipRegion(region: ClipRegion) {
 	try {
-		await fetch(`/api/streams/${region.streamId}`, {
-			method: 'PATCH',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ addClipRegion: region })
-		});
+		await saveClipCmd(region);
 	} catch (err) {
 		console.error('Failed to save clip region:', err);
 	}
@@ -266,66 +245,12 @@ export async function saveClipRegion(region: ClipRegion) {
 /**
  * Delete a clip region from the server.
  */
-export async function deleteClipRegion(id: string, streamId: string) {
+export async function deleteClipRegion(id: string, _streamId: string) {
 	try {
-		await fetch(`/api/streams/${streamId}`, {
-			method: 'PATCH',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ removeClipRegionId: id })
-		});
+		await deleteClipCmd({ id });
 	} catch (err) {
 		console.error('Failed to delete clip region:', err);
 	}
-}
-
-/**
- * Clear the entire session (all streams, transcriptions, chat, clips).
- * Calls the backend to wipe SQLite and resets all frontend stores.
- */
-export async function clearSession() {
-	await fetch('/api/session', { method: 'DELETE' });
-	streams.set([]);
-	clipRegions.set([]);
-	transcriptions.set({});
-	chatMessages.set({});
-	syncOffsets.set({});
-	streamPlaybackStates.set({});
-	focusedStreamId.set(null);
-	soloStreamId.set(null);
-	exportLog.set([]);
-	appMode.set('sources');
-}
-
-/**
- * Export the current session as a JSON file download.
- */
-export async function exportSessionFile() {
-	const res = await fetch('/api/session');
-	const blob = await res.blob();
-	const url = URL.createObjectURL(blob);
-	const a = document.createElement('a');
-	a.href = url;
-	a.download = `omnicut-session-${Date.now()}.json`;
-	a.click();
-	URL.revokeObjectURL(url);
-}
-
-/**
- * Import a session from a JSON file. Refreshes streams after import.
- */
-export async function importSessionFile(file: File): Promise<{ imported: number; total: number; errors: string[] }> {
-	const text = await file.text();
-	const res = await fetch('/api/session', {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: text
-	});
-	const result = await res.json();
-	if (!res.ok && !result.imported) {
-		throw new Error(result.error || 'Import failed');
-	}
-	await refreshStreams();
-	return result;
 }
 
 /**
@@ -362,17 +287,6 @@ export function connectSSE(): () => void {
 				transcriptions.update((current) => {
 					const { [data.streamId]: _, ...rest } = current;
 					return rest;
-				});
-			} else if (data.type === 'chat-message') {
-				chatMessages.update((current) => {
-					const entries = current[data.streamId] || [];
-					return {
-						...current,
-						[data.streamId]: [
-							...entries,
-							{ username: data.username, text: data.text, timestamp: data.timestamp }
-						]
-					};
 				});
 			} else if (data.type === 'export-progress') {
 				exportLog.update((log) => [

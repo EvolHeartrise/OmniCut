@@ -27,6 +27,7 @@ export async function initDatabase(): Promise<void> {
 	db = new Database(DB_PATH);
 	db.exec('PRAGMA journal_mode = WAL');
 	db.exec('PRAGMA synchronous = NORMAL');
+	db.exec('PRAGMA foreign_keys = ON');
 
 	db.exec(`
 		CREATE TABLE IF NOT EXISTS streams (
@@ -263,6 +264,20 @@ export function saveChatMessage(streamId: string, msg: ChatMessage): void {
 	);
 }
 
+export function saveChatMessagesBatch(streamId: string, msgs: ChatMessage[]): void {
+	if (msgs.length === 0) return;
+	const d = getDb();
+	const insert = d.prepare(
+		'INSERT INTO chat_messages (stream_id, username, text, timestamp) VALUES (?, ?, ?, ?)'
+	);
+	const tx = d.transaction(() => {
+		for (const msg of msgs) {
+			insert.run(streamId, msg.username, msg.text, msg.timestamp);
+		}
+	});
+	tx();
+}
+
 export function loadChatMessages(streamId: string): ChatMessage[] {
 	const d = getDb();
 	const rows = d.query(
@@ -290,6 +305,20 @@ export function loadChatMessagesInRange(streamId: string, fromTime: number, toTi
 		'SELECT username, text, timestamp FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp'
 	).all(streamId, fromTime, toTime) as any[];
 	return rows.map((r) => ({ username: r.username, text: r.text, timestamp: r.timestamp }));
+}
+
+export function loadChatHeatmap(streamId: string, bucketSeconds: number): Array<{ bucket: number; count: number }> {
+	const d = getDb();
+	const rows = d.query(
+		`SELECT
+			CAST(timestamp / ? AS INTEGER) * ? AS bucket,
+			COUNT(*) AS count
+		FROM chat_messages
+		WHERE stream_id = ?
+		GROUP BY bucket
+		ORDER BY bucket`
+	).all(bucketSeconds, bucketSeconds, streamId) as any[];
+	return rows.map((r) => ({ bucket: r.bucket, count: r.count }));
 }
 
 export function deleteChatMessages(streamId: string): void {
@@ -321,49 +350,6 @@ export function loadAllClipRegions(): ClipRegion[] {
 		startTime: r.start_time,
 		endTime: r.end_time
 	}));
-}
-
-// --- Bulk operations for session import/export ---
-
-export function clearAll(): void {
-	const d = getDb();
-	d.exec('DELETE FROM chat_messages');
-	d.exec('DELETE FROM transcriptions');
-	d.exec('DELETE FROM clip_regions');
-	d.exec('DELETE FROM streams');
-}
-
-export function bulkImportTranscriptions(streamId: string, entries: Array<{ text: string; startTime: number; endTime: number }>): void {
-	const d = getDb();
-	const stmt = d.prepare('INSERT INTO transcriptions (stream_id, text, start_time, end_time) VALUES (?, ?, ?, ?)');
-	const tx = d.transaction(() => {
-		for (const e of entries) {
-			stmt.run(streamId, e.text, e.startTime, e.endTime);
-		}
-	});
-	tx();
-}
-
-export function bulkImportChatMessages(streamId: string, messages: ChatMessage[]): void {
-	const d = getDb();
-	const stmt = d.prepare('INSERT INTO chat_messages (stream_id, username, text, timestamp) VALUES (?, ?, ?, ?)');
-	const tx = d.transaction(() => {
-		for (const m of messages) {
-			stmt.run(streamId, m.username, m.text, m.timestamp);
-		}
-	});
-	tx();
-}
-
-export function bulkImportClipRegions(regions: ClipRegion[]): void {
-	const d = getDb();
-	const stmt = d.prepare('INSERT OR REPLACE INTO clip_regions (id, stream_id, start_time, end_time) VALUES (?, ?, ?, ?)');
-	const tx = d.transaction(() => {
-		for (const r of regions) {
-			stmt.run(r.id, r.streamId, r.startTime, r.endTime);
-		}
-	});
-	tx();
 }
 
 // --- Ignored Channels ---

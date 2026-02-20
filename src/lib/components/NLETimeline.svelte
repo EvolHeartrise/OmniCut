@@ -9,17 +9,16 @@
 		masterPlaying,
 		masterPlaybackRate,
 		saveOffset,
-		removeStream,
 		focusedStreamId,
 		clipRegions,
 		saveClipRegion,
 		seekRequest,
-		chatMessages,
 		type ClipRegion
 	} from '$lib/stores/streams.js';
 	import { applyTimelineZoom, clampPps } from '$lib/timeline.js';
 	import { splitClipRegion, removeClipRegionAction } from '$lib/clipActions.js';
 	import { TRACK_COLORS as COLORS } from '$lib/constants.js';
+	import { getChatHeatmap } from '$lib/streams.remote';
 
 	const MIN_PPS = 0.1;
 	const MAX_PPS = 200;
@@ -34,6 +33,19 @@
 	let frozenTimelineStart = $state<number | null>(null);
 	let frozenMasterTime = $state<number | null>(null);
 	let dragOffsetDelta = $state(0); // offset change during drag (newOffset - dragStartOffset)
+
+	// Locked tracks (by track key) — prevents drag/offset on locked tracks
+	// All tracks are locked by default; the set is synced in $effect.pre below
+	let lockedTracks = $state<Set<string>>(new Set());
+
+	function toggleTrackLock(trackKey: string) {
+		lockedTracks = new Set(lockedTracks);
+		if (lockedTracks.has(trackKey)) {
+			lockedTracks.delete(trackKey);
+		} else {
+			lockedTracks.add(trackKey);
+		}
+	}
 
 	// Undo stack
 	type UndoEntry =
@@ -85,6 +97,25 @@
 			if (!updated.includes(key)) updated.push(key);
 		}
 		trackOrder = updated;
+
+		// Auto-lock new tracks
+		const prev = untrack(() => lockedTracks);
+		let lockChanged = false;
+		const nextLocked = new Set(prev);
+		for (const key of updated) {
+			if (!nextLocked.has(key)) {
+				nextLocked.add(key);
+				lockChanged = true;
+			}
+		}
+		// Remove locks for tracks that no longer exist
+		for (const key of nextLocked) {
+			if (!updated.includes(key)) {
+				nextLocked.delete(key);
+				lockChanged = true;
+			}
+		}
+		if (lockChanged) lockedTracks = nextLocked;
 	});
 
 	// Map each track key to its constituent streams
@@ -129,47 +160,44 @@
 		})
 	);
 
-	// Chat heatmap: bucket messages into time windows, normalize intensity per track
+	// Chat heatmap: fetch once per stream via remote query, store in $state
 	const CHAT_BUCKET_SECONDS = 5;
 
-	let chatHeatmapData = $derived.by(() => {
-		const allChat = $chatMessages;
-		const result: Record<string, Array<{ startTime: number; count: number; intensity: number }>> = {};
+	let chatHeatmapRaw = $state<Record<string, { buckets: Array<{ time: number; count: number }>; max: number }>>({});
+	let heatmapFetchedIds = new Set<string>();
 
+	$effect(() => {
+		const allStreamIds = tracksData.flatMap((t) => t.bars.map((b) => b.streamId));
+		for (const sid of allStreamIds) {
+			if (heatmapFetchedIds.has(sid)) continue;
+			heatmapFetchedIds.add(sid);
+			getChatHeatmap({ streamId: sid, bucket: CHAT_BUCKET_SECONDS })
+				.then((data: { buckets: Array<{ time: number; count: number }>; max: number }) => {
+					chatHeatmapRaw = { ...chatHeatmapRaw, [sid]: data };
+				})
+				.catch(() => {});
+		}
+	});
+
+	let chatHeatmapData = $derived.by(() => {
+		const result: Record<string, Array<{ startTime: number; count: number; intensity: number }>> = {};
 		for (const track of tracksData) {
 			for (const bar of track.bars) {
-				const messages = allChat[bar.streamId];
-				if (!messages || messages.length === 0) continue;
-
-				// Bucket messages into CHAT_BUCKET_SECONDS intervals (in master/epoch time)
-				const buckets = new Map<number, number>();
-				for (const msg of messages) {
-					// Convert stream-local time to master time for positioning
-					const msgMasterTime = msg.timestamp + bar.anchor - bar.offset;
-					const bucketKey = Math.floor(msgMasterTime / CHAT_BUCKET_SECONDS) * CHAT_BUCKET_SECONDS;
-					buckets.set(bucketKey, (buckets.get(bucketKey) || 0) + 1);
-				}
-
-				// Find max for normalization
-				let maxCount = 0;
-				for (const count of buckets.values()) {
-					if (count > maxCount) maxCount = count;
-				}
-
-				// Build sorted array with normalized intensity (0-1)
-				const sorted: Array<{ startTime: number; count: number; intensity: number }> = [];
-				for (const [time, count] of buckets) {
-					sorted.push({
-						startTime: time,
-						count,
-						intensity: maxCount > 0 ? count / maxCount : 0
+				const raw = chatHeatmapRaw[bar.streamId];
+				if (!raw || raw.buckets.length === 0) continue;
+				const max = raw.max;
+				const entries: Array<{ startTime: number; count: number; intensity: number }> = [];
+				for (const b of raw.buckets) {
+					const masterT = b.time + bar.anchor - bar.offset;
+					entries.push({
+						startTime: masterT,
+						count: b.count,
+						intensity: max > 0 ? b.count / max : 0
 					});
 				}
-				sorted.sort((a, b) => a.startTime - b.startTime);
-				result[bar.streamId] = sorted;
+				result[bar.streamId] = entries;
 			}
 		}
-
 		return result;
 	});
 
@@ -333,6 +361,9 @@
 	function handleTrackMouseDown(e: MouseEvent, trackId: string) {
 		e.stopPropagation();
 		e.preventDefault();
+		// Prevent dragging on locked tracks
+		const track = tracksData.find((t) => t.streamIds.includes(trackId));
+		if (track && lockedTracks.has(track.key)) return;
 		draggingStreamId = trackId;
 		dragStartX = e.clientX;
 		dragStartOffset = $syncOffsets[trackId] || 0;
@@ -577,6 +608,11 @@
 					}
 				}
 			}
+		} else if ((e.key === 'l' || e.key === 'L') && !e.repeat) {
+			if ($focusedStreamId) {
+				const track = tracksData.find((t) => t.streamIds.includes($focusedStreamId!));
+				if (track) toggleTrackLock(track.key);
+			}
 		} else if (e.shiftKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
 			e.preventDefault();
 			const now = masterCurrentTimeState;
@@ -688,9 +724,12 @@
 								<span class="vod-suffix">(VOD)</span>
 							{/if}
 						</span>
-						<button class="btn-remove-track" onclick={() => {
-							for (const sid of track.streamIds) removeStream(sid);
-						}} title="Remove track">✕</button>
+						<button
+							class="btn-lock-track"
+							class:locked={lockedTracks.has(track.key)}
+							onclick={() => toggleTrackLock(track.key)}
+							title={lockedTracks.has(track.key) ? 'Unlock track (L)' : 'Lock track (L)'}
+						>{lockedTracks.has(track.key) ? '🔒' : '🔓'}</button>
 					</div>
 				{/each}
 			</div>
@@ -723,6 +762,7 @@
 									<div
 										class="track-bar"
 										class:dragging={draggingStreamId === bar.streamId}
+										class:locked={lockedTracks.has(track.key)}
 										style="left: {barLeft}px; width: {barWidth}px; background: {track.color};"
 										onmousedown={(e) => handleTrackMouseDown(e, bar.streamId)}
 									>
@@ -885,27 +925,33 @@
 		overflow: hidden;
 	}
 
-	.btn-remove-track {
+	.btn-lock-track {
 		margin-left: auto;
 		background: none;
 		border: none;
 		color: #555;
 		cursor: pointer;
-		font-size: 0.65rem;
-		padding: 2px 4px;
+		font-size: 0.6rem;
+		padding: 2px 3px;
 		line-height: 1;
 		flex-shrink: 0;
 		opacity: 0;
 		transition: opacity 0.15s, color 0.15s;
 	}
 
-	.label-row:hover .btn-remove-track {
+	.btn-lock-track.locked {
+		opacity: 1;
+		color: #f59e0b;
+	}
+
+	.label-row:hover .btn-lock-track {
 		opacity: 1;
 	}
 
-	.btn-remove-track:hover {
-		color: #ef4444;
+	.btn-lock-track:hover {
+		color: #f59e0b;
 	}
+
 
 	.color-dot {
 		width: 8px;
@@ -1013,6 +1059,11 @@
 		opacity: 1;
 		cursor: grabbing;
 		box-shadow: 0 0 8px rgba(255, 255, 255, 0.2);
+	}
+
+	.track-bar.locked {
+		cursor: not-allowed;
+		opacity: 0.7;
 	}
 
 	.bar-progress {

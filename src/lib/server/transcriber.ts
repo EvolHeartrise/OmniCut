@@ -30,6 +30,22 @@ interface Sentence {
 	partial?: boolean;
 }
 
+/** Remove consecutive duplicate/near-duplicate sentences (Whisper hallucination loops). */
+function deduplicateSentences(sentences: Sentence[]): Sentence[] {
+	if (sentences.length <= 1) return sentences;
+	const result: Sentence[] = [sentences[0]];
+	for (let i = 1; i < sentences.length; i++) {
+		const prev = result[result.length - 1];
+		const curr = sentences[i];
+		// Skip if identical text and timestamps overlap or are adjacent (within 1s)
+		if (curr.text.trim() === prev.text.trim() && curr.start < prev.end + 1) {
+			continue;
+		}
+		result.push(curr);
+	}
+	return result;
+}
+
 interface QueueItem {
 	wavPath: string;
 	language: string | null;
@@ -328,7 +344,7 @@ async function checkForNewSegments(streamId: string) {
 	if (!wavPath) return;
 
 	try {
-		const sentences = await transcribeAudio(wavPath, tracker.language);
+		const sentences = deduplicateSentences(await transcribeAudio(wavPath, tracker.language));
 		const batchOffset = startIdx * SEGMENT_DURATION;
 
 		for (let i = 0; i < sentences.length; i++) {
@@ -454,11 +470,13 @@ export async function transcribeFullRecording(
 	if (!wavPath) return;
 
 	try {
-		const sentences = await transcribeAudio(wavPath, language ?? null);
+		const raw = await transcribeAudio(wavPath, language ?? null);
+		const sentences = deduplicateSentences(raw);
+		const skipped = raw.length - sentences.length;
 		for (const s of sentences) {
 			onResult(streamId, s.text, s.start, s.end);
 		}
-		console.log(`[transcriber] Full transcription complete for stream ${streamId}: ${sentences.length} sentences`);
+		console.log(`[transcriber] Full transcription complete for stream ${streamId}: ${sentences.length} sentences${skipped > 0 ? ` (${skipped} duplicates removed)` : ''}`);
 	} finally {
 		try {
 			fs.unlinkSync(wavPath);

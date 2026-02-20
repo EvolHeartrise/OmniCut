@@ -9,7 +9,7 @@
 	import Hls from 'hls.js';
 	import type { StreamState } from '$lib/stores/streams.js';
 	import { syncOffsets, streamPlaybackStates, masterControl, masterPlaying, masterPlaybackRate, masterTime, transcriptions, stopStream, retranscribeStream } from '$lib/stores/streams.js';
-	import { createHlsConfig } from '$lib/utils.js';
+	import { createHlsConfig, formatBytes } from '$lib/utils.js';
 
 	let { stream, focused = false, trackNumber = 0 }: { stream: StreamState; focused?: boolean; trackNumber?: number } = $props();
 
@@ -103,13 +103,6 @@
 
 				break;
 		}
-	}
-
-	function formatBytes(bytes: number): string {
-		if (bytes === 0) return '0 B';
-		const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-		const i = Math.floor(Math.log(bytes) / Math.log(1024));
-		return (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
 	}
 
 	function saveVolumeState() {
@@ -249,6 +242,7 @@
 			{#if trackNumber}<span class="track-number">{trackNumber}</span>{/if}<a href="https://twitch.tv/{stream.channel}" target="_blank" rel="noopener noreferrer" class="channel-link">{stream.channel}</a>{#if stream.sourceType === 'vod'}<span class="vod-badge">(VOD)</span>{/if}
 			{#if stream.streamTitle}<span class="stream-title">{stream.streamTitle}</span>{/if}
 			<span class="disk-usage">{formatBytes(stream.diskUsageBytes)}</span>
+			{#if stream.chatMessageCount > 0}<span class="chat-count">{stream.chatMessageCount.toLocaleString()} msgs</span>{/if}
 		</span>
 		{#if stream.status === 'capturing' && stream.sourceType === 'vod'}
 			<button class="btn-stop" onclick={() => stopStream(stream.id)} title="Stop downloading">Stop</button>
@@ -267,6 +261,7 @@
 		<video
 			bind:this={videoEl}
 			ontimeupdate={handleTimeUpdate}
+			title={stream.streamTitle || stream.channel}
 			playsinline
 			muted
 		></video>
@@ -408,6 +403,13 @@
 		font-weight: 400;
 		font-size: 0.7rem;
 		color: #666;
+		margin-left: 6px;
+	}
+
+	.chat-count {
+		font-weight: 400;
+		font-size: 0.7rem;
+		color: #7c3aed;
 		margin-left: 6px;
 	}
 

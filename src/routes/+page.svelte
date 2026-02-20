@@ -2,13 +2,14 @@
 	import { onMount } from 'svelte';
 	import AddStreamBar from '$lib/components/AddStreamBar.svelte';
 	import DiscoveryBrowser from '$lib/components/DiscoveryBrowser.svelte';
+	import MediaLibrary from '$lib/components/MediaLibrary.svelte';
 	import StreamGrid from '$lib/components/StreamGrid.svelte';
 	import NLETimeline from '$lib/components/NLETimeline.svelte';
 	import CleaningTimeline from '$lib/components/CleaningTimeline.svelte';
 	import ExportPanel from '$lib/components/ExportPanel.svelte';
 	import TranscriptPanel from '$lib/components/TranscriptPanel.svelte';
 	import ChatPanel from '$lib/components/ChatPanel.svelte';
-	import { refreshStreams, connectSSE, streams, focusedStreamId, soloStreamId, appMode, transcriptPanelOpen, chatPanelOpen, exportSessionFile, importSessionFile, clearSession, transcriptions, syncOffsets, masterTime, clipRegions, saveClipRegion, type ClipRegion } from '$lib/stores/streams.js';
+	import { refreshStreams, connectSSE, streams, focusedStreamId, soloStreamId, appMode, transcriptPanelOpen, chatPanelOpen, transcriptions, syncOffsets, masterTime, clipRegions, saveClipRegion, type ClipRegion } from '$lib/stores/streams.js';
 
 	onMount(() => {
 		refreshStreams();
@@ -17,54 +18,11 @@
 	});
 
 	let mode = $derived($appMode);
-	let importing = $state(false);
-	let importError = $state<string | null>(null);
-	let fileInput: HTMLInputElement;
-	let clearConfirm = $state(false);
-	let clearConfirmTimer: ReturnType<typeof setTimeout> | undefined;
 
 	// T-key hold state for transcription-based clip region creation
 	let tHeld = $state(false);
 	let tClipId = $state<string | null>(null);
 	let tClipStreamId = $state<string | null>(null);
-
-	async function handleExport() {
-		await exportSessionFile();
-	}
-
-	async function handleClearSession() {
-		if (!clearConfirm) {
-			clearConfirm = true;
-			clearConfirmTimer = setTimeout(() => { clearConfirm = false; }, 3000);
-			return;
-		}
-		clearTimeout(clearConfirmTimer);
-		clearConfirm = false;
-		await clearSession();
-	}
-
-	async function handleImportClick() {
-		fileInput.click();
-	}
-
-	async function handleFileSelected(e: Event) {
-		const input = e.target as HTMLInputElement;
-		const file = input.files?.[0];
-		if (!file) return;
-		input.value = '';
-		importing = true;
-		importError = null;
-		try {
-			const result = await importSessionFile(file);
-			if (result.errors.length > 0) {
-				importError = `Imported ${result.imported}/${result.total}: ${result.errors.join('; ')}`;
-			}
-		} catch (err) {
-			importError = err instanceof Error ? err.message : 'Import failed';
-		} finally {
-			importing = false;
-		}
-	}
 
 	// Keyboard shortcuts
 	function handleKeydown(e: KeyboardEvent) {
@@ -243,24 +201,6 @@
 		</div>
 		<div class="header-info">
 			<span class="stream-count">{$streams.length} streams</span>
-			<button class="btn-tool" onclick={handleExport}>Save Session</button>
-			<button class="btn-tool" onclick={handleImportClick} disabled={importing}>
-				{importing ? 'Loading...' : 'Load Session'}
-			</button>
-			<button
-				class="btn-tool btn-danger"
-				onclick={handleClearSession}
-			>{clearConfirm ? 'Are you sure?' : 'Clear Session'}</button>
-			<input
-				type="file"
-				accept=".json"
-				style="display:none"
-				bind:this={fileInput}
-				onchange={handleFileSelected}
-			/>
-			{#if importError}
-				<span class="import-error">{importError}</span>
-			{/if}
 			{#if mode === 'clipping'}
 				<button
 					class="btn-tool"
@@ -280,6 +220,7 @@
 	{#if mode === 'sources'}
 		<main class="sources-content">
 			<AddStreamBar />
+			<MediaLibrary />
 			<DiscoveryBrowser />
 		</main>
 	{:else if mode === 'clipping'}
@@ -390,17 +331,6 @@
 		color: #ddd;
 	}
 
-	.btn-tool:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
-	}
-
-	.btn-danger:hover {
-		background: #7f1d1d;
-		border-color: #991b1b;
-		color: #fca5a5;
-	}
-
 	.btn-tool-active {
 		background: #7c3aed;
 		color: #fff;
@@ -410,15 +340,6 @@
 	.btn-tool-active:hover {
 		background: #6d28d9;
 		color: #fff;
-	}
-
-	.import-error {
-		font-size: 0.65rem;
-		color: #f87171;
-		max-width: 300px;
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
 	}
 
 	.shortcut-hint {

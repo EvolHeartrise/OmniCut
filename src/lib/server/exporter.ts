@@ -2,7 +2,7 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 import type { ClipRegion, StreamInfo } from './types.js';
 
-const EXPORTS_DIR = path.resolve(process.cwd(), 'exports');
+const EXPORTS_DIR = path.resolve(process.env.EXPORTS_DIR || path.join(process.cwd(), 'exports'));
 
 /**
  * Escape a file path for use in an ffmpeg concat demuxer list file.

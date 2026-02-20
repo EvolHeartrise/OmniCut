@@ -8,10 +8,10 @@
 		seekRequest
 	} from '$lib/stores/streams.js';
 	import { TRACK_COLORS as COLORS } from '$lib/constants.js';
+	import { getMultiStreamChat } from '$lib/streams.remote';
 
 	const FETCH_WINDOW = 120; // ±120 seconds around playhead
 	const REFETCH_THRESHOLD = 30; // re-fetch when playhead drifts 30s from last center
-	const FETCH_DEBOUNCE = 300; // ms
 
 	let searchQuery = $state('');
 	let listEl = $state<HTMLDivElement | null>(null);
@@ -27,11 +27,22 @@
 		masterTime: number; // epoch seconds
 	}
 
-	// Fetched chat entries (raw from server, before filtering)
-	let fetchedEntries = $state<ChatEntry[]>([]);
-	let lastFetchCenter = 0;
-	let fetchDebounceTimer: ReturnType<typeof setTimeout> | null = null;
-	let fetchController: AbortController | null = null;
+	// Debounced center for query args — only updates when playhead drifts far enough.
+	// IMPORTANT: we must NOT clear+reschedule on every frame, or the timeout never fires
+	// during continuous playback. Instead, only schedule if no timer is already pending.
+	let debouncedCenter = $state($masterTime);
+	let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+	$effect(() => {
+		const now = $masterTime;
+		if (Math.abs(now - debouncedCenter) >= REFETCH_THRESHOLD && !debounceTimer) {
+			const snapshotTime = now;
+			debounceTimer = setTimeout(() => {
+				debounceTimer = null;
+				debouncedCenter = snapshotTime;
+			}, 300);
+		}
+	});
 
 	// Build stream lookup for visible streams
 	let visibleStreams = $derived.by(() => {
@@ -50,62 +61,37 @@
 			}));
 	});
 
-	// Trigger fetch when masterTime drifts far enough or visible streams change
-	$effect(() => {
-		const now = $masterTime;
-		const _streams = visibleStreams; // subscribe to stream changes
-		const drift = Math.abs(now - lastFetchCenter);
+	// Derive query ranges from debounced center + visible streams
+	let chatRanges = $derived(
+		visibleStreams.map((s) => {
+			const localCenter = debouncedCenter - s.anchor + s.offset;
+			return {
+				streamId: s.id,
+				from: Math.max(0, localCenter - FETCH_WINDOW),
+				to: localCenter + FETCH_WINDOW
+			};
+		})
+	);
 
-		if (drift >= REFETCH_THRESHOLD || lastFetchCenter === 0) {
-			debouncedFetch(now);
-		}
-	});
+	// Fetch chat messages via remote query — re-fetches when chatRanges changes
+	const rawMessages = $derived(await getMultiStreamChat({ ranges: chatRanges }));
 
-	function debouncedFetch(center: number) {
-		if (fetchDebounceTimer) clearTimeout(fetchDebounceTimer);
-		fetchDebounceTimer = setTimeout(() => fetchChat(center), FETCH_DEBOUNCE);
-	}
-
-	async function fetchChat(center: number) {
-		// Abort any in-flight request
-		if (fetchController) fetchController.abort();
-		fetchController = new AbortController();
-		const signal = fetchController.signal;
-
-		lastFetchCenter = center;
-		const strs = visibleStreams;
-		const allEntries: ChatEntry[] = [];
-
-		const fetches = strs.map(async (s) => {
-			const localCenter = center - s.anchor + s.offset;
-			const from = Math.max(0, localCenter - FETCH_WINDOW);
-			const to = localCenter + FETCH_WINDOW;
-
-			try {
-				const res = await fetch(`/api/streams/${s.id}/chat?from=${from}&to=${to}`, { signal });
-				if (!res.ok) return;
-				const data = await res.json();
-				for (const msg of data.messages) {
-					allEntries.push({
-						streamId: s.id,
-						channel: s.channel,
-						color: s.color,
-						username: msg.username,
-						text: msg.text,
-						masterTime: msg.timestamp + s.anchor - s.offset
-					});
-				}
-			} catch {
-				// Aborted or network error — ignore
-			}
+	// Transform server data to ChatEntry format with master-time positioning
+	let fetchedEntries = $derived.by(() => {
+		if (!rawMessages || rawMessages.length === 0) return [] as ChatEntry[];
+		const streamLookup = new Map(visibleStreams.map((s) => [s.id, s]));
+		return rawMessages.map((m) => {
+			const s = streamLookup.get(m.streamId);
+			return {
+				streamId: m.streamId,
+				channel: s?.channel || '',
+				color: s?.color || '#888',
+				username: m.username,
+				text: m.text,
+				masterTime: m.timestamp + (s ? s.anchor - s.offset : 0)
+			};
 		});
-
-		await Promise.all(fetches);
-		if (signal.aborted) return;
-
-		allEntries.sort((a, b) => a.masterTime - b.masterTime);
-		fetchedEntries = allEntries;
-	}
+	});
 
 	// Apply search filter
 	let filteredEntries = $derived.by(() => {
@@ -181,7 +167,7 @@
 	</div>
 
 	<div class="entry-list" bind:this={listEl} onscroll={handleListScroll}>
-		{#each filteredEntries as entry, i (entry.masterTime.toString() + entry.streamId + entry.username + entry.text.slice(0, 30))}
+		{#each filteredEntries as entry, i (i)}
 			<button
 				class="entry-row"
 				class:active={i === activeEntryIndex}

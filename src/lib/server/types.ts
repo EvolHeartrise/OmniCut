@@ -45,23 +45,3 @@ export interface StreamMeta {
 	createdAt: string | null;
 	vodId: string | null;
 }
-
-export interface SessionExport {
-	version: 1;
-	exportedAt: number;
-	streams: Array<{
-		id: string;
-		channel: string;
-		startedAt: number;
-		viewerCount: number | null;
-		streamTitle: string | null;
-		recordingDir: string;
-		offset: number;
-		sourceType: 'live' | 'vod';
-		parentStreamId: string | null;
-		platform?: 'twitch' | 'douyu';
-	}>;
-	transcriptions: Record<string, Array<{ text: string; startTime: number; endTime: number }>>;
-	clipRegions: ClipRegion[];
-	chatMessages?: Record<string, ChatMessage[]>;
-}

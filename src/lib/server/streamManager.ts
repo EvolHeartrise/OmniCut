@@ -6,10 +6,10 @@ import { startTranscription, stopTranscription, transcribeFullRecording, shutdow
 import { startChatCollection } from './chatCollector.js';
 import { startVodChatFetch, extractVideoId } from './vodChatFetcher.js';
 import { exportVideo as exportVideoImpl } from './exporter.js';
-import type { StreamInfo, ClipRegion, SessionExport, ChatMessage } from './types.js';
+import type { StreamInfo, ClipRegion, ChatMessage } from './types.js';
 import * as db from './persistence.js';
 
-const RECORDINGS_DIR = path.resolve(process.cwd(), 'recordings');
+const RECORDINGS_DIR = path.resolve(process.env.RECORDINGS_DIR || path.join(process.cwd(), 'recordings'));
 
 // In-memory store of active captures (hot cache; persisted to SQLite on changes)
 const captures = new Map<string, CaptureHandle>();
@@ -121,27 +121,48 @@ function broadcastTranscription(streamId: string, text: string, startTime: numbe
 	broadcast(JSON.stringify({ type: 'transcription', streamId, text, startTime, endTime }));
 }
 
-function broadcastChatMessage(streamId: string, msg: ChatMessage) {
+// --- Batched chat message buffering ---
+// Buffer chat messages per stream and flush periodically to avoid
+// per-message SQLite INSERTs and SSE broadcasts during VOD chat download.
+const CHAT_FLUSH_INTERVAL_MS = 500;
+const chatBuffers = new Map<string, ChatMessage[]>();
+const chatFlushTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function flushChatBuffer(streamId: string) {
+	const buf = chatBuffers.get(streamId);
+	if (!buf || buf.length === 0) return;
+	const msgs = buf.splice(0);
+
 	// Persist in memory
 	let messages = streamChatMessages.get(streamId);
 	if (!messages) {
 		messages = [];
 		streamChatMessages.set(streamId, messages);
 	}
-	messages.push(msg);
+	messages.push(...msgs);
 
-	// Persist to SQLite
-	db.saveChatMessage(streamId, msg);
+	// Persist to SQLite in a single transaction
+	db.saveChatMessagesBatch(streamId, msgs);
+}
 
-	broadcast(
-		JSON.stringify({
-			type: 'chat-message',
+function broadcastChatMessage(streamId: string, msg: ChatMessage) {
+	let buf = chatBuffers.get(streamId);
+	if (!buf) {
+		buf = [];
+		chatBuffers.set(streamId, buf);
+	}
+	buf.push(msg);
+
+	// Schedule flush if not already pending
+	if (!chatFlushTimers.has(streamId)) {
+		chatFlushTimers.set(
 			streamId,
-			username: msg.username,
-			text: msg.text,
-			timestamp: msg.timestamp
-		})
-	);
+			setTimeout(() => {
+				chatFlushTimers.delete(streamId);
+				flushChatBuffer(streamId);
+			}, CHAT_FLUSH_INTERVAL_MS)
+		);
+	}
 }
 
 function broadcastExportProgress(message: string, step: number, totalSteps: number) {
@@ -169,7 +190,8 @@ function serializeStreamInfo(info: StreamInfo) {
 		sourceType: info.sourceType,
 		parentStreamId: info.parentStreamId,
 		platform: info.platform,
-		sourceUrl: info.sourceUrl
+		sourceUrl: info.sourceUrl,
+		chatMessageCount: streamChatMessages.get(info.id)?.length ?? 0
 	};
 }
 
@@ -477,6 +499,12 @@ export function removeStream(id: string): boolean {
 	handle.kill();
 	captures.delete(id);
 
+	// Cancel any pending chat flush and discard buffer
+	const pendingFlush = chatFlushTimers.get(id);
+	if (pendingFlush) clearTimeout(pendingFlush);
+	chatFlushTimers.delete(id);
+	chatBuffers.delete(id);
+
 	// Remove from in-memory caches
 	streamTranscriptions.delete(id);
 	streamChatMessages.delete(id);
@@ -489,6 +517,14 @@ export function removeStream(id: string): boolean {
 
 	// Remove from SQLite (cascades to transcriptions, chat, clips)
 	db.deleteStream(id);
+
+	// Delete recording files from disk
+	const recordingDir = handle.info.recordingDir;
+	if (recordingDir && fs.existsSync(recordingDir)) {
+		fs.rm(recordingDir, { recursive: true, force: true }, (err) => {
+			if (err) console.error(`Failed to delete recording dir ${recordingDir}:`, err);
+		});
+	}
 
 	return true;
 }
@@ -591,190 +627,25 @@ export function getChatMessagesInRange(id: string, fromTime: number, toTime: num
 }
 
 /**
+ * Get pre-bucketed chat heatmap data for a stream.
+ */
+export function getChatHeatmap(id: string, bucketSeconds: number): { buckets: Array<{ time: number; count: number }>; max: number } {
+	const rows = db.loadChatHeatmap(id, bucketSeconds);
+	let max = 0;
+	const buckets = rows.map((r) => {
+		if (r.count > max) max = r.count;
+		return { time: r.bucket, count: r.count };
+	});
+	return { buckets, max };
+}
+
+/**
  * Get the recording directory path for a stream.
  */
 export function getStreamRecordingDir(id: string): string | null {
 	const handle = captures.get(id);
 	if (!handle) return null;
 	return handle.info.recordingDir;
-}
-
-// --- Session import/export ---
-
-/**
- * Export all session state to a portable JSON structure.
- */
-export function exportSession(): SessionExport {
-	const streams: SessionExport['streams'] = [];
-	for (const [, handle] of captures) {
-		const info = handle.info;
-		streams.push({
-			id: info.id,
-			channel: info.channel,
-			startedAt: info.startedAt,
-			viewerCount: info.viewerCount,
-			streamTitle: info.streamTitle,
-			recordingDir: path.relative(RECORDINGS_DIR, info.recordingDir),
-			offset: info.offset,
-			sourceType: info.sourceType,
-			parentStreamId: info.parentStreamId,
-			platform: info.platform
-		});
-	}
-
-	const transcriptions: SessionExport['transcriptions'] = {};
-	for (const [id, entries] of streamTranscriptions) {
-		transcriptions[id] = entries;
-	}
-
-	const chatMessages: SessionExport['chatMessages'] = {};
-	for (const [id, messages] of streamChatMessages) {
-		if (messages.length > 0) {
-			chatMessages[id] = messages;
-		}
-	}
-
-	return {
-		version: 1,
-		exportedAt: Date.now(),
-		streams,
-		transcriptions,
-		clipRegions: [...clipRegionsStore],
-		chatMessages
-	};
-}
-
-/**
- * Clear all session state — stop processes, wipe in-memory caches, and clear SQLite.
- */
-export function clearSession(): void {
-	for (const [id, handle] of captures) {
-		stopTranscription(id);
-		handle.stopChat?.();
-		handle.transcriptionStarted = true; // prevent full transcription from firing on kill
-		handle.kill();
-	}
-	captures.clear();
-	streamTranscriptions.clear();
-	streamChatMessages.clear();
-	clipRegionsStore.length = 0;
-	db.clearAll();
-}
-
-/**
- * Import session state from a previously exported JSON structure.
- * Clears existing state and replaces with imported data.
- */
-export function importSession(data: SessionExport): { imported: number; errors: string[] } {
-	if (data.version !== 1) {
-		return { imported: 0, errors: [`Unsupported export version: ${data.version}`] };
-	}
-
-	clearSession();
-
-	const errors: string[] = [];
-	let imported = 0;
-
-	for (const stream of data.streams) {
-		const recordingDir = path.join(RECORDINGS_DIR, stream.recordingDir);
-
-		// Verify recording directory exists
-		if (!fs.existsSync(recordingDir)) {
-			errors.push(`Recording directory missing for ${stream.channel} (${stream.recordingDir})`);
-			continue;
-		}
-
-		// Verify playlist exists
-		const playlistPath = path.join(recordingDir, 'playlist.m3u8');
-		if (!fs.existsSync(playlistPath)) {
-			errors.push(`playlist.m3u8 missing for ${stream.channel} (${stream.recordingDir})`);
-			continue;
-		}
-
-		// Recount segments and disk usage from disk
-		let segmentCount = 0;
-		let diskUsageBytes = 0;
-		try {
-			const files = fs.readdirSync(recordingDir);
-			for (const file of files) {
-				if (file.endsWith('.ts')) {
-					segmentCount++;
-				}
-				const stat = fs.statSync(path.join(recordingDir, file));
-				diskUsageBytes += stat.size;
-			}
-		} catch {
-			// Non-fatal: just use zeros
-		}
-
-		const info: StreamInfo = {
-			id: stream.id,
-			channel: stream.channel,
-			status: 'stopped',
-			startedAt: stream.startedAt,
-			segmentCount,
-			diskUsageBytes,
-			viewerCount: stream.viewerCount,
-			streamTitle: stream.streamTitle,
-			gameName: null,
-			recordingDir,
-			offset: stream.offset,
-			sourceType: stream.sourceType,
-			parentStreamId: stream.parentStreamId,
-			platform: (stream as any).platform || 'twitch',
-			sourceUrl: (stream as any).sourceUrl || null
-		};
-
-		// Create stub CaptureHandle (no process, just data)
-		const stubHandle: CaptureHandle = {
-			info,
-			kill: () => {},
-			segmentWatchInterval: null
-		};
-
-		captures.set(stream.id, stubHandle);
-
-		// Persist to SQLite
-		db.saveStream(info);
-
-		imported++;
-	}
-
-	// Restore transcriptions (only for successfully imported streams)
-	if (data.transcriptions) {
-		for (const [streamId, entries] of Object.entries(data.transcriptions)) {
-			if (captures.has(streamId)) {
-				streamTranscriptions.set(streamId, [...entries]);
-				db.bulkImportTranscriptions(streamId, entries);
-			}
-		}
-	}
-
-	// Restore clip regions (only for successfully imported streams)
-	if (data.clipRegions) {
-		const validRegions: ClipRegion[] = [];
-		for (const region of data.clipRegions) {
-			if (captures.has(region.streamId)) {
-				clipRegionsStore.push({ ...region });
-				validRegions.push(region);
-			}
-		}
-		if (validRegions.length > 0) {
-			db.bulkImportClipRegions(validRegions);
-		}
-	}
-
-	// Restore chat messages (only for successfully imported streams)
-	if (data.chatMessages) {
-		for (const [streamId, messages] of Object.entries(data.chatMessages)) {
-			if (captures.has(streamId)) {
-				streamChatMessages.set(streamId, [...messages]);
-				db.bulkImportChatMessages(streamId, messages);
-			}
-		}
-	}
-
-	return { imported, errors };
 }
 
 // --- Video export ---
