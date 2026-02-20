@@ -9,6 +9,7 @@ import {
 	stopStream as smStopStream,
 	removeStream as smRemoveStream,
 	retranscribeStream as smRetranscribe,
+	resumeVodStream as smResumeVod,
 	updateStreamOffset,
 	addClipRegion,
 	removeClipRegion,
@@ -109,6 +110,13 @@ export const removeStreamCmd = command('unchecked', async (args: { id: string })
 /** Re-transcribe a stopped stream. */
 export const retranscribeCmd = command('unchecked', async (args: { id: string }) => {
 	smRetranscribe(args.id);
+});
+
+/** Resume a stopped Twitch VOD capture. */
+export const resumeVodCmd = command('unchecked', async (args: { id: string }) => {
+	const success = smResumeVod(args.id);
+	if (!success) throw new Error('Cannot resume: stream must be a stopped Twitch VOD');
+	await getStreams().refresh();
 });
 
 /** Update a stream's sync offset. */

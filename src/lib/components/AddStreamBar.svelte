@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { addStream, streams, appMode } from '$lib/stores/streams.js';
+	import { addStream, streams } from '$lib/stores/streams.js';
 	import type { ChannelInfo, VodInfo } from '$lib/types.js';
 
 	type Platform = 'twitch' | 'douyu';
@@ -228,7 +228,6 @@
 		try {
 			const lang = channelSettings.get(channel.login) || undefined;
 			await addStream(channel.login, { language: lang, platform: channel.platform });
-			$appMode = 'clipping';
 		} catch (err) {
 			error = err instanceof Error ? err.message : 'Failed to start capture';
 		} finally {
@@ -243,7 +242,6 @@
 		try {
 			const lang = channelSettings.get(channel.login) || undefined;
 			await addStream(channel.login, { language: lang, vod: true });
-			$appMode = 'clipping';
 		} catch (err) {
 			error = err instanceof Error ? err.message : 'Failed to start VOD capture';
 		} finally {
@@ -269,7 +267,6 @@
 		error = '';
 		try {
 			await addStream('_vod', { vodUrl });
-			$appMode = 'clipping';
 		} catch (err) {
 			error = err instanceof Error ? err.message : 'Failed to add VOD';
 		} finally {
@@ -323,7 +320,6 @@
 		try {
 			const lang = expandedVodsLogin ? (channelSettings.get(expandedVodsLogin) || undefined) : undefined;
 			await addStream('_vod', { vodUrl: `https://twitch.tv/videos/${vodId}`, language: lang });
-			$appMode = 'clipping';
 		} catch (err) {
 			error = err instanceof Error ? err.message : 'Failed to add VOD';
 		} finally {

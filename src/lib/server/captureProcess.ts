@@ -174,7 +174,8 @@ export function startCapture(
 	recordingsBase: string,
 	onStatusChange: (info: StreamInfo) => void,
 	vodUrl?: string,
-	platform: 'twitch' | 'douyu' = 'twitch'
+	platform: 'twitch' | 'douyu' = 'twitch',
+	hlsStartOffset?: number
 ): CaptureHandle {
 	const recordingDir = path.join(recordingsBase, id);
 	fs.mkdirSync(recordingDir, { recursive: true });
@@ -319,6 +320,10 @@ export function startCapture(
 		// Twitch: streamlink stdout piped into FFmpeg stdin
 		const twitchUrl = vodUrl || `https://twitch.tv/${channel}`;
 		const streamlinkArgs = [twitchUrl, 'best', '--stdout'];
+
+		if (hlsStartOffset && hlsStartOffset > 0) {
+			streamlinkArgs.push('--hls-start-offset', hlsStartOffset.toFixed(1));
+		}
 
 		const twitchToken = process.env.TWITCH_OAUTH_TOKEN;
 		if (twitchToken) {

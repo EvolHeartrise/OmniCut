@@ -6,6 +6,7 @@ import {
 	stopStreamCmd,
 	removeStreamCmd,
 	retranscribeCmd,
+	resumeVodCmd,
 	updateOffsetCmd,
 	saveClipCmd,
 	deleteClipCmd
@@ -185,6 +186,18 @@ export async function retranscribeStream(id: string): Promise<void> {
 		await retranscribeCmd({ id });
 	} catch (err) {
 		console.error('Failed to retranscribe stream:', err);
+	}
+}
+
+/**
+ * Resume a stopped Twitch VOD capture from where it left off.
+ */
+export async function resumeVodStream(id: string): Promise<void> {
+	try {
+		await resumeVodCmd({ id });
+		await refreshStreams();
+	} catch (err) {
+		console.error('Failed to resume VOD stream:', err);
 	}
 }
 

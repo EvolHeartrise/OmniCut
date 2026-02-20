@@ -8,7 +8,7 @@
 	import { get } from 'svelte/store';
 	import Hls from 'hls.js';
 	import type { StreamState } from '$lib/stores/streams.js';
-	import { syncOffsets, streamPlaybackStates, masterControl, masterPlaying, masterPlaybackRate, masterTime, transcriptions, stopStream, retranscribeStream } from '$lib/stores/streams.js';
+	import { syncOffsets, streamPlaybackStates, masterControl, masterPlaying, masterPlaybackRate, masterTime, transcriptions, stopStream, retranscribeStream, resumeVodStream } from '$lib/stores/streams.js';
 	import { createHlsConfig, formatBytes } from '$lib/utils.js';
 
 	let { stream, focused = false, trackNumber = 0 }: { stream: StreamState; focused?: boolean; trackNumber?: number } = $props();
@@ -247,6 +247,9 @@
 		{#if stream.status === 'capturing' && stream.sourceType === 'vod'}
 			<button class="btn-stop" onclick={() => stopStream(stream.id)} title="Stop downloading">Stop</button>
 		{:else if stream.status === 'stopped'}
+			{#if stream.sourceType === 'vod' && stream.platform === 'twitch'}
+				<button class="btn-resume" onclick={() => resumeVodStream(stream.id)} title="Resume VOD download from where it left off">Resume</button>
+			{/if}
 			<button class="btn-retranscribe" onclick={() => retranscribeStream(stream.id)} title="Re-transcribe entire recording">Re-transcribe</button>
 			<span class="status-badge">Stopped</span>
 		{:else if stream.status === 'starting' || stream.status === 'error'}
@@ -460,6 +463,25 @@
 	.btn-retranscribe:hover {
 		background: #7c3aed;
 		color: #fff;
+	}
+
+	.btn-resume {
+		font-size: 0.65rem;
+		font-weight: 700;
+		padding: 2px 8px;
+		border-radius: 4px;
+		border: 1px solid #22c55e;
+		background: transparent;
+		color: #22c55e;
+		cursor: pointer;
+		text-transform: uppercase;
+		letter-spacing: 0.5px;
+		transition: background 0.15s, color 0.15s;
+	}
+
+	.btn-resume:hover {
+		background: #22c55e;
+		color: #000;
 	}
 
 	.status-badge.error {

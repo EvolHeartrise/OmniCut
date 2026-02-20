@@ -462,6 +462,90 @@ export function stopStream(id: string): boolean {
 }
 
 /**
+ * Parse an HLS playlist and return the total duration in seconds.
+ * Returns 0 if the file doesn't exist or has no segments.
+ */
+function parsePlaylistDuration(playlistPath: string): number {
+	if (!fs.existsSync(playlistPath)) return 0;
+	const content = fs.readFileSync(playlistPath, 'utf-8');
+	const lines = content.split('\n');
+	let total = 0;
+	for (const line of lines) {
+		const trimmed = line.trim();
+		if (trimmed.startsWith('#EXTINF:')) {
+			total += parseFloat(trimmed.split(':')[1].replace(',', ''));
+		}
+	}
+	return total;
+}
+
+/**
+ * Resume a stopped Twitch VOD capture from where it left off.
+ * Reads the existing playlist duration and restarts streamlink with --hls-start-offset.
+ */
+export function resumeVodStream(id: string): boolean {
+	const handle = captures.get(id);
+	if (!handle) return false;
+	if (handle.info.status !== 'stopped') return false;
+	if (handle.info.sourceType !== 'vod') return false;
+	if (handle.info.platform !== 'twitch') return false;
+	if (!handle.info.sourceUrl) return false;
+
+	const playlistPath = path.join(handle.info.recordingDir, 'playlist.m3u8');
+	const playlistDuration = parsePlaylistDuration(playlistPath);
+	const hlsStartOffset = Math.max(0, playlistDuration - 5);
+
+	// Preserve original metadata
+	const originalStartedAt = handle.info.startedAt;
+	const originalStreamTitle = handle.info.streamTitle;
+	const originalGameName = handle.info.gameName;
+	const originalParentStreamId = handle.info.parentStreamId;
+	const sourceUrl = handle.info.sourceUrl;
+	const channel = handle.info.channel;
+
+	// Clear old stub handle's interval
+	if (handle.segmentWatchInterval) clearInterval(handle.segmentWatchInterval);
+
+	// Resolve language
+	const language = db.getChannelSettings(channel)?.language ?? null;
+
+	const newHandle = startCapture(channel, id, RECORDINGS_DIR, (info) => {
+		// Preserve original metadata across status changes
+		info.startedAt = originalStartedAt;
+		info.streamTitle = originalStreamTitle;
+		info.gameName = originalGameName;
+		info.parentStreamId = originalParentStreamId;
+
+		broadcastUpdate(info);
+		db.saveStream(info);
+
+		// Start live transcription when capturing begins
+		if (info.status === 'capturing' && !newHandle.transcriptionStarted) {
+			newHandle.transcriptionStarted = true;
+			startTranscription(id, info.recordingDir, (_streamId, text, startTime, endTime) => {
+				broadcastTranscription(id, text, startTime, endTime);
+			}, language);
+		}
+
+		// Full-file transcription when download completes
+		if (info.status === 'stopped' && newHandle.transcriptionStarted) {
+			transcribeFullRecording(id, info.recordingDir, (_streamId, text, startTime, endTime) => {
+				broadcastTranscription(id, text, startTime, endTime);
+			}, language);
+		}
+	}, sourceUrl, 'twitch', hlsStartOffset);
+
+	// Don't re-fetch chat
+	newHandle.chatStarted = true;
+
+	captures.set(id, newHandle);
+
+	console.log(`[vod:${channel}] Resumed VOD capture with offset ${hlsStartOffset.toFixed(1)}s`);
+
+	return true;
+}
+
+/**
  * Re-transcribe a stopped stream using full-file transcription.
  * Clears existing transcriptions and starts fresh.
  */

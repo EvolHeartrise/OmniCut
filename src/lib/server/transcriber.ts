@@ -4,7 +4,7 @@ import * as fs from 'node:fs';
 const BATCH_SIZE = 15; // segments per batch (~30 seconds at 2s/segment, Whisper's full context window)
 const POLL_INTERVAL = 3000; // check for new segments every 3s
 const SEGMENT_DURATION = 2; // seconds per HLS segment (matches -hls_time 2)
-const POOL_SIZE = 3; // number of concurrent transcription workers
+const POOL_SIZE = 2; // number of concurrent transcription workers
 
 // --- Worker pool ---
 
