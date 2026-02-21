@@ -22,6 +22,7 @@
 	let scrollTimeout: ReturnType<typeof setTimeout> | null = null;
 
 	interface ChatEntry {
+		id: number;
 		streamId: string;
 		channel: string;
 		streamColor: string;
@@ -71,6 +72,7 @@
 		return rawMessages.map((m) => {
 			const s = streamLookup.get(m.streamId);
 			return {
+				id: m.id,
 				streamId: m.streamId,
 				channel: s?.channel || '',
 				streamColor: s?.color || '#888',
@@ -167,7 +169,7 @@
 	</div>
 
 	<div class="chat-log" bind:this={listEl} onscroll={handleListScroll}>
-		{#each displayEntries as entry (entry.masterTime.toString() + entry.username + entry.text.slice(0, 30))}
+		{#each displayEntries as entry (entry.id)}
 			<button class="chat-line" onclick={() => seekToEntry(entry)}>
 				<span class="user" style="color:{entry.userColor}">{entry.username}</span><span class="sep">:</span>
 				<span class="msg">{entry.text}</span>

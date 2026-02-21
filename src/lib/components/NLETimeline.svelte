@@ -219,7 +219,7 @@
 	});
 
 	// Chat heatmap: fetch once per stream via remote query, store in $state
-	const CHAT_BUCKET_SECONDS = 5;
+	const CHAT_BUCKET_SECONDS = 30;
 
 	let chatHeatmapRaw = $state<Record<string, { buckets: Array<{ time: number; count: number }>; max: number }>>({});
 	let heatmapFetchedIds = new Set<string>();
@@ -237,26 +237,70 @@
 		}
 	});
 
-	let chatHeatmapData = $derived.by(() => {
-		const result: Record<string, Array<{ startTime: number; count: number; intensity: number }>> = {};
+	// Canvas refs for chat heatmap — keyed by stream ID
+	let heatmapCanvases = $state<Record<string, HTMLCanvasElement>>({});
+
+	function bindHeatmapCanvas(el: HTMLCanvasElement, sid: string) {
+		heatmapCanvases = { ...heatmapCanvases, [sid]: el };
+		return {
+			destroy() {
+				const { [sid]: _, ...rest } = heatmapCanvases;
+				heatmapCanvases = rest;
+			}
+		};
+	}
+
+	// Draw chat heatmap on canvas per-stream — reads chatHeatmapRaw directly,
+	// computes master-time positions inline during draw (no intermediate derived).
+	// No viewport culling needed: canvas is positioned/sized to match the bar,
+	// so the browser handles clipping via overflow. Only redraws on zoom/offset/data changes.
+	$effect(() => {
+		const pps = pixelsPerSecond;
+		const tStart = effectiveTimelineStart;
+		const bucketSec = CHAT_BUCKET_SECONDS;
+
 		for (const track of tracksData) {
 			for (const bar of track.bars) {
+				const canvas = heatmapCanvases[bar.streamId];
 				const raw = chatHeatmapRaw[bar.streamId];
-				if (!raw || raw.buckets.length === 0) continue;
-				const max = raw.max;
-				const entries: Array<{ startTime: number; count: number; intensity: number }> = [];
+				if (!canvas) continue;
+
+				const barLeft = (bar.anchor - bar.offset - tStart) * pps;
+				const barWidth = bar.duration * pps;
+				const canvasW = Math.ceil(barWidth);
+				const canvasH = 24;
+
+				if (canvas.width !== canvasW) canvas.width = canvasW;
+				if (canvas.height !== canvasH) canvas.height = canvasH;
+				canvas.style.left = `${barLeft}px`;
+				canvas.style.width = `${canvasW}px`;
+
+				const ctx = canvas.getContext('2d');
+				if (!ctx) continue;
+				ctx.clearRect(0, 0, canvasW, canvasH);
+
+				if (!raw || raw.buckets.length === 0 || raw.max === 0) continue;
+
+				const heatWidth = bucketSec * pps;
+
 				for (const b of raw.buckets) {
-					const masterT = b.time + bar.anchor - bar.offset;
-					entries.push({
-						startTime: masterT,
-						count: b.count,
-						intensity: max > 0 ? b.count / max : 0
-					});
+					const intensity = b.count / raw.max;
+					if (intensity <= 0.05) continue;
+
+					// b.time is stream-local seconds; bar.anchor - bar.offset is the bar's master-time origin
+					const localX = b.time * pps;
+					const alpha = 0.15 + intensity * 0.7;
+
+					const grad = ctx.createLinearGradient(0, canvasH, 0, 0);
+					grad.addColorStop(0, `rgba(249, 115, 22, ${alpha})`);
+					grad.addColorStop(1, `rgba(251, 191, 36, ${alpha})`);
+					ctx.fillStyle = grad;
+					ctx.beginPath();
+					ctx.roundRect(localX, 0, heatWidth, canvasH, 2);
+					ctx.fill();
 				}
-				result[bar.streamId] = entries;
 			}
 		}
-		return result;
 	});
 
 	// Master time is a pure self-advancing clock in epoch seconds. Streams follow it, never the reverse.
@@ -842,21 +886,11 @@
 									</div>
 								{/if}
 							{/each}
-							{#each track.streamIds as sid}
-								{#if chatHeatmapData[sid]}
-									{@const visMin = viewportLeft - CULL_MARGIN}
-									{@const visMax = viewportLeft + viewportWidth + CULL_MARGIN}
-									{@const heatWidth = CHAT_BUCKET_SECONDS * pixelsPerSecond}
-									{#each chatHeatmapData[sid] as bucket}
-										{@const heatLeft = (bucket.startTime - effectiveTimelineStart) * pixelsPerSecond}
-										{#if bucket.intensity > 0.05 && heatLeft + heatWidth > visMin && heatLeft < visMax}
-											<div
-												class="chat-heatmap-bar"
-												style="left: {heatLeft}px; width: {heatWidth}px; opacity: {0.15 + bucket.intensity * 0.7}"
-											></div>
-										{/if}
-									{/each}
-								{/if}
+							{#each track.bars as hbar}
+								<canvas
+									class="chat-heatmap-canvas"
+									use:bindHeatmapCanvas={hbar.streamId}
+								></canvas>
 							{/each}
 							{#each trackClipRegions.get(track.key) ?? [] as region}
 								{@const dragShift = draggingStreamId === region.streamId ? -dragOffsetDelta : 0}
@@ -1158,12 +1192,10 @@
 		line-height: 24px;
 	}
 
-	.chat-heatmap-bar {
+	.chat-heatmap-canvas {
 		position: absolute;
 		top: 4px;
 		height: 24px;
-		background: linear-gradient(to top, #f97316, #fbbf24);
-		border-radius: 2px;
 		pointer-events: none;
 		z-index: 2;
 	}

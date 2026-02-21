@@ -32,6 +32,7 @@ export interface StreamState {
 	platform: 'twitch' | 'douyu';
 	sourceUrl?: string | null;
 	chatMessageCount: number;
+	transcriptionCount: number;
 	chatComplete: boolean;
 }
 
@@ -61,6 +62,7 @@ export const masterPlaying = writable(false);
 
 // Per-stream timestamped transcription captions
 export interface TranscriptionEntry {
+	id: number;
 	text: string;
 	startTime: number; // stream-local seconds
 	endTime: number;

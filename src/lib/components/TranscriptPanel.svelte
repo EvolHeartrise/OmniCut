@@ -6,7 +6,9 @@
 		soloStreamId,
 		masterTime,
 		seekRequest,
-		deriveVisibleStreams
+		transcriptions,
+		deriveVisibleStreams,
+		type TranscriptionEntry
 	} from '$lib/stores/streams.js';
 	import { TRACK_COLORS as COLORS } from '$lib/constants.js';
 	import { getMultiStreamTranscriptions } from '$lib/streams.remote';
@@ -21,6 +23,7 @@
 	let scrollTimeout: ReturnType<typeof setTimeout> | null = null;
 
 	interface TaggedEntry {
+		id: number;
 		streamId: string;
 		channel: string;
 		color: string;
@@ -62,6 +65,18 @@
 	// Fetch transcriptions via remote query — re-fetches when ranges change
 	const rawEntries = $derived(await getMultiStreamTranscriptions({ ranges: transcriptRanges }));
 
+	// Feed StreamTile captions from the wider ±120s window (superset of ±60s caption window)
+	$effect(() => {
+		const data = rawEntries;
+		if (!data) return;
+		const grouped: Record<string, TranscriptionEntry[]> = {};
+		for (const r of data) {
+			if (!grouped[r.streamId]) grouped[r.streamId] = [];
+			grouped[r.streamId].push({ id: r.id, text: r.text, startTime: r.startTime, endTime: r.endTime });
+		}
+		transcriptions.set(grouped);
+	});
+
 	// Transform server data to TaggedEntry format with master-time positioning
 	let fetchedEntries = $derived.by(() => {
 		if (!rawEntries || rawEntries.length === 0) return [] as TaggedEntry[];
@@ -69,6 +84,7 @@
 		return rawEntries.map((e) => {
 			const s = streamLookup.get(e.streamId);
 			return {
+				id: e.id,
 				streamId: e.streamId,
 				channel: s?.channel || '',
 				color: s?.color || '#888',
@@ -163,7 +179,7 @@
 	</div>
 
 	<div class="entry-list" bind:this={listEl} onscroll={handleListScroll}>
-		{#each filteredEntries as entry, i (entry.masterStart.toString() + entry.streamId + entry.text.slice(0, 40))}
+		{#each filteredEntries as entry, i (entry.id)}
 			<button
 				class="entry-row"
 				class:active={i === activeEntryIndex}

@@ -25,12 +25,14 @@
 	let mode = $derived($appMode);
 
 	// --- Windowed caption fetch (feeds StreamTile subtitles via transcriptions store) ---
+	// Only active when TranscriptPanel is closed. When open, TranscriptPanel writes
+	// to the transcriptions store from its wider ±120s window (superset of ±60s).
 
 	let captionCenter = $state($masterTime);
 	let captionDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
 	$effect(() => {
-		if ($appMode !== 'clipping') return;
+		if ($appMode !== 'clipping' || $transcriptPanelOpen) return;
 		const now = $masterTime;
 		if (Math.abs(now - captionCenter) >= CAPTION_REFETCH_THRESHOLD && !captionDebounceTimer) {
 			const snap = now;
@@ -48,7 +50,7 @@
 	});
 
 	let captionRanges = $derived(
-		$appMode === 'clipping'
+		$appMode === 'clipping' && !$transcriptPanelOpen
 			? $streams.map((s) => {
 					const anchor = s.startedAt / 1000;
 					const offset = $syncOffsets[s.id] || 0;
@@ -71,11 +73,11 @@
 	// Push windowed caption data into the transcriptions store for StreamTile
 	$effect(() => {
 		const data = captionResults;
-		if (!data) return;
+		if (!data || $transcriptPanelOpen) return;
 		const grouped: Record<string, TranscriptionEntry[]> = {};
 		for (const r of data) {
 			if (!grouped[r.streamId]) grouped[r.streamId] = [];
-			grouped[r.streamId].push({ text: r.text, startTime: r.startTime, endTime: r.endTime });
+			grouped[r.streamId].push({ id: r.id, text: r.text, startTime: r.startTime, endTime: r.endTime });
 		}
 		transcriptions.set(grouped);
 	});

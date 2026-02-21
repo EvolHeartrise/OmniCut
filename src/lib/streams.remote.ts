@@ -53,7 +53,7 @@ export const getChatHeatmap = query('unchecked', async (args: { streamId: string
 export const getMultiStreamChat = query(
 	'unchecked',
 	async (args: { ranges: Array<{ streamId: string; from: number; to: number }> }) => {
-		const results: Array<ChatMessage & { streamId: string }> = [];
+		const results: Array<ChatMessage & { id: number; streamId: string }> = [];
 		for (const range of args.ranges) {
 			const messages = smGetChatMessagesInRange(range.streamId, range.from, range.to);
 			for (const m of messages) {
@@ -69,7 +69,7 @@ export const getMultiStreamChat = query(
 export const getMultiStreamTranscriptions = query(
 	'unchecked',
 	async (args: { ranges: Array<{ streamId: string; from: number; to: number }> }) => {
-		const results: Array<{ streamId: string; text: string; startTime: number; endTime: number }> = [];
+		const results: Array<{ id: number; streamId: string; text: string; startTime: number; endTime: number }> = [];
 		for (const range of args.ranges) {
 			const entries = smGetTranscriptionsInRange(range.streamId, range.from, range.to);
 			for (const e of entries) {

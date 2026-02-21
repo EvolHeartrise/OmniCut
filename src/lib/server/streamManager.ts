@@ -20,6 +20,9 @@ const clipRegionsStore: ClipRegion[] = [];
 // In-memory cache of chat message counts per stream (avoids COUNT(*) on every broadcast)
 const chatMessageCounts = new Map<string, number>();
 
+// In-memory cache of transcription counts per stream
+const transcriptionCounts = new Map<string, number>();
+
 // SSE clients for real-time updates
 const sseClients = new Set<(data: string) => void>();
 
@@ -62,9 +65,10 @@ export async function initStreamManager(): Promise<void> {
 		}
 	}
 
-	// Initialize chat message counts
+	// Initialize chat message counts and transcription counts
 	for (const [, handle] of captures) {
 		chatMessageCounts.set(handle.info.id, db.countChatMessages(handle.info.id));
+		transcriptionCounts.set(handle.info.id, db.countTranscriptions(handle.info.id));
 	}
 
 	const streamCount = captures.size;
@@ -89,6 +93,7 @@ function broadcastUpdate(info: StreamInfo) {
 
 function broadcastTranscription(streamId: string, text: string, startTime: number, endTime: number) {
 	db.saveTranscription(streamId, text, startTime, endTime);
+	transcriptionCounts.set(streamId, (transcriptionCounts.get(streamId) ?? 0) + 1);
 	broadcast(JSON.stringify({ type: 'transcription', streamId, text, startTime, endTime }));
 }
 
@@ -128,6 +133,7 @@ function serializeStreamInfo(info: StreamInfo) {
 		platform: info.platform,
 		sourceUrl: info.sourceUrl,
 		chatMessageCount: chatMessageCounts.get(info.id) ?? 0,
+		transcriptionCount: transcriptionCounts.get(info.id) ?? 0,
 		chatComplete: info.chatComplete
 	};
 }
@@ -534,6 +540,7 @@ export function retranscribeStream(id: string): boolean {
 
 	// Clear existing transcriptions
 	db.deleteTranscriptions(id);
+	transcriptionCounts.set(id, 0);
 	broadcast(JSON.stringify({ type: 'transcription-cleared', streamId: id }));
 
 	// Resolve language
@@ -568,6 +575,7 @@ export function removeStream(id: string): boolean {
 	}
 
 	chatMessageCounts.delete(id);
+	transcriptionCounts.delete(id);
 
 	// Remove from SQLite (cascades to transcriptions, chat, clips)
 	db.deleteStream(id);
@@ -659,7 +667,7 @@ export function getAllClipRegions(): ClipRegion[] {
 	return clipRegionsStore;
 }
 
-export function getTranscriptionsInRange(id: string, fromTime: number, toTime: number): Array<{ text: string; startTime: number; endTime: number }> {
+export function getTranscriptionsInRange(id: string, fromTime: number, toTime: number): Array<{ id: number; text: string; startTime: number; endTime: number }> {
 	return db.loadTranscriptionsInRange(id, fromTime, toTime);
 }
 
@@ -669,7 +677,7 @@ export function getTranscriptionsInRange(id: string, fromTime: number, toTime: n
 /**
  * Get chat messages for a stream within a time range (stream-local seconds).
  */
-export function getChatMessagesInRange(id: string, fromTime: number, toTime: number): ChatMessage[] {
+export function getChatMessagesInRange(id: string, fromTime: number, toTime: number): (ChatMessage & { id: number })[] {
 	return db.loadChatMessagesInRange(id, fromTime, toTime);
 }
 

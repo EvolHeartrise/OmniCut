@@ -172,6 +172,7 @@ interface StreamRow {
 }
 
 interface TranscriptionRow {
+	id: number;
 	stream_id: string;
 	text: string;
 	start_time: number;
@@ -179,6 +180,7 @@ interface TranscriptionRow {
 }
 
 interface ChatRow {
+	id: number;
 	stream_id: string;
 	username: string;
 	text: string;
@@ -296,12 +298,18 @@ export function saveTranscription(streamId: string, text: string, startTime: num
 	);
 }
 
-export function loadTranscriptionsInRange(streamId: string, fromTime: number, toTime: number): Array<{ text: string; startTime: number; endTime: number }> {
+export function loadTranscriptionsInRange(streamId: string, fromTime: number, toTime: number): Array<{ id: number; text: string; startTime: number; endTime: number }> {
 	const d = getDb();
 	const rows = d.query(
-		'SELECT text, start_time, end_time FROM transcriptions WHERE stream_id = ? AND end_time >= ? AND start_time <= ? ORDER BY start_time'
+		'SELECT id, text, start_time, end_time FROM transcriptions WHERE stream_id = ? AND end_time >= ? AND start_time <= ? ORDER BY start_time'
 	).all(streamId, fromTime, toTime) as TranscriptionRow[];
-	return rows.map((r) => ({ text: r.text, startTime: r.start_time, endTime: r.end_time }));
+	return rows.map((r) => ({ id: r.id, text: r.text, startTime: r.start_time, endTime: r.end_time }));
+}
+
+export function countTranscriptions(streamId: string): number {
+	const d = getDb();
+	const row = d.query('SELECT COUNT(*) as cnt FROM transcriptions WHERE stream_id = ?').get(streamId) as { cnt: number } | null;
+	return row?.cnt ?? 0;
 }
 
 export function deleteTranscriptions(streamId: string): void {
@@ -325,12 +333,12 @@ export function countChatMessages(streamId: string): number {
 	return row?.cnt ?? 0;
 }
 
-export function loadChatMessagesInRange(streamId: string, fromTime: number, toTime: number): ChatMessage[] {
+export function loadChatMessagesInRange(streamId: string, fromTime: number, toTime: number): (ChatMessage & { id: number })[] {
 	const d = getDb();
 	const rows = d.query(
-		'SELECT username, text, timestamp, color FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp'
+		'SELECT id, username, text, timestamp, color FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp'
 	).all(streamId, fromTime, toTime) as ChatRow[];
-	return rows.map((r) => ({ username: r.username, text: r.text, timestamp: r.timestamp, color: r.color ?? null }));
+	return rows.map((r) => ({ id: r.id, username: r.username, text: r.text, timestamp: r.timestamp, color: r.color ?? null }));
 }
 
 export function loadChatHeatmap(streamId: string, bucketSeconds: number): Array<{ bucket: number; count: number }> {

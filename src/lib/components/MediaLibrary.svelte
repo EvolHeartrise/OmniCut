@@ -71,6 +71,10 @@
 						<span class="meta chat">{stream.chatMessageCount.toLocaleString()} msgs</span>
 					{/if}
 
+					{#if stream.transcriptionCount > 0}
+						<span class="meta transcript">{stream.transcriptionCount.toLocaleString()} transcripts</span>
+					{/if}
+
 					<span class="meta date">{formatDate(stream.startedAt)}</span>
 
 					<span class="actions">
@@ -201,6 +205,10 @@
 
 	.meta.chat {
 		color: #7c3aed;
+	}
+
+	.meta.transcript {
+		color: #0891b2;
 	}
 
 	.meta.date {
