@@ -15,7 +15,7 @@
 		seekRequest,
 		type ClipRegion
 	} from '$lib/stores/streams.js';
-	import { applyTimelineZoom, clampPps } from '$lib/timeline.js';
+	import { applyTimelineZoom, clampPps, computeTickInterval, handleTimelineWheel, zoomIn as tzZoomIn, zoomOut as tzZoomOut, reCenter as tzReCenter, popFromUndoStack } from '$lib/timeline.js';
 	import { splitClipRegion, removeClipRegionAction } from '$lib/clipActions.js';
 	import { TRACK_COLORS as COLORS } from '$lib/constants.js';
 	import { getChatHeatmap } from '$lib/streams.remote';
@@ -225,7 +225,18 @@
 	let heatmapFetchedIds = new Set<string>();
 
 	$effect(() => {
-		const allStreamIds = tracksData.flatMap((t) => t.bars.map((b) => b.streamId));
+		const allStreamIds = new Set(tracksData.flatMap((t) => t.bars.map((b) => b.streamId)));
+
+		// Clean up stale entries for removed streams
+		for (const sid of heatmapFetchedIds) {
+			if (!allStreamIds.has(sid)) {
+				heatmapFetchedIds.delete(sid);
+				const { [sid]: _, ...rest } = chatHeatmapRaw;
+				chatHeatmapRaw = rest;
+			}
+		}
+
+		// Fetch heatmap for new streams
 		for (const sid of allStreamIds) {
 			if (heatmapFetchedIds.has(sid)) continue;
 			heatmapFetchedIds.add(sid);
@@ -355,13 +366,7 @@
 	let playheadX = $derived((masterCurrentTime - effectiveTimelineStart) * pixelsPerSecond);
 
 	// Ruler tick interval: choose so ticks are ~60-150px apart
-	let tickInterval = $derived.by(() => {
-		const candidates = [0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600, 7200, 14400, 28800, 43200, 86400];
-		for (const c of candidates) {
-			if (c * pixelsPerSecond >= 60) return c;
-		}
-		return 86400;
-	});
+	let tickInterval = $derived(computeTickInterval(pixelsPerSecond, 60));
 
 	let ticks = $derived.by(() => {
 		const result: { x: number; label: string }[] = [];
@@ -417,29 +422,16 @@
 
 	function reCenter() {
 		autoScroll = true;
-		if (scrollAreaEl) {
-			ignoreScrollEvents = true;
-			scrollAreaEl.scrollLeft = playheadX - scrollAreaEl.clientWidth / 2;
-		}
+		tzReCenter(scrollAreaEl, playheadX, () => { ignoreScrollEvents = true; });
 	}
 
 	// --- Zoom (Ctrl+Wheel) / Pan (bare scroll) ---
 	function handleWheel(e: WheelEvent) {
-		if (e.ctrlKey) {
-			e.preventDefault();
-			if (!scrollAreaEl) return;
-			const { newPps, scheduleScrollRestore } = applyTimelineZoom(
-				e, scrollAreaEl, pixelsPerSecond, effectiveTimelineStart, MIN_PPS, MAX_PPS
-			);
-			pixelsPerSecond = newPps;
-			scheduleScrollRestore(() => { ignoreScrollEvents = true; });
-		} else if (e.shiftKey) {
-			// Shift+wheel → horizontal pan
-			e.preventDefault();
-			if (!scrollAreaEl) return;
-			scrollAreaEl.scrollLeft += e.deltaY !== 0 ? e.deltaY : e.deltaX;
-		}
-		// Bare wheel: native vertical scroll (don't prevent default)
+		const newPps = handleTimelineWheel(
+			e, scrollAreaEl, pixelsPerSecond, effectiveTimelineStart,
+			MIN_PPS, MAX_PPS, () => { ignoreScrollEvents = true; }
+		);
+		if (newPps !== null) pixelsPerSecond = newPps;
 	}
 
 	// --- Click-to-seek on background ---
@@ -768,11 +760,11 @@
 	}
 
 	function zoomIn() {
-		pixelsPerSecond = clampPps(pixelsPerSecond * 1.5, MIN_PPS, MAX_PPS);
+		pixelsPerSecond = tzZoomIn(pixelsPerSecond, MIN_PPS, MAX_PPS);
 	}
 
 	function zoomOut() {
-		pixelsPerSecond = clampPps(pixelsPerSecond / 1.5, MIN_PPS, MAX_PPS);
+		pixelsPerSecond = tzZoomOut(pixelsPerSecond, MIN_PPS, MAX_PPS);
 	}
 
 	// Wheel listener — needs non-passive, reacts to scrollAreaEl availability

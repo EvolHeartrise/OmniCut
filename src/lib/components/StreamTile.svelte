@@ -1,6 +1,19 @@
 <script module lang="ts">
-	// Persists volume state across mount/unmount cycles per stream
+	// Persists volume state across mount/unmount cycles per stream.
+	// Bounded: evicts oldest entries when the map exceeds MAX_VOLUME_STATES to prevent unbounded growth.
+	const MAX_VOLUME_STATES = 100;
 	const volumeStates = new Map<string, { volume: number; muted: boolean }>();
+
+	function setVolumeState(id: string, state: { volume: number; muted: boolean }) {
+		// Delete first to reset insertion order (Map preserves insertion order)
+		volumeStates.delete(id);
+		volumeStates.set(id, state);
+		// Evict oldest if over limit
+		if (volumeStates.size > MAX_VOLUME_STATES) {
+			const first = volumeStates.keys().next().value;
+			if (first !== undefined) volumeStates.delete(first);
+		}
+	}
 </script>
 
 <script lang="ts">
@@ -106,7 +119,7 @@
 	}
 
 	function saveVolumeState() {
-		volumeStates.set(stream.id, { volume, muted });
+		setVolumeState(stream.id, { volume, muted });
 	}
 
 	function toggleMute() {

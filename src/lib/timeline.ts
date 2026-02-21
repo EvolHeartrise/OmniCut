@@ -37,3 +37,85 @@ export function applyTimelineZoom(
 export function clampPps(pps: number, min: number, max: number): number {
 	return Math.min(max, Math.max(min, pps));
 }
+
+// --- Shared timeline utilities ---
+
+/**
+ * Tick interval candidates for time rulers. Returns the smallest interval
+ * that keeps ticks at least `minPixelGap` pixels apart at the given pps.
+ */
+const TICK_CANDIDATES = [0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600, 7200, 14400, 28800, 43200, 86400];
+
+export function computeTickInterval(pixelsPerSecond: number, minPixelGap: number = 60): number {
+	for (const c of TICK_CANDIDATES) {
+		if (c * pixelsPerSecond >= minPixelGap) return c;
+	}
+	return 86400;
+}
+
+/**
+ * Handle Ctrl+Wheel zoom and Shift+Wheel horizontal pan on a scrollable timeline.
+ * Returns the new pixelsPerSecond if a zoom occurred, or null if the event was a pan/noop.
+ */
+export function handleTimelineWheel(
+	e: WheelEvent,
+	scrollAreaEl: HTMLDivElement | null,
+	pixelsPerSecond: number,
+	timelineStart: number,
+	minPps: number,
+	maxPps: number,
+	setIgnoreScroll: () => void
+): number | null {
+	if (e.ctrlKey) {
+		e.preventDefault();
+		if (!scrollAreaEl) return null;
+		const { newPps, scheduleScrollRestore } = applyTimelineZoom(
+			e, scrollAreaEl, pixelsPerSecond, timelineStart, minPps, maxPps
+		);
+		scheduleScrollRestore(setIgnoreScroll);
+		return newPps;
+	} else if (e.shiftKey) {
+		e.preventDefault();
+		if (!scrollAreaEl) return null;
+		scrollAreaEl.scrollLeft += e.deltaY !== 0 ? e.deltaY : e.deltaX;
+	}
+	return null;
+}
+
+/**
+ * Zoom in/out by a 1.5x factor, clamped to min/max.
+ */
+export function zoomIn(pixelsPerSecond: number, minPps: number, maxPps: number): number {
+	return clampPps(pixelsPerSecond * 1.5, minPps, maxPps);
+}
+
+export function zoomOut(pixelsPerSecond: number, minPps: number, maxPps: number): number {
+	return clampPps(pixelsPerSecond / 1.5, minPps, maxPps);
+}
+
+/**
+ * Re-center the scroll area so the playhead is in the middle.
+ */
+export function reCenter(
+	scrollAreaEl: HTMLDivElement | null,
+	playheadX: number,
+	setIgnoreScroll: () => void
+): void {
+	if (scrollAreaEl) {
+		setIgnoreScroll();
+		scrollAreaEl.scrollLeft = playheadX - scrollAreaEl.clientWidth / 2;
+	}
+}
+
+/**
+ * Simple undo stack operations.
+ */
+export function pushToUndoStack<T>(stack: T[], entry: T): T[] {
+	return [...stack, entry];
+}
+
+export function popFromUndoStack<T>(stack: T[]): { entry: T; stack: T[] } | null {
+	if (stack.length === 0) return null;
+	const entry = stack[stack.length - 1];
+	return { entry, stack: stack.slice(0, -1) };
+}

@@ -9,7 +9,7 @@
 		type ClipRegion
 	} from '$lib/stores/streams.js';
 	import { formatDuration, createHlsConfig } from '$lib/utils.js';
-	import { applyTimelineZoom, clampPps } from '$lib/timeline.js';
+	import { handleTimelineWheel, zoomIn as tzZoomIn, zoomOut as tzZoomOut, reCenter as tzReCenter } from '$lib/timeline.js';
 	import { splitClipRegion, removeClipRegionAction } from '$lib/clipActions.js';
 
 	interface ClipSegment {
@@ -336,19 +336,11 @@
 	}
 
 	function handleWheel(e: WheelEvent) {
-		if (e.ctrlKey) {
-			e.preventDefault();
-			if (!scrollAreaEl) return;
-			const { newPps, scheduleScrollRestore } = applyTimelineZoom(
-				e, scrollAreaEl, pixelsPerSecond, 0, MIN_PPS, MAX_PPS
-			);
-			pixelsPerSecond = newPps;
-			scheduleScrollRestore(() => { ignoreScrollEvents = true; });
-		} else if (e.shiftKey) {
-			e.preventDefault();
-			if (!scrollAreaEl) return;
-			scrollAreaEl.scrollLeft += e.deltaY !== 0 ? e.deltaY : e.deltaX;
-		}
+		const newPps = handleTimelineWheel(
+			e, scrollAreaEl, pixelsPerSecond, 0,
+			MIN_PPS, MAX_PPS, () => { ignoreScrollEvents = true; }
+		);
+		if (newPps !== null) pixelsPerSecond = newPps;
 	}
 
 	// Undo stack
@@ -421,19 +413,16 @@
 	}
 
 	function zoomIn() {
-		pixelsPerSecond = clampPps(pixelsPerSecond * 1.5, MIN_PPS, MAX_PPS);
+		pixelsPerSecond = tzZoomIn(pixelsPerSecond, MIN_PPS, MAX_PPS);
 	}
 
 	function zoomOut() {
-		pixelsPerSecond = clampPps(pixelsPerSecond / 1.5, MIN_PPS, MAX_PPS);
+		pixelsPerSecond = tzZoomOut(pixelsPerSecond, MIN_PPS, MAX_PPS);
 	}
 
 	function reCenter() {
 		autoScroll = true;
-		if (scrollAreaEl) {
-			ignoreScrollEvents = true;
-			scrollAreaEl.scrollLeft = playheadX - scrollAreaEl.clientWidth / 2;
-		}
+		tzReCenter(scrollAreaEl, playheadX, () => { ignoreScrollEvents = true; });
 	}
 
 	// Keyboard shortcuts for cleaning mode

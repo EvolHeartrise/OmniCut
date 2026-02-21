@@ -8,6 +8,8 @@ const LIVE_POOL_SIZE = 2; // number of concurrent live transcription workers
 const VOD_POOL_SIZE = 1; // number of concurrent VOD transcription workers
 const MAX_RESPAWN_ATTEMPTS = 3; // max consecutive respawn attempts per worker slot
 const RESPAWN_BACKOFF_MS = 5000; // delay between respawn attempts
+const QUEUE_ITEM_TIMEOUT_MS = 120_000; // 2 minutes max wait per transcription request
+const POOL_READY_TIMEOUT_MS = 60_000; // 1 minute max wait for pool readiness
 
 // --- Worker pool ---
 
@@ -220,10 +222,26 @@ function removeWorker(pool: Pool, worker: PoolWorker) {
 	workerResolvers.delete(worker);
 	const idx = pool.workers.indexOf(worker);
 	if (idx !== -1) pool.workers.splice(idx, 1);
+
+	// If the pool is now empty and failed, drain and reject all pending queue items
+	if (pool.workers.length === 0 && pool.failed) {
+		drainQueue(pool);
+	}
+}
+
+/** Reject all pending items in the queue (e.g., when pool has failed permanently). */
+function drainQueue(pool: Pool) {
+	while (pool.queue.length > 0) {
+		const item = pool.queue.shift()!;
+		item.reject(new Error(`Transcription pool '${pool.label}' has failed — no workers available`));
+	}
 }
 
 function ensurePool(pool: Pool): boolean {
-	if (pool.failed) return false;
+	if (pool.failed) {
+		drainQueue(pool);
+		return false;
+	}
 	if (pool.readyCount > 0) return true;
 	if (pool.initStarted) return false; // still starting up
 
@@ -233,6 +251,7 @@ function ensurePool(pool: Pool): boolean {
 	if (!fs.existsSync(scriptPath)) {
 		console.warn(`[transcriber:${pool.label}] scripts/transcribe_worker.py not found, transcription disabled`);
 		pool.failed = true;
+		drainQueue(pool);
 		return false;
 	}
 
@@ -246,6 +265,7 @@ function ensurePool(pool: Pool): boolean {
 
 	if (pool.workers.length === 0) {
 		pool.failed = true;
+		drainQueue(pool);
 		return false;
 	}
 
@@ -279,7 +299,32 @@ function transcribeAudio(pool: Pool, wavPath: string, language: string | null): 
 			resolve([]);
 			return;
 		}
-		pool.queue.push({ wavPath, language, task, resolve, reject });
+
+		// Timeout: reject if the request sits in the queue or is processing too long
+		let settled = false;
+		const timer = setTimeout(() => {
+			if (settled) return;
+			settled = true;
+			// Remove from queue if still pending
+			const idx = pool.queue.findIndex((q) => q.resolve === wrappedResolve);
+			if (idx !== -1) pool.queue.splice(idx, 1);
+			reject(new Error(`Transcription timed out after ${QUEUE_ITEM_TIMEOUT_MS / 1000}s`));
+		}, QUEUE_ITEM_TIMEOUT_MS);
+
+		const wrappedResolve = (sentences: Sentence[]) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			resolve(sentences);
+		};
+		const wrappedReject = (err: Error) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			reject(err);
+		};
+
+		pool.queue.push({ wavPath, language, task, resolve: wrappedResolve, reject: wrappedReject });
 		processQueue(pool);
 	});
 }
@@ -513,9 +558,14 @@ async function doFullTranscription(job: VodJob): Promise<void> {
 
 	console.log(`[transcriber:vod] Starting full transcription for stream ${streamId} (${segFiles.length} segments)`);
 
-	// Ensure VOD worker pool is started; wait until at least one worker is ready
+	// Ensure VOD worker pool is started; wait until at least one worker is ready (with timeout)
 	ensurePool(vodPool);
+	const poolWaitStart = Date.now();
 	while (vodPool.readyCount === 0 && !vodPool.failed) {
+		if (Date.now() - poolWaitStart > POOL_READY_TIMEOUT_MS) {
+			console.error(`[transcriber:vod] Pool not ready after ${POOL_READY_TIMEOUT_MS / 1000}s, giving up on stream ${streamId}`);
+			return;
+		}
 		await new Promise((r) => setTimeout(r, 500));
 		ensurePool(vodPool);
 	}

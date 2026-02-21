@@ -6,25 +6,34 @@ import { startTranscription, stopTranscription, transcribeFullRecording, shutdow
 import { startChatCollection } from './chatCollector.js';
 import { startVodChatFetch, extractVideoId } from './vodChatFetcher.js';
 import { exportVideo as exportVideoImpl } from './exporter.js';
-import type { StreamInfo, ClipRegion, ChatMessage } from './types.js';
+import type { StreamInfo, ChatMessage } from './types.js';
 import * as db from './persistence.js';
+import {
+	addSSEClient as sseAddClient,
+	broadcastUpdate,
+	broadcastTranscription,
+	persistChatMessage,
+	broadcastExportProgress,
+	broadcastTranscriptionCleared,
+	serializeStreamInfo,
+	initCounts,
+	deleteCounts,
+	resetTranscriptionCount,
+	broadcast
+} from './sseBroadcaster.js';
+import {
+	restoreClipRegions,
+	addClipRegion,
+	removeClipRegion,
+	getAllClipRegions,
+	removeClipRegionsForStream,
+	getClipRegionCount
+} from './clipManager.js';
 
 const RECORDINGS_DIR = path.resolve(process.env.RECORDINGS_DIR || path.join(process.cwd(), 'recordings'));
 
 // In-memory store of active captures (hot cache; persisted to SQLite on changes)
 const captures = new Map<string, CaptureHandle>();
-
-// In-memory store of clip regions keyed by ID (hot cache; persisted to SQLite)
-const clipRegionsStore = new Map<string, ClipRegion>();
-
-// In-memory cache of chat message counts per stream (avoids COUNT(*) on every broadcast)
-const chatMessageCounts = new Map<string, number>();
-
-// In-memory cache of transcription counts per stream
-const transcriptionCounts = new Map<string, number>();
-
-// SSE clients for real-time updates
-const sseClients = new Set<(data: string) => void>();
 
 // --- Initialization: restore state from SQLite ---
 
@@ -57,86 +66,20 @@ export async function initStreamManager(): Promise<void> {
 		captures.set(info.id, stubHandle);
 	}
 
-	// Restore clip regions
-	const savedClips = db.loadAllClipRegions();
-	for (const region of savedClips) {
-		if (captures.has(region.streamId)) {
-			clipRegionsStore.set(region.id, region);
-		}
-	}
+	// Restore clip regions (filter to known stream IDs)
+	restoreClipRegions(new Set(captures.keys()));
 
 	// Initialize chat message counts and transcription counts
 	for (const [, handle] of captures) {
-		chatMessageCounts.set(handle.info.id, db.countChatMessages(handle.info.id));
-		transcriptionCounts.set(handle.info.id, db.countTranscriptions(handle.info.id));
+		initCounts(handle.info.id);
 	}
 
 	const streamCount = captures.size;
-	console.log(`[init] Restored ${streamCount} streams, ${clipRegionsStore.size} clip regions`);
+	console.log(`[init] Restored ${streamCount} streams, ${getClipRegionCount()} clip regions`);
 }
 
-// --- Broadcasting ---
-
-function broadcast(data: string) {
-	for (const send of sseClients) {
-		try {
-			send(data);
-		} catch {
-			sseClients.delete(send);
-		}
-	}
-}
-
-function broadcastUpdate(info: StreamInfo) {
-	broadcast(JSON.stringify({ type: 'stream-update', stream: serializeStreamInfo(info) }));
-}
-
-function broadcastTranscription(streamId: string, text: string, startTime: number, endTime: number) {
-	db.saveTranscription(streamId, text, startTime, endTime);
-	transcriptionCounts.set(streamId, (transcriptionCounts.get(streamId) ?? 0) + 1);
-	broadcast(JSON.stringify({ type: 'transcription', streamId, text, startTime, endTime }));
-}
-
-function persistChatMessage(streamId: string, msg: ChatMessage) {
-	try {
-		db.saveChatMessage(streamId, msg);
-		chatMessageCounts.set(streamId, (chatMessageCounts.get(streamId) ?? 0) + 1);
-	} catch (err) {
-		console.error(`[chat] Failed to save message for stream ${streamId}:`, err);
-	}
-}
-
-function broadcastExportProgress(message: string, step: number, totalSteps: number) {
-	broadcast(JSON.stringify({ type: 'export-progress', message, step, totalSteps }));
-}
-
-export function addSSEClient(send: (data: string) => void): () => void {
-	sseClients.add(send);
-	return () => sseClients.delete(send);
-}
-
-function serializeStreamInfo(info: StreamInfo) {
-	return {
-		id: info.id,
-		channel: info.channel,
-		status: info.status,
-		startedAt: info.startedAt,
-		error: info.error,
-		segmentCount: info.segmentCount,
-		diskUsageBytes: info.diskUsageBytes,
-		viewerCount: info.viewerCount,
-		streamTitle: info.streamTitle,
-		gameName: info.gameName,
-		offset: info.offset,
-		sourceType: info.sourceType,
-		parentStreamId: info.parentStreamId,
-		platform: info.platform,
-		sourceUrl: info.sourceUrl,
-		chatMessageCount: chatMessageCounts.get(info.id) ?? 0,
-		transcriptionCount: transcriptionCounts.get(info.id) ?? 0,
-		chatComplete: info.chatComplete
-	};
-}
+// Re-export SSE client management
+export const addSSEClient = sseAddClient;
 
 // --- Duplicate capture guards ---
 
@@ -328,7 +271,9 @@ export async function addVodByUrl(vodUrl: string, language?: string | null): Pro
 				vodHandle.transcriptionStarted = true;
 				transcribeFullRecording(id, info.recordingDir, (_streamId, text, startTime, endTime) => {
 					broadcastTranscription(id, text, startTime, endTime);
-				}, transcriptionLanguage);
+				}, transcriptionLanguage).catch((err) => {
+					console.error(`[vod:douyu:${channel}] Full transcription failed:`, err);
+				});
 			}
 		}, vodUrl, 'douyu');
 
@@ -382,7 +327,9 @@ export async function addVodByUrl(vodUrl: string, language?: string | null): Pro
 			vodHandle.transcriptionStarted = true;
 			transcribeFullRecording(id, info.recordingDir, (_streamId, text, startTime, endTime) => {
 				broadcastTranscription(id, text, startTime, endTime);
-			}, transcriptionLanguage);
+			}, transcriptionLanguage).catch((err) => {
+				console.error(`[vod:${channel}] Full transcription failed:`, err);
+			});
 		}
 	}, fullVodUrl, 'twitch');
 
@@ -480,7 +427,9 @@ export function resumeVodStream(id: string): boolean {
 			newHandle.transcriptionStarted = true;
 			transcribeFullRecording(id, info.recordingDir, (_streamId, text, startTime, endTime) => {
 				broadcastTranscription(id, text, startTime, endTime);
-			}, language);
+			}, language).catch((err) => {
+				console.error(`[vod:${channel}] Full transcription failed on resume:`, err);
+			});
 		}
 	}, sourceUrl, 'twitch', hlsStartOffset);
 
@@ -540,16 +489,18 @@ export function retranscribeStream(id: string): boolean {
 
 	// Clear existing transcriptions
 	db.deleteTranscriptions(id);
-	transcriptionCounts.set(id, 0);
-	broadcast(JSON.stringify({ type: 'transcription-cleared', streamId: id }));
+	resetTranscriptionCount(id);
+	broadcastTranscriptionCleared(id);
 
 	// Resolve language
 	const language = db.getChannelSettings(handle.info.channel)?.language ?? null;
 
-	// Fire-and-forget full transcription
+	// Full transcription with error logging
 	transcribeFullRecording(id, handle.info.recordingDir, (_streamId, text, startTime, endTime) => {
 		broadcastTranscription(id, text, startTime, endTime);
-	}, language);
+	}, language).catch((err) => {
+		console.error(`[retranscribe:${handle.info.channel}] Full transcription failed:`, err);
+	});
 
 	return true;
 }
@@ -568,23 +519,17 @@ export function removeStream(id: string): boolean {
 	captures.delete(id);
 
 	// Remove from in-memory caches
-	for (const [clipId, region] of clipRegionsStore) {
-		if (region.streamId === id) {
-			clipRegionsStore.delete(clipId);
-		}
-	}
-
-	chatMessageCounts.delete(id);
-	transcriptionCounts.delete(id);
+	removeClipRegionsForStream(id);
+	deleteCounts(id);
 
 	// Remove from SQLite (cascades to transcriptions, chat, clips)
 	db.deleteStream(id);
 
-	// Delete recording files from disk
+	// Delete recording files from disk (async with error logging)
 	const recordingDir = handle.info.recordingDir;
 	if (recordingDir && fs.existsSync(recordingDir)) {
-		fs.rm(recordingDir, { recursive: true, force: true }, (err) => {
-			if (err) console.error(`Failed to delete recording dir ${recordingDir}:`, err);
+		fs.promises.rm(recordingDir, { recursive: true, force: true }).catch((err) => {
+			console.error(`[removeStream] Failed to delete recording dir ${recordingDir}:`, err);
 		});
 	}
 
@@ -625,40 +570,8 @@ export function updateStreamOffset(id: string, offset: number): boolean {
 	return true;
 }
 
-// --- Clip regions ---
-
-/**
- * Add or update a clip region (upsert by ID).
- * Validates that startTime < endTime.
- */
-export function addClipRegion(region: ClipRegion): void {
-	if (region.startTime >= region.endTime) {
-		throw new Error(`Invalid clip region: startTime (${region.startTime}) must be less than endTime (${region.endTime})`);
-	}
-	clipRegionsStore.set(region.id, region);
-
-	// Persist to SQLite
-	db.saveClipRegion(region);
-}
-
-/**
- * Remove a clip region by ID.
- */
-export function removeClipRegion(id: string): boolean {
-	if (!clipRegionsStore.delete(id)) return false;
-
-	// Remove from SQLite
-	db.deleteClipRegion(id);
-
-	return true;
-}
-
-/**
- * Get all clip regions.
- */
-export function getAllClipRegions(): ClipRegion[] {
-	return Array.from(clipRegionsStore.values());
-}
+// --- Clip regions (delegated to clipManager.ts) ---
+export { addClipRegion, removeClipRegion, getAllClipRegions } from './clipManager.js';
 
 export function getTranscriptionsInRange(id: string, fromTime: number, toTime: number): Array<{ id: number; text: string; startTime: number; endTime: number }> {
 	return db.loadTranscriptionsInRange(id, fromTime, toTime);
@@ -700,7 +613,7 @@ export function getStreamRecordingDir(id: string): string | null {
  */
 export async function exportVideo(filename: string): Promise<{ outputPath: string }> {
 	return exportVideoImpl(
-		Array.from(clipRegionsStore.values()),
+		getAllClipRegions(),
 		filename,
 		(streamId) => {
 			const handle = captures.get(streamId);
