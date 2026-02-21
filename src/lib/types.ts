@@ -1,9 +1,10 @@
-/** Clip region marked by the user on the timeline. */
+/** Clip region marked on the timeline. */
 export interface ClipRegion {
 	id: string;
 	streamId: string;
 	startTime: number; // master time (epoch seconds)
 	endTime: number;   // master time (epoch seconds)
+	createdBy?: 'human' | 'ai'; // who created this clip (default: human)
 }
 
 /** VOD info returned by the channel vods API. */

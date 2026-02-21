@@ -153,6 +153,13 @@ export async function initDatabase(): Promise<void> {
 		// Index already exists — ignore
 	}
 
+	// Migration: add created_by column to clip_regions for AI/human attribution
+	try {
+		db.exec("ALTER TABLE clip_regions ADD COLUMN created_by TEXT DEFAULT 'human'");
+	} catch {
+		// Column already exists — ignore
+	}
+
 	// Prepare hot-path statements for better performance
 	stmtSaveChatMessage = db.prepare(
 		'INSERT OR IGNORE INTO chat_messages (stream_id, username, text, timestamp, color) VALUES (?, ?, ?, ?, ?)'
@@ -206,6 +213,7 @@ interface ClipRow {
 	stream_id: string;
 	start_time: number;
 	end_time: number;
+	created_by: string | null;
 }
 
 interface HeatmapRow {
@@ -400,9 +408,9 @@ export function loadChatHeatmap(streamId: string, bucketSeconds: number): Array<
 export function saveClipRegion(region: ClipRegion): void {
 	const d = getDb();
 	d.run(
-		`INSERT INTO clip_regions (id, stream_id, start_time, end_time) VALUES (?, ?, ?, ?)
+		`INSERT INTO clip_regions (id, stream_id, start_time, end_time, created_by) VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET start_time = excluded.start_time, end_time = excluded.end_time`,
-		[region.id, region.streamId, region.startTime, region.endTime]
+		[region.id, region.streamId, region.startTime, region.endTime, region.createdBy ?? 'human']
 	);
 }
 
@@ -413,12 +421,13 @@ export function deleteClipRegion(id: string): void {
 
 export function loadAllClipRegions(): ClipRegion[] {
 	const d = getDb();
-	const rows = d.query('SELECT id, stream_id, start_time, end_time FROM clip_regions').all() as ClipRow[];
+	const rows = d.query('SELECT id, stream_id, start_time, end_time, created_by FROM clip_regions').all() as ClipRow[];
 	return rows.map((r) => ({
 		id: r.id,
 		streamId: r.stream_id,
 		startTime: r.start_time,
-		endTime: r.end_time
+		endTime: r.end_time,
+		createdBy: (r.created_by as 'human' | 'ai') ?? 'human'
 	}));
 }
 

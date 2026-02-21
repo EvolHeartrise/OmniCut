@@ -387,7 +387,7 @@ mcpServer.tool(
 		}
 
 		try {
-			addClipRegion({ id, streamId, startTime, endTime });
+			addClipRegion({ id, streamId, startTime, endTime, createdBy: 'ai' });
 			return {
 				content: [
 					{
@@ -395,7 +395,7 @@ mcpServer.tool(
 						text: JSON.stringify(
 							{
 								success: true,
-								clip: { id, streamId, startTime, endTime },
+								clip: { id, streamId, startTime, endTime, createdBy: 'ai' },
 								message: `Clip created: ${endTime - startTime}s region on stream "${stream.channel}".`
 							},
 							null,
