@@ -691,6 +691,7 @@
 		width: 72px;
 		outline: none;
 		-moz-appearance: textfield;
+		appearance: textfield;
 	}
 
 	.viewer-input::-webkit-outer-spin-button,

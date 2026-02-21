@@ -6,7 +6,7 @@
 	let filename = $state('export');
 	let exporting = $state(false);
 	let result = $state<{ success: boolean; message: string } | null>(null);
-	let logEl: HTMLDivElement;
+	let logEl = $state<HTMLDivElement | null>(null);
 
 	let sortedClips = $derived(
 		[...$clipRegions].sort((a, b) => a.startTime - b.startTime)

@@ -31,7 +31,7 @@
 	let currentTime = $state(0);
 	let duration = $state(0);
 	let retryTimeout: ReturnType<typeof setTimeout> | null = null;
-	const initVol = volumeStates.get(stream.id);
+	const initVol = untrack(() => volumeStates.get(stream.id));
 	let volume = $state(initVol?.volume ?? 1);
 	let muted = $state(initVol?.muted ?? true);
 	let lastMasterSeq = 0;
