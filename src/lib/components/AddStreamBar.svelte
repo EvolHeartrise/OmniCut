@@ -2,7 +2,7 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { addStream, streams } from '$lib/stores/streams.js';
 	import type { ChannelInfo, VodInfo } from '$lib/types.js';
-	import { formatUptime, formatViewers } from '$lib/utils.js';
+	import { formatUptime, formatViewers, formatVodDuration } from '$lib/utils.js';
 	import {
 		getWatchlist,
 		addToWatchlistCmd,
@@ -313,13 +313,6 @@
 		}
 	}
 
-	function formatDuration(seconds: number | null): string {
-		if (seconds == null) return '';
-		const h = Math.floor(seconds / 3600);
-		const m = Math.floor((seconds % 3600) / 60);
-		if (h > 0) return `${h}h ${m}m`;
-		return `${m}m`;
-	}
 
 	function formatDate(iso: string | null): string {
 		if (!iso) return '';
@@ -555,7 +548,7 @@
 										<span class="vod-title" title={vod.title || ''}>{vod.title || 'Untitled'}</span>
 										<span class="vod-meta">
 											{formatDate(vod.createdAt)}
-											{#if vod.durationSeconds}&nbsp;&middot; {formatDuration(vod.durationSeconds)}{/if}
+											{#if vod.durationSeconds}&nbsp;&middot; {formatVodDuration(vod.durationSeconds)}{/if}
 											{#if vod.viewCount != null}&nbsp;&middot; {formatVodViews(vod.viewCount)} views{/if}
 										</span>
 									</div>

@@ -13,6 +13,7 @@ import {
 	broadcastUpdate,
 	broadcastTranscription,
 	persistChatMessage,
+	persistChatMessagesBatch,
 	broadcastExportProgress,
 	broadcastTranscriptionCleared,
 	serializeStreamInfo,
@@ -200,6 +201,8 @@ export async function addVodStream(channel: string, language?: string | null): P
 							db.saveStream(vodHandle.info);
 							broadcastUpdate(vodHandle.info);
 						}
+					}, (_sid, msgs) => {
+						persistChatMessagesBatch(vodId, msgs);
 					});
 				}
 			}
@@ -272,7 +275,7 @@ export async function addVodByUrl(vodUrl: string, language?: string | null): Pro
 				transcribeFullRecording(id, info.recordingDir, (_streamId, text, startTime, endTime) => {
 					broadcastTranscription(id, text, startTime, endTime);
 				}, transcriptionLanguage).catch((err) => {
-					console.error(`[vod:douyu:${channel}] Full transcription failed:`, err);
+					console.error(`[vod:douyu:${roomId}] Full transcription failed:`, err);
 				});
 			}
 		}, vodUrl, 'douyu');
@@ -318,6 +321,8 @@ export async function addVodByUrl(vodUrl: string, language?: string | null): Pro
 						db.saveStream(vodHandle.info);
 						broadcastUpdate(vodHandle.info);
 					}
+				}, (_sid, msgs) => {
+					persistChatMessagesBatch(id, msgs);
 				});
 			}
 		}
@@ -472,6 +477,8 @@ export function refetchVodChat(id: string): boolean {
 			db.saveStream(handle.info);
 			broadcastUpdate(handle.info);
 		}
+	}, (_sid, msgs) => {
+		persistChatMessagesBatch(id, msgs);
 	});
 
 	console.log(`[vod-chat:${handle.info.channel}] Refetching chat for video ${videoId}`);

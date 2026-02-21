@@ -1,9 +1,12 @@
 import { TWITCH_CLIENT_ID } from './twitchApi.js';
-import type { ChatCallback } from './types.js';
+import type { ChatMessage, ChatCallback } from './types.js';
 
 const PAGE_DELAY_MS = 150;
 const MAX_RETRIES = 5;
 const INITIAL_BACKOFF_MS = 1000;
+const BATCH_FLUSH_SIZE = 500;
+
+export type BatchChatCallback = (streamId: string, messages: ChatMessage[]) => void;
 
 const VOD_COMMENTS_QUERY = `query($videoID: ID!, $cursor: Cursor) {
   video(id: $videoID) {
@@ -36,6 +39,7 @@ interface QueueEntry {
 	streamId: string;
 	videoId: string;
 	onMessage: ChatCallback;
+	onBatch?: BatchChatCallback;
 	onComplete?: (success: boolean) => void;
 	stopped: boolean;
 }
@@ -47,8 +51,22 @@ async function fetchAllPages(entry: QueueEntry) {
 	let cursor: string | undefined;
 	let totalMessages = 0;
 	let success = false;
+	const useBatch = !!entry.onBatch;
+	let batch: ChatMessage[] = [];
 
-	console.log(`[vod-chat:${entry.videoId}] Starting VOD chat download`);
+	function flushBatch() {
+		if (batch.length === 0) return;
+		if (useBatch) {
+			entry.onBatch!(entry.streamId, batch);
+		} else {
+			for (const msg of batch) {
+				entry.onMessage(entry.streamId, msg);
+			}
+		}
+		batch = [];
+	}
+
+	console.log(`[vod-chat:${entry.videoId}] Starting VOD chat download${useBatch ? ' (batched)' : ''}`);
 
 	try {
 		while (!entry.stopped) {
@@ -133,10 +151,15 @@ async function fetchAllPages(entry: QueueEntry) {
 				const timestamp: number = node.contentOffsetSeconds ?? 0;
 				const color: string | null = node.commenter?.chatColor ?? null;
 
-				entry.onMessage(entry.streamId, { username, text, timestamp, color });
+				batch.push({ username, text, timestamp, color });
 				totalMessages++;
 
 				cursor = edge.cursor;
+			}
+
+			// Flush batch when it reaches the threshold
+			if (batch.length >= BATCH_FLUSH_SIZE) {
+				flushBatch();
 			}
 
 			if (!comments.pageInfo?.hasNextPage) {
@@ -151,6 +174,9 @@ async function fetchAllPages(entry: QueueEntry) {
 			console.error(`[vod-chat:${entry.videoId}] Error fetching chat:`, err);
 		}
 	}
+
+	// Flush any remaining messages
+	flushBatch();
 
 	console.log(`[vod-chat:${entry.videoId}] Finished — ${totalMessages} messages downloaded (success=${success})`);
 	entry.onComplete?.(success);
@@ -187,9 +213,10 @@ export function startVodChatFetch(
 	streamId: string,
 	videoId: string,
 	onMessage: ChatCallback,
-	onComplete?: (success: boolean) => void
+	onComplete?: (success: boolean) => void,
+	onBatch?: BatchChatCallback
 ): () => void {
-	const entry: QueueEntry = { streamId, videoId, onMessage, onComplete, stopped: false };
+	const entry: QueueEntry = { streamId, videoId, onMessage, onBatch, onComplete, stopped: false };
 	chatQueue.push(entry);
 	processQueue();
 

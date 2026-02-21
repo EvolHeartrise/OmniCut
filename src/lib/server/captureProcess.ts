@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as crypto from 'node:crypto';
 import type { StreamInfo, CaptureHandle, StreamMeta } from './types.js';
-import { twitchGql, STREAM_META_GQL, VOD_META_GQL } from './twitchApi.js';
+import { twitchGql, STREAM_META_GQL, VOD_META_GQL, fetchDouyuChannel } from './twitchApi.js';
 
 export type { CaptureHandle };
 
@@ -84,23 +84,14 @@ export async function resolveDouyuStreamUrl(roomId: string): Promise<string> {
 }
 
 export async function fetchDouyuStreamMeta(roomId: string): Promise<StreamMeta> {
-	try {
-		const res = await fetch(`https://open.douyucdn.cn/api/RoomApi/room/${roomId}`);
-		const data = await res.json();
-		const room = data?.data;
-		if (!room) {
-			return { viewerCount: null, title: null, gameName: null, createdAt: null, vodId: null };
-		}
-		return {
-			viewerCount: room.online ?? null,
-			title: room.room_name ?? null,
-			gameName: room.cate_name ?? null,
-			createdAt: room.start_time ? new Date(room.start_time + '+08:00').toISOString() : null,
-			vodId: null
-		};
-	} catch {
-		return { viewerCount: null, title: null, gameName: null, createdAt: null, vodId: null };
-	}
+	const ch = await fetchDouyuChannel(roomId);
+	return {
+		viewerCount: ch.viewerCount,
+		title: ch.title,
+		gameName: ch.gameName,
+		createdAt: ch.startedAt,
+		vodId: null
+	};
 }
 
 export async function fetchStreamMeta(channel: string): Promise<StreamMeta> {
@@ -195,6 +186,7 @@ export function startCapture(
 	let cumulativeDiskUsage = 0;
 	const knownFiles = new Set<string>();
 	const segmentWatchInterval = setInterval(async () => {
+		if (info.status === 'stopped' || info.status === 'error') return;
 		try {
 			const allFiles = await fs.promises.readdir(recordingDir);
 			const tsFiles = allFiles.filter((f) => f.endsWith('.ts'));
@@ -250,10 +242,14 @@ export function startCapture(
 		});
 	}
 
-	const kill = () => {
-		info.status = 'stopped';
+	function clearPolling() {
 		if (segmentWatchInterval) clearInterval(segmentWatchInterval);
 		if (streamMetaInterval) clearInterval(streamMetaInterval);
+	}
+
+	const kill = () => {
+		info.status = 'stopped';
+		clearPolling();
 		try { sourceProc?.kill(); } catch { /* already dead */ }
 		try { ffmpegProc?.kill(); } catch { /* already dead */ }
 		onStatusChange(info);
@@ -304,13 +300,13 @@ export function startCapture(
 				ffmpegProc.exited.then((code) => {
 					console.log(`[ffmpeg:${channel}] exited with code ${code}`);
 					if (info.status !== 'stopped') {
+						clearPolling();
 						info.status = 'stopped';
 						onStatusChange(info);
 					}
 				});
 			} catch (err) {
-				clearInterval(segmentWatchInterval);
-				if (streamMetaInterval) clearInterval(streamMetaInterval);
+				clearPolling();
 				console.error(`[douyu:${channel}] Failed to resolve stream:`, err);
 				info.status = 'error';
 				info.error = err instanceof Error ? err.message : 'Failed to resolve Douyu stream';
@@ -360,6 +356,7 @@ export function startCapture(
 		sourceProc.exited.then((code) => {
 			console.log(`[streamlink:${channel}] exited with code ${code}`);
 			if (info.status !== 'stopped') {
+				clearPolling();
 				info.status = code === 0 ? 'stopped' : 'error';
 				info.error = code !== 0 ? `streamlink exited with code ${code}` : undefined;
 				onStatusChange(info);
@@ -369,6 +366,7 @@ export function startCapture(
 		ffmpegProc.exited.then((code) => {
 			console.log(`[ffmpeg:${channel}] exited with code ${code}`);
 			if (info.status !== 'stopped' && info.status !== 'error') {
+				clearPolling();
 				info.status = 'stopped';
 				onStatusChange(info);
 			}

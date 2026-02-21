@@ -15,7 +15,7 @@
 		seekRequest,
 		type ClipRegion
 	} from '$lib/stores/streams.js';
-	import { applyTimelineZoom, clampPps, computeTickInterval, handleTimelineWheel, zoomIn as tzZoomIn, zoomOut as tzZoomOut, reCenter as tzReCenter, popFromUndoStack } from '$lib/timeline.js';
+	import { applyTimelineZoom, clampPps, computeTickInterval, handleTimelineWheel, zoomIn as tzZoomIn, zoomOut as tzZoomOut, reCenter as tzReCenter } from '$lib/timeline.js';
 	import { splitClipRegion, removeClipRegionAction } from '$lib/clipActions.js';
 	import { TRACK_COLORS as COLORS } from '$lib/constants.js';
 	import { getChatHeatmap } from '$lib/streams.remote';
@@ -220,9 +220,19 @@
 
 	// Chat heatmap: fetch once per stream via remote query, store in $state
 	const CHAT_BUCKET_SECONDS = 30;
+	const HEATMAP_REFRESH_MS = 30_000; // re-fetch active stream heatmaps every 30s
 
 	let chatHeatmapRaw = $state<Record<string, { buckets: Array<{ time: number; count: number }>; max: number }>>({});
 	let heatmapFetchedIds = new Set<string>();
+	let heatmapRefreshTimer: ReturnType<typeof setInterval> | null = null;
+
+	function fetchHeatmapForStream(sid: string) {
+		getChatHeatmap({ streamId: sid, bucket: CHAT_BUCKET_SECONDS })
+			.then((data: { buckets: Array<{ time: number; count: number }>; max: number }) => {
+				chatHeatmapRaw = { ...chatHeatmapRaw, [sid]: data };
+			})
+			.catch(() => {});
+	}
 
 	$effect(() => {
 		const allStreamIds = new Set(tracksData.flatMap((t) => t.bars.map((b) => b.streamId)));
@@ -240,12 +250,23 @@
 		for (const sid of allStreamIds) {
 			if (heatmapFetchedIds.has(sid)) continue;
 			heatmapFetchedIds.add(sid);
-			getChatHeatmap({ streamId: sid, bucket: CHAT_BUCKET_SECONDS })
-				.then((data: { buckets: Array<{ time: number; count: number }>; max: number }) => {
-					chatHeatmapRaw = { ...chatHeatmapRaw, [sid]: data };
-				})
-				.catch(() => {});
+			fetchHeatmapForStream(sid);
 		}
+
+		// Set up periodic refresh for active (non-stopped) streams
+		if (heatmapRefreshTimer) clearInterval(heatmapRefreshTimer);
+		const activeIds = $streams
+			.filter((s) => s.status !== 'stopped' && allStreamIds.has(s.id))
+			.map((s) => s.id);
+		if (activeIds.length > 0) {
+			heatmapRefreshTimer = setInterval(() => {
+				for (const sid of activeIds) fetchHeatmapForStream(sid);
+			}, HEATMAP_REFRESH_MS);
+		}
+
+		return () => {
+			if (heatmapRefreshTimer) clearInterval(heatmapRefreshTimer);
+		};
 	});
 
 	// Canvas refs for chat heatmap — keyed by stream ID

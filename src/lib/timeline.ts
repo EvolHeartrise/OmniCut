@@ -107,15 +107,3 @@ export function reCenter(
 	}
 }
 
-/**
- * Simple undo stack operations.
- */
-export function pushToUndoStack<T>(stack: T[], entry: T): T[] {
-	return [...stack, entry];
-}
-
-export function popFromUndoStack<T>(stack: T[]): { entry: T; stack: T[] } | null {
-	if (stack.length === 0) return null;
-	const entry = stack[stack.length - 1];
-	return { entry, stack: stack.slice(0, -1) };
-}

@@ -64,6 +64,15 @@ export function formatViewers(count: number): string {
 	return String(count);
 }
 
+/** Format a total duration in seconds as "Xh Ym" or "Ym" (for VOD lengths). */
+export function formatVodDuration(seconds: number | null): string {
+	if (seconds == null) return '';
+	const h = Math.floor(seconds / 3600);
+	const m = Math.floor((seconds % 3600) / 60);
+	if (h > 0) return `${h}h ${m}m`;
+	return `${m}m`;
+}
+
 /** Format stream uptime from ISO start time. */
 export function formatUptime(startedAt: string, now: number): string {
 	const elapsed = now - new Date(startedAt).getTime();

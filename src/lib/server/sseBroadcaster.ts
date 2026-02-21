@@ -42,6 +42,7 @@ export function initCounts(streamId: string): void {
 export function deleteCounts(streamId: string): void {
 	chatMessageCounts.delete(streamId);
 	transcriptionCounts.delete(streamId);
+	lastBroadcast.delete(streamId);
 }
 
 export function getChatMessageCount(streamId: string): number {
@@ -81,8 +82,18 @@ export function serializeStreamInfo(info: StreamInfo) {
 	};
 }
 
+// Cache last broadcast payload per stream to skip no-op SSE pushes
+const lastBroadcast = new Map<string, string>();
+
 export function broadcastUpdate(info: StreamInfo) {
-	broadcast(JSON.stringify({ type: 'stream-update', stream: serializeStreamInfo(info) }));
+	const payload = JSON.stringify({ type: 'stream-update', stream: serializeStreamInfo(info) });
+	if (lastBroadcast.get(info.id) === payload) return;
+	lastBroadcast.set(info.id, payload);
+	broadcast(payload);
+}
+
+export function clearBroadcastCache(streamId: string) {
+	lastBroadcast.delete(streamId);
 }
 
 export function broadcastTranscription(streamId: string, text: string, startTime: number, endTime: number) {
@@ -97,6 +108,16 @@ export function persistChatMessage(streamId: string, msg: ChatMessage) {
 		chatMessageCounts.set(streamId, (chatMessageCounts.get(streamId) ?? 0) + 1);
 	} catch (err) {
 		console.error(`[chat] Failed to save message for stream ${streamId}:`, err);
+	}
+}
+
+export function persistChatMessagesBatch(streamId: string, messages: ChatMessage[]) {
+	if (messages.length === 0) return;
+	try {
+		db.saveChatMessagesBatch(streamId, messages);
+		chatMessageCounts.set(streamId, (chatMessageCounts.get(streamId) ?? 0) + messages.length);
+	} catch (err) {
+		console.error(`[chat] Failed to save ${messages.length} messages for stream ${streamId}:`, err);
 	}
 }
 

@@ -55,6 +55,7 @@ interface QueueItem {
 	wavPath: string;
 	language: string | null;
 	task: string;
+	beamSize: number;
 	resolve: (sentences: Sentence[]) => void;
 	reject: (err: Error) => void;
 }
@@ -282,7 +283,7 @@ function processQueue(pool: Pool) {
 	const req = pool.queue.shift()!;
 	worker.busy = true;
 	workerResolvers.set(worker, { resolve: req.resolve, reject: req.reject });
-	const payload: Record<string, unknown> = { wav_path: req.wavPath, task: req.task };
+	const payload: Record<string, unknown> = { wav_path: req.wavPath, task: req.task, beam_size: req.beamSize };
 	if (req.language) payload.language = req.language;
 	worker.proc.stdin.write(JSON.stringify(payload) + '\n');
 
@@ -292,7 +293,7 @@ function processQueue(pool: Pool) {
 	}
 }
 
-function transcribeAudio(pool: Pool, wavPath: string, language: string | null): Promise<Sentence[]> {
+function transcribeAudio(pool: Pool, wavPath: string, language: string | null, beamSize: number = 1): Promise<Sentence[]> {
 	const task = language && language !== 'en' ? 'translate' : 'transcribe';
 	return new Promise((resolve, reject) => {
 		if (!ensurePool(pool) && pool.workers.length === 0) {
@@ -324,7 +325,7 @@ function transcribeAudio(pool: Pool, wavPath: string, language: string | null): 
 			reject(err);
 		};
 
-		pool.queue.push({ wavPath, language, task, resolve: wrappedResolve, reject: wrappedReject });
+		pool.queue.push({ wavPath, language, task, beamSize, resolve: wrappedResolve, reject: wrappedReject });
 		processQueue(pool);
 	});
 }
@@ -578,7 +579,7 @@ async function doFullTranscription(job: VodJob): Promise<void> {
 	if (!wavPath) return;
 
 	try {
-		const raw = await transcribeAudio(vodPool, wavPath, language);
+		const raw = await transcribeAudio(vodPool, wavPath, language, 5);
 		const sentences = deduplicateSentences(raw);
 		const skipped = raw.length - sentences.length;
 		for (const s of sentences) {

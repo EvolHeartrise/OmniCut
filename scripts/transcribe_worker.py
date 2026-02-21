@@ -74,6 +74,7 @@ def main():
             wav_path = req["wav_path"]
             language = req.get("language")
             task = req.get("task", "transcribe")
+            beam_size = req.get("beam_size", 1)
         except (json.JSONDecodeError, KeyError):
             print(json.dumps({"sentences": [], "error": "invalid JSON input"}), flush=True)
             continue
@@ -86,7 +87,7 @@ def main():
                     model_multi = WhisperModel("small", device=device, compute_type=compute_type)
                 model = model_multi
             transcribe_kwargs = dict(
-                beam_size=1,
+                beam_size=beam_size,
                 word_timestamps=True,
                 vad_filter=True,
                 vad_parameters=dict(min_silence_duration_ms=500),
