@@ -14,6 +14,11 @@ const DB_PATH = path.join(DATA_DIR, 'omnicut.db');
 
 let db: Database | null = null;
 
+// Prepared statements for hot-path operations (initialized after DB open)
+type Statement = import('bun:sqlite').Statement;
+let stmtSaveChatMessage: Statement | null = null;
+let stmtSaveTranscription: Statement | null = null;
+
 /**
  * Initialize the SQLite database, creating tables if they don't exist.
  * Must be called once at server startup (when running under Bun).
@@ -147,6 +152,14 @@ export async function initDatabase(): Promise<void> {
 	} catch {
 		// Index already exists — ignore
 	}
+
+	// Prepare hot-path statements for better performance
+	stmtSaveChatMessage = db.prepare(
+		'INSERT OR IGNORE INTO chat_messages (stream_id, username, text, timestamp, color) VALUES (?, ?, ?, ?, ?)'
+	);
+	stmtSaveTranscription = db.prepare(
+		'INSERT INTO transcriptions (stream_id, text, start_time, end_time) VALUES (?, ?, ?, ?)'
+	);
 }
 
 // --- Row types for query results ---
@@ -291,11 +304,15 @@ export function updateStreamOffset(id: string, offset: number): void {
 // --- Transcriptions ---
 
 export function saveTranscription(streamId: string, text: string, startTime: number, endTime: number): void {
-	const d = getDb();
-	d.run(
-		'INSERT INTO transcriptions (stream_id, text, start_time, end_time) VALUES (?, ?, ?, ?)',
-		[streamId, text, startTime, endTime]
-	);
+	if (stmtSaveTranscription) {
+		stmtSaveTranscription.run(streamId, text, startTime, endTime);
+	} else {
+		const d = getDb();
+		d.run(
+			'INSERT INTO transcriptions (stream_id, text, start_time, end_time) VALUES (?, ?, ?, ?)',
+			[streamId, text, startTime, endTime]
+		);
+	}
 }
 
 export function loadTranscriptionsInRange(streamId: string, fromTime: number, toTime: number): Array<{ id: number; text: string; startTime: number; endTime: number }> {
@@ -320,11 +337,34 @@ export function deleteTranscriptions(streamId: string): void {
 // --- Chat Messages ---
 
 export function saveChatMessage(streamId: string, msg: ChatMessage): void {
+	if (stmtSaveChatMessage) {
+		stmtSaveChatMessage.run(streamId, msg.username, msg.text, msg.timestamp, msg.color ?? null);
+	} else {
+		const d = getDb();
+		d.run(
+			'INSERT OR IGNORE INTO chat_messages (stream_id, username, text, timestamp, color) VALUES (?, ?, ?, ?, ?)',
+			[streamId, msg.username, msg.text, msg.timestamp, msg.color ?? null]
+		);
+	}
+}
+
+/** Batch-insert chat messages inside a single transaction (much faster for VOD chat imports). */
+export function saveChatMessagesBatch(streamId: string, messages: ChatMessage[]): void {
+	if (messages.length === 0) return;
 	const d = getDb();
-	d.run(
-		'INSERT OR IGNORE INTO chat_messages (stream_id, username, text, timestamp, color) VALUES (?, ?, ?, ?, ?)',
-		[streamId, msg.username, msg.text, msg.timestamp, msg.color ?? null]
+	const stmt = stmtSaveChatMessage ?? d.prepare(
+		'INSERT OR IGNORE INTO chat_messages (stream_id, username, text, timestamp, color) VALUES (?, ?, ?, ?, ?)'
 	);
+	d.exec('BEGIN');
+	try {
+		for (const msg of messages) {
+			stmt.run(streamId, msg.username, msg.text, msg.timestamp, msg.color ?? null);
+		}
+		d.exec('COMMIT');
+	} catch (err) {
+		d.exec('ROLLBACK');
+		throw err;
+	}
 }
 
 export function countChatMessages(streamId: string): number {

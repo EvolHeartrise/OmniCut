@@ -6,6 +6,8 @@ const POLL_INTERVAL = 3000; // check for new segments every 3s
 const SEGMENT_DURATION = 2; // seconds per HLS segment (matches -hls_time 2)
 const LIVE_POOL_SIZE = 2; // number of concurrent live transcription workers
 const VOD_POOL_SIZE = 1; // number of concurrent VOD transcription workers
+const MAX_RESPAWN_ATTEMPTS = 3; // max consecutive respawn attempts per worker slot
+const RESPAWN_BACKOFF_MS = 5000; // delay between respawn attempts
 
 // --- Worker pool ---
 
@@ -70,6 +72,9 @@ const vodPool: Pool = { workers: [], queue: [], readyCount: 0, initStarted: fals
 
 // Map worker → pending resolve/reject callbacks
 const workerResolvers = new Map<PoolWorker, { resolve: (sentences: Sentence[]) => void; reject: (err: Error) => void }>();
+
+// Track consecutive respawn failures per worker slot to prevent infinite loops
+const respawnAttempts = new Map<string, number>(); // key: `${pool.label}:${workerId}`
 
 function getScriptPath(): string {
 	return path.join(process.cwd(), 'scripts', 'transcribe_worker.py');
@@ -159,7 +164,7 @@ function spawnWorker(pool: Pool, workerId: number): PoolWorker | null {
 			} catch { /* stream closed */ }
 		})();
 
-		// Handle worker exit
+		// Handle worker exit with backoff to prevent infinite respawn loops
 		proc.exited.then((code) => {
 			console.warn(`[transcriber:${pool.label}:w${workerId}] Worker exited with code ${code}`);
 			// Reject any pending request
@@ -169,13 +174,36 @@ function spawnWorker(pool: Pool, workerId: number): PoolWorker | null {
 				worker.busy = false;
 				reject(new Error(`Worker exited with code ${code}`));
 			}
+			const wasReady = worker.ready;
 			removeWorker(pool, worker);
-			// Try to respawn if the pool is still active
+
+			// Try to respawn with backoff if the pool is still active
 			if (!pool.failed && pool.workers.length < pool.size) {
-				const newWorker = spawnWorker(pool, workerId);
-				if (newWorker) {
-					pool.workers.push(newWorker);
+				const slotKey = `${pool.label}:${workerId}`;
+				// Reset counter if the worker was previously ready (healthy exit, not a startup crash)
+				if (wasReady) {
+					respawnAttempts.delete(slotKey);
 				}
+				const attempts = (respawnAttempts.get(slotKey) ?? 0) + 1;
+				respawnAttempts.set(slotKey, attempts);
+
+				if (attempts > MAX_RESPAWN_ATTEMPTS) {
+					console.error(`[transcriber:${pool.label}:w${workerId}] Max respawn attempts (${MAX_RESPAWN_ATTEMPTS}) reached — giving up`);
+					if (pool.workers.length === 0) {
+						pool.failed = true;
+					}
+					return;
+				}
+
+				const delay = RESPAWN_BACKOFF_MS * attempts;
+				console.log(`[transcriber:${pool.label}:w${workerId}] Respawning in ${delay}ms (attempt ${attempts}/${MAX_RESPAWN_ATTEMPTS})`);
+				setTimeout(() => {
+					if (pool.failed) return;
+					const newWorker = spawnWorker(pool, workerId);
+					if (newWorker) {
+						pool.workers.push(newWorker);
+					}
+				}, delay);
 			}
 		});
 

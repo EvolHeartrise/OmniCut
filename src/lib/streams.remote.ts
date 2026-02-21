@@ -29,12 +29,24 @@ import {
 	addToWatchlist as dbAddToWatchlist,
 	removeFromWatchlist as dbRemoveFromWatchlist
 } from '$lib/server/persistence.js';
-import { TWITCH_CLIENT_ID } from '$lib/server/twitchApi.js';
+import {
+	twitchGql,
+	fetchTwitchChannel,
+	fetchDouyuChannel,
+	mapBrowseEdges,
+	mapVideoEdges,
+	BROWSE_STREAMS_GQL,
+	BROWSE_GAME_STREAMS_GQL,
+	SEARCH_CATEGORIES_GQL,
+	CHANNEL_VODS_GQL,
+	type BrowseStreamEdge,
+	type VideoEdge
+} from '$lib/server/twitchApi.js';
 import type { ChatMessage } from '$lib/server/types.js';
 import type { ChannelInfo, VodInfo } from '$lib/types.js';
 
 // ---------------------------------------------------------------------------
-// Queries
+// Queries — Stream & Media Data
 // ---------------------------------------------------------------------------
 
 /** List all streams with clip regions (transcriptions fetched on demand via windowed query). */
@@ -82,199 +94,6 @@ export const getMultiStreamTranscriptions = query(
 );
 
 // ---------------------------------------------------------------------------
-// Twitch GQL helpers (moved from API routes)
-// ---------------------------------------------------------------------------
-
-const BROWSE_STREAMS_QUERY = `query($first: Int!, $after: Cursor, $opts: StreamOptions) {
-	streams(first: $first, after: $after, options: $opts) {
-		edges {
-			cursor
-			node {
-				broadcaster {
-					login
-					displayName
-					profileImageURL(width: 70)
-				}
-				viewersCount
-				title
-				game { name }
-				createdAt
-			}
-		}
-		pageInfo { hasNextPage }
-	}
-}`;
-
-const BROWSE_GAME_STREAMS_QUERY = `query($id: ID!, $first: Int!, $after: Cursor, $opts: GameStreamOptions) {
-	game(id: $id) {
-		streams(first: $first, after: $after, options: $opts) {
-			edges {
-				cursor
-				node {
-					broadcaster {
-						login
-						displayName
-						profileImageURL(width: 70)
-					}
-					viewersCount
-					title
-					game { name }
-					createdAt
-				}
-			}
-			pageInfo { hasNextPage }
-		}
-	}
-}`;
-
-const SEARCH_CATEGORIES_GQL = `query($query: String!) {
-	searchCategories(query: $query, first: 10) {
-		edges {
-			node {
-				id
-				name
-			}
-		}
-	}
-}`;
-
-const CHANNEL_LOOKUP_GQL = `query($login: String!) {
-	user(login: $login) {
-		displayName
-		profileImageURL(width: 70)
-		stream {
-			viewersCount
-			title
-			game { name }
-			createdAt
-			archiveVideo { id }
-		}
-	}
-}`;
-
-const CHANNEL_VODS_GQL = `query($login: String!, $first: Int, $after: Cursor, $type: BroadcastType) {
-	user(login: $login) {
-		videos(first: $first, after: $after, type: $type, sort: TIME) {
-			edges {
-				cursor
-				node {
-					id
-					title
-					createdAt
-					lengthSeconds
-					previewThumbnailURL(width: 320, height: 180)
-					viewCount
-				}
-			}
-			pageInfo { hasNextPage }
-		}
-	}
-}`;
-
-interface BrowseStreamEdge {
-	cursor: string;
-	node: {
-		broadcaster: { login: string; displayName: string; profileImageURL: string };
-		viewersCount: number;
-		title: string;
-		game: { name: string } | null;
-		createdAt: string;
-	};
-}
-
-interface VideoEdge {
-	cursor: string;
-	node: {
-		id: string;
-		title: string | null;
-		createdAt: string | null;
-		lengthSeconds: number | null;
-		previewThumbnailURL: string | null;
-		viewCount: number | null;
-	};
-}
-
-function mapBrowseEdges(edges: BrowseStreamEdge[]): { streams: ChannelInfo[]; cursor: string | null } {
-	const cursor = edges.length > 0 ? edges[edges.length - 1].cursor : null;
-	const streams: ChannelInfo[] = edges.map((edge) => ({
-		login: edge.node.broadcaster.login,
-		displayName: edge.node.broadcaster.displayName ?? null,
-		profileImageUrl: edge.node.broadcaster.profileImageURL ?? null,
-		isLive: true,
-		title: edge.node.title ?? null,
-		gameName: edge.node.game?.name ?? null,
-		viewerCount: edge.node.viewersCount ?? null,
-		startedAt: edge.node.createdAt ?? null,
-		hasVod: false,
-		platform: 'twitch' as const
-	}));
-	return { streams, cursor };
-}
-
-async function twitchGql(gqlQuery: string, variables: Record<string, unknown>): Promise<unknown> {
-	const res = await fetch('https://gql.twitch.tv/gql', {
-		method: 'POST',
-		headers: {
-			'Client-ID': TWITCH_CLIENT_ID,
-			'Content-Type': 'application/json'
-		},
-		body: JSON.stringify({ query: gqlQuery, variables })
-	});
-	return res.json();
-}
-
-async function fetchTwitchChannel(login: string): Promise<ChannelInfo> {
-	try {
-		const data = await twitchGql(CHANNEL_LOOKUP_GQL, { login }) as Record<string, unknown>;
-		const user = (data as { data?: { user?: Record<string, unknown> } })?.data?.user;
-		if (!user) {
-			return { login, displayName: null, profileImageUrl: null, isLive: false, title: null, gameName: null, viewerCount: null, startedAt: null, hasVod: false, platform: 'twitch' };
-		}
-		const stream = user.stream as { viewersCount?: number; title?: string; game?: { name: string }; createdAt?: string; archiveVideo?: { id: string } } | null;
-		return {
-			login,
-			displayName: (user.displayName as string) ?? null,
-			profileImageUrl: (user.profileImageURL as string) ?? null,
-			isLive: !!stream,
-			title: stream?.title ?? null,
-			gameName: stream?.game?.name ?? null,
-			viewerCount: stream?.viewersCount ?? null,
-			startedAt: stream?.createdAt ?? null,
-			hasVod: !!stream?.archiveVideo?.id,
-			platform: 'twitch'
-		};
-	} catch {
-		return { login, displayName: null, profileImageUrl: null, isLive: false, title: null, gameName: null, viewerCount: null, startedAt: null, hasVod: false, platform: 'twitch' };
-	}
-}
-
-async function fetchDouyuChannel(roomId: string): Promise<ChannelInfo> {
-	try {
-		const res = await fetch(`https://open.douyucdn.cn/api/RoomApi/room/${roomId}`);
-		const data = await res.json();
-		const room = data?.data;
-		if (!room) {
-			return { login: roomId, displayName: null, profileImageUrl: null, isLive: false, title: null, gameName: null, viewerCount: null, startedAt: null, hasVod: false, platform: 'douyu' };
-		}
-		const isLive = String(room.room_status) === '1';
-		return {
-			login: roomId,
-			displayName: room.owner_name ?? null,
-			profileImageUrl: room.avatar ?? null,
-			isLive,
-			title: room.room_name ?? null,
-			gameName: room.cate_name ?? null,
-			viewerCount: room.online ?? null,
-			startedAt: isLive && room.start_time ? new Date(room.start_time + '+08:00').toISOString() : null,
-			hasVod: false,
-			platform: 'douyu'
-		};
-	} catch {
-		return { login: roomId, displayName: null, profileImageUrl: null, isLive: false, title: null, gameName: null, viewerCount: null, startedAt: null, hasVod: false, platform: 'douyu' };
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Queries — Browse & Discovery
 // ---------------------------------------------------------------------------
 
@@ -288,12 +107,12 @@ export const browseStreams = query(
 		const after = args.after;
 
 		try {
-			const gqlQuery = gameId ? BROWSE_GAME_STREAMS_QUERY : BROWSE_STREAMS_QUERY;
+			const gqlQuery = gameId ? BROWSE_GAME_STREAMS_GQL : BROWSE_STREAMS_GQL;
 			const variables: Record<string, unknown> = { first, opts: { languages: ['EN'] } };
 			if (after) variables.after = after;
 			if (gameId) variables.id = gameId;
 
-			const data = await twitchGql(gqlQuery, variables) as Record<string, unknown>;
+			const data = await twitchGql<Record<string, unknown>>(gqlQuery, variables);
 
 			if ((data as { errors?: unknown[] }).errors) {
 				console.error('Twitch GQL errors:', (data as { errors: unknown[] }).errors);
@@ -328,8 +147,8 @@ export const searchCategories = query(
 		if (!q.trim()) return { categories: [] as Array<{ id: string; name: string }> };
 
 		try {
-			const data = await twitchGql(SEARCH_CATEGORIES_GQL, { query: q }) as Record<string, unknown>;
-			const edges = ((data as { data?: { searchCategories?: { edges?: Array<{ node: { id: string; name: string } }> } } })?.data?.searchCategories?.edges) ?? [];
+			const data = await twitchGql<{ data?: { searchCategories?: { edges?: Array<{ node: { id: string; name: string } }> } } }>(SEARCH_CATEGORIES_GQL, { query: q });
+			const edges = data?.data?.searchCategories?.edges ?? [];
 			const categories = edges.map((e) => ({ id: e.node.id, name: e.node.name }));
 			return { categories };
 		} catch (err) {
@@ -377,14 +196,14 @@ export const getChannelVods = query(
 			const variables: Record<string, unknown> = { login, first, type: 'ARCHIVE' };
 			if (after) variables.after = after;
 
-			const data = await twitchGql(CHANNEL_VODS_GQL, variables) as Record<string, unknown>;
+			const data = await twitchGql<{ errors?: unknown[]; data?: { user?: { videos?: { edges: VideoEdge[]; pageInfo?: { hasNextPage?: boolean } } } } }>(CHANNEL_VODS_GQL, variables);
 
-			if ((data as { errors?: unknown[] }).errors) {
-				console.error('Twitch GQL errors (vods):', (data as { errors: unknown[] }).errors);
+			if (data.errors) {
+				console.error('Twitch GQL errors (vods):', data.errors);
 				return { vods: [] as VodInfo[], cursor: null as string | null, hasNextPage: false };
 			}
 
-			const connection = (data as { data?: { user?: { videos?: { edges: VideoEdge[]; pageInfo?: { hasNextPage?: boolean } } } } })?.data?.user?.videos;
+			const connection = data?.data?.user?.videos;
 			if (!connection) {
 				return { vods: [] as VodInfo[], cursor: null as string | null, hasNextPage: false };
 			}
@@ -392,15 +211,7 @@ export const getChannelVods = query(
 			const edges: VideoEdge[] = connection.edges ?? [];
 			const lastCursor = edges.length > 0 ? edges[edges.length - 1].cursor : null;
 			const hasNextPage = connection.pageInfo?.hasNextPage ?? false;
-
-			const vods: VodInfo[] = edges.map((edge) => ({
-				id: edge.node.id,
-				title: edge.node.title ?? null,
-				createdAt: edge.node.createdAt ?? null,
-				durationSeconds: edge.node.lengthSeconds ?? null,
-				thumbnailUrl: edge.node.previewThumbnailURL ?? null,
-				viewCount: edge.node.viewCount ?? null
-			}));
+			const vods = mapVideoEdges(edges);
 
 			return { vods, cursor: lastCursor, hasNextPage };
 		} catch (err) {
@@ -409,6 +220,10 @@ export const getChannelVods = query(
 		}
 	}
 );
+
+// ---------------------------------------------------------------------------
+// Queries — Settings & Watchlist
+// ---------------------------------------------------------------------------
 
 /** Load all per-channel settings from the database. */
 export const getAllChannelSettings = query(async () => {
@@ -421,47 +236,8 @@ export const getWatchlist = query(async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Commands
+// Commands — Stream Management
 // ---------------------------------------------------------------------------
-
-/** Ignore a channel in the discovery browser. */
-export const ignoreChannelCmd = command('unchecked', async (args: { login: string }) => {
-	if (!args.login?.trim()) throw new Error('login required');
-	addIgnoredChannel(args.login.trim());
-});
-
-/** Un-ignore a channel. */
-export const unignoreChannelCmd = command('unchecked', async (args: { login: string }) => {
-	if (!args.login?.trim()) throw new Error('login required');
-	removeIgnoredChannel(args.login.trim());
-});
-
-/** Save per-channel transcription language setting. */
-export const saveChannelSettingsCmd = command('unchecked', async (args: { login: string; language?: string | null }) => {
-	if (!args.login?.trim()) throw new Error('login required');
-	saveChannelSettings(args.login.trim(), args.language || null);
-});
-
-/** Add a channel to the watchlist. */
-export const addToWatchlistCmd = command('unchecked', async (args: { login: string; platform?: string }) => {
-	if (!args.login || typeof args.login !== 'string') throw new Error('Missing or invalid "login" field');
-	dbAddToWatchlist(args.login.toLowerCase().trim(), args.platform || 'twitch');
-});
-
-/** Remove a channel from the watchlist. */
-export const removeFromWatchlistCmd = command('unchecked', async (args: { login: string; platform?: string }) => {
-	if (!args.login || typeof args.login !== 'string') throw new Error('Missing or invalid "login" field');
-	dbRemoveFromWatchlist(args.login.toLowerCase().trim(), args.platform || 'twitch');
-});
-
-/** Export all clip regions into a single video file. */
-export const exportVideoCmd = command('unchecked', async (args: { filename: string }) => {
-	if (!args.filename || typeof args.filename !== 'string' || args.filename.trim().length === 0) {
-		throw new Error('Filename is required');
-	}
-	const result = await exportVideo(args.filename.trim());
-	return { success: true, outputPath: result.outputPath };
-});
 
 /** Add a stream (live or VOD). */
 export const addStreamCmd = command(
@@ -528,6 +304,10 @@ export const updateOffsetCmd = command('unchecked', async (args: { id: string; o
 	updateStreamOffset(args.id, args.offset);
 });
 
+// ---------------------------------------------------------------------------
+// Commands — Clip Regions
+// ---------------------------------------------------------------------------
+
 /** Save (upsert) a clip region. */
 export const saveClipCmd = command(
 	'unchecked',
@@ -539,4 +319,47 @@ export const saveClipCmd = command(
 /** Delete a clip region. */
 export const deleteClipCmd = command('unchecked', async (args: { id: string }) => {
 	removeClipRegion(args.id);
+});
+
+// ---------------------------------------------------------------------------
+// Commands — Channel Settings & Watchlist
+// ---------------------------------------------------------------------------
+
+/** Ignore a channel in the discovery browser. */
+export const ignoreChannelCmd = command('unchecked', async (args: { login: string }) => {
+	if (!args.login?.trim()) throw new Error('login required');
+	addIgnoredChannel(args.login.trim());
+});
+
+/** Un-ignore a channel. */
+export const unignoreChannelCmd = command('unchecked', async (args: { login: string }) => {
+	if (!args.login?.trim()) throw new Error('login required');
+	removeIgnoredChannel(args.login.trim());
+});
+
+/** Save per-channel transcription language setting. */
+export const saveChannelSettingsCmd = command('unchecked', async (args: { login: string; language?: string | null }) => {
+	if (!args.login?.trim()) throw new Error('login required');
+	saveChannelSettings(args.login.trim(), args.language || null);
+});
+
+/** Add a channel to the watchlist. */
+export const addToWatchlistCmd = command('unchecked', async (args: { login: string; platform?: string }) => {
+	if (!args.login || typeof args.login !== 'string') throw new Error('Missing or invalid "login" field');
+	dbAddToWatchlist(args.login.toLowerCase().trim(), args.platform || 'twitch');
+});
+
+/** Remove a channel from the watchlist. */
+export const removeFromWatchlistCmd = command('unchecked', async (args: { login: string; platform?: string }) => {
+	if (!args.login || typeof args.login !== 'string') throw new Error('Missing or invalid "login" field');
+	dbRemoveFromWatchlist(args.login.toLowerCase().trim(), args.platform || 'twitch');
+});
+
+/** Export all clip regions into a single video file. */
+export const exportVideoCmd = command('unchecked', async (args: { filename: string }) => {
+	if (!args.filename || typeof args.filename !== 'string' || args.filename.trim().length === 0) {
+		throw new Error('Filename is required');
+	}
+	const result = await exportVideo(args.filename.trim());
+	return { success: true, outputPath: result.outputPath };
 });

@@ -3,11 +3,16 @@ Long-running transcription worker for OmniCut.
 Loads Whisper models once, then processes WAV files streamed via stdin.
 
 Models:
-  - small.en  — used for English streams (better accuracy for English)
-  - small     — used for non-English streams (multilingual + translation)
+  - small.en  — loaded eagerly; used for English streams (better accuracy)
+  - small     — loaded lazily on first non-English request (multilingual + translation)
+
+Device:
+  - Automatically detects CUDA availability via CTranslate2.
+  - Falls back to CPU (int8) when no GPU is available.
 
 Protocol:
-  - On startup, prints {"ready": true} when both models are loaded.
+  - On startup, prints {"device": "cuda"|"cpu"} indicating which backend.
+  - Prints {"ready": true} when the English model is loaded.
   - Reads one JSON object per line from stdin:
     {"wav_path": "...", "language": "ja", "task": "translate"}
     language/task are optional; defaults to English transcription.
@@ -32,6 +37,17 @@ def _add_cuda_dll_paths():
     except ImportError:
         pass
 
+def _detect_device():
+    """Detect whether CUDA is available, falling back to CPU."""
+    try:
+        import ctranslate2
+        if "cuda" in ctranslate2.get_supported_compute_types("cuda"):
+            return "cuda", "int8_float32"
+    except Exception:
+        pass
+    return "cpu", "int8"
+
+
 def main():
     try:
         from faster_whisper import WhisperModel
@@ -40,8 +56,13 @@ def main():
         sys.exit(1)
 
     _add_cuda_dll_paths()
-    model_en = WhisperModel("small.en", device="cuda", compute_type="int8_float32")
-    model_multi = WhisperModel("small", device="cuda", compute_type="int8_float32")
+    device, compute_type = _detect_device()
+    print(json.dumps({"device": device}), flush=True)
+
+    # Lazy-load models: English model loads eagerly (always needed),
+    # multilingual model loads on first non-English request.
+    model_en = WhisperModel("small.en", device=device, compute_type=compute_type)
+    model_multi = None
     print(json.dumps({"ready": True}), flush=True)
 
     for line in sys.stdin:
@@ -58,7 +79,12 @@ def main():
             continue
         try:
             use_english = not language or language == "en"
-            model = model_en if use_english else model_multi
+            if use_english:
+                model = model_en
+            else:
+                if model_multi is None:
+                    model_multi = WhisperModel("small", device=device, compute_type=compute_type)
+                model = model_multi
             transcribe_kwargs = dict(
                 beam_size=1,
                 word_timestamps=True,

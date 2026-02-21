@@ -14,8 +14,8 @@ const RECORDINGS_DIR = path.resolve(process.env.RECORDINGS_DIR || path.join(proc
 // In-memory store of active captures (hot cache; persisted to SQLite on changes)
 const captures = new Map<string, CaptureHandle>();
 
-// In-memory store of clip regions (hot cache; persisted to SQLite)
-const clipRegionsStore: ClipRegion[] = [];
+// In-memory store of clip regions keyed by ID (hot cache; persisted to SQLite)
+const clipRegionsStore = new Map<string, ClipRegion>();
 
 // In-memory cache of chat message counts per stream (avoids COUNT(*) on every broadcast)
 const chatMessageCounts = new Map<string, number>();
@@ -61,7 +61,7 @@ export async function initStreamManager(): Promise<void> {
 	const savedClips = db.loadAllClipRegions();
 	for (const region of savedClips) {
 		if (captures.has(region.streamId)) {
-			clipRegionsStore.push(region);
+			clipRegionsStore.set(region.id, region);
 		}
 	}
 
@@ -72,7 +72,7 @@ export async function initStreamManager(): Promise<void> {
 	}
 
 	const streamCount = captures.size;
-	console.log(`[init] Restored ${streamCount} streams, ${clipRegionsStore.length} clip regions`);
+	console.log(`[init] Restored ${streamCount} streams, ${clipRegionsStore.size} clip regions`);
 }
 
 // --- Broadcasting ---
@@ -568,9 +568,9 @@ export function removeStream(id: string): boolean {
 	captures.delete(id);
 
 	// Remove from in-memory caches
-	for (let i = clipRegionsStore.length - 1; i >= 0; i--) {
-		if (clipRegionsStore[i].streamId === id) {
-			clipRegionsStore.splice(i, 1);
+	for (const [clipId, region] of clipRegionsStore) {
+		if (region.streamId === id) {
+			clipRegionsStore.delete(clipId);
 		}
 	}
 
@@ -635,12 +635,7 @@ export function addClipRegion(region: ClipRegion): void {
 	if (region.startTime >= region.endTime) {
 		throw new Error(`Invalid clip region: startTime (${region.startTime}) must be less than endTime (${region.endTime})`);
 	}
-	const idx = clipRegionsStore.findIndex((r) => r.id === region.id);
-	if (idx !== -1) {
-		clipRegionsStore[idx] = region;
-	} else {
-		clipRegionsStore.push(region);
-	}
+	clipRegionsStore.set(region.id, region);
 
 	// Persist to SQLite
 	db.saveClipRegion(region);
@@ -650,9 +645,7 @@ export function addClipRegion(region: ClipRegion): void {
  * Remove a clip region by ID.
  */
 export function removeClipRegion(id: string): boolean {
-	const idx = clipRegionsStore.findIndex((r) => r.id === id);
-	if (idx === -1) return false;
-	clipRegionsStore.splice(idx, 1);
+	if (!clipRegionsStore.delete(id)) return false;
 
 	// Remove from SQLite
 	db.deleteClipRegion(id);
@@ -664,16 +657,13 @@ export function removeClipRegion(id: string): boolean {
  * Get all clip regions.
  */
 export function getAllClipRegions(): ClipRegion[] {
-	return clipRegionsStore;
+	return Array.from(clipRegionsStore.values());
 }
 
 export function getTranscriptionsInRange(id: string, fromTime: number, toTime: number): Array<{ id: number; text: string; startTime: number; endTime: number }> {
 	return db.loadTranscriptionsInRange(id, fromTime, toTime);
 }
 
-/**
- * Get all stored chat messages for a stream.
- */
 /**
  * Get chat messages for a stream within a time range (stream-local seconds).
  */
@@ -710,7 +700,7 @@ export function getStreamRecordingDir(id: string): string | null {
  */
 export async function exportVideo(filename: string): Promise<{ outputPath: string }> {
 	return exportVideoImpl(
-		clipRegionsStore,
+		Array.from(clipRegionsStore.values()),
 		filename,
 		(streamId) => {
 			const handle = captures.get(streamId);

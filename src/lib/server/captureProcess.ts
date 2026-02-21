@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as crypto from 'node:crypto';
 import type { StreamInfo, CaptureHandle, StreamMeta } from './types.js';
-import { TWITCH_CLIENT_ID } from './twitchApi.js';
+import { twitchGql, STREAM_META_GQL, VOD_META_GQL } from './twitchApi.js';
 
 export type { CaptureHandle };
 
@@ -36,7 +36,11 @@ async function getDouyuSignParams(roomId: string): Promise<Record<string, string
 
 	// Write script to temp file and execute in subprocess for isolation
 	// (script is ~60KB — too large for a command-line argument)
-	const tmpPath = path.join(os.tmpdir(), `douyu-sign-${Date.now()}.js`);
+	// Validate roomId is purely numeric to prevent injection
+	if (!/^\d+$/.test(roomId)) {
+		throw new Error(`Invalid Douyu room ID: ${roomId}`);
+	}
+	const tmpPath = path.join(os.tmpdir(), `douyu-sign-${crypto.randomUUID()}.js`);
 	const script = `${cryptoJs};${signFunc};process.stdout.write(ub98484234("${roomId}","${uuid}","${ts}"))`;
 	fs.writeFileSync(tmpPath, script);
 
@@ -101,19 +105,8 @@ export async function fetchDouyuStreamMeta(roomId: string): Promise<StreamMeta> 
 
 export async function fetchStreamMeta(channel: string): Promise<StreamMeta> {
 	try {
-		const res = await fetch('https://gql.twitch.tv/gql', {
-			method: 'POST',
-			headers: {
-				'Client-ID': TWITCH_CLIENT_ID,
-				'Content-Type': 'application/json'
-			},
-			body: JSON.stringify({
-				query: 'query($login: String!) { user(login: $login) { stream { viewersCount title game { name } createdAt archiveVideo { id } } } }',
-				variables: { login: channel }
-			})
-		});
-		const data = await res.json();
-		const stream = data?.data?.user?.stream;
+		const data = await twitchGql<{ data?: { user?: { stream?: Record<string, unknown> } } }>(STREAM_META_GQL, { login: channel });
+		const stream = data?.data?.user?.stream as { viewersCount?: number; title?: string; game?: { name: string }; createdAt?: string; archiveVideo?: { id: string } } | undefined;
 		return {
 			viewerCount: stream?.viewersCount ?? null,
 			title: stream?.title ?? null,
@@ -135,19 +128,8 @@ export interface VodMeta {
 
 export async function fetchVodMeta(vodId: string): Promise<VodMeta> {
 	try {
-		const res = await fetch('https://gql.twitch.tv/gql', {
-			method: 'POST',
-			headers: {
-				'Client-ID': TWITCH_CLIENT_ID,
-				'Content-Type': 'application/json'
-			},
-			body: JSON.stringify({
-				query: 'query($id: ID!) { video(id: $id) { owner { login } title createdAt lengthSeconds } }',
-				variables: { id: vodId }
-			})
-		});
-		const data = await res.json();
-		const video = data?.data?.video;
+		const data = await twitchGql<{ data?: { video?: Record<string, unknown> } }>(VOD_META_GQL, { id: vodId });
+		const video = data?.data?.video as { owner?: { login: string }; title?: string; createdAt?: string; lengthSeconds?: number } | undefined;
 		if (!video) {
 			return { channel: '', title: null, createdAt: null, durationSeconds: null };
 		}
@@ -210,7 +192,8 @@ export function startCapture(
 
 	// Common setup: segment watcher, metadata polling, kill function
 	let lastKnownSegCount = 0;
-	let lastKnownDiskUsage = 0;
+	let cumulativeDiskUsage = 0;
+	const knownFiles = new Set<string>();
 	const segmentWatchInterval = setInterval(async () => {
 		try {
 			const allFiles = await fs.promises.readdir(recordingDir);
@@ -218,21 +201,25 @@ export function startCapture(
 			const newSegCount = tsFiles.length;
 
 			if (newSegCount !== lastKnownSegCount) {
-				// Only re-stat when file count changes
-				const stats = await Promise.all(
-					allFiles.map(async (f) => {
-						try {
-							const stat = await fs.promises.stat(path.join(recordingDir, f));
-							return stat.size;
-						} catch { return 0; }
-					})
-				);
-				lastKnownDiskUsage = stats.reduce((a, b) => a + b, 0);
+				// Only stat NEW files incrementally instead of re-statting everything
+				const newFiles = allFiles.filter((f) => !knownFiles.has(f));
+				if (newFiles.length > 0) {
+					const newSizes = await Promise.all(
+						newFiles.map(async (f) => {
+							try {
+								const stat = await fs.promises.stat(path.join(recordingDir, f));
+								return stat.size;
+							} catch { return 0; }
+						})
+					);
+					cumulativeDiskUsage += newSizes.reduce((a, b) => a + b, 0);
+					for (const f of newFiles) knownFiles.add(f);
+				}
 				lastKnownSegCount = newSegCount;
 			}
 
 			info.segmentCount = newSegCount;
-			info.diskUsageBytes = lastKnownDiskUsage;
+			info.diskUsageBytes = cumulativeDiskUsage;
 
 			if (newSegCount > 0 && info.status === 'starting') {
 				info.status = 'capturing';
@@ -381,7 +368,7 @@ export function startCapture(
 
 		ffmpegProc.exited.then((code) => {
 			console.log(`[ffmpeg:${channel}] exited with code ${code}`);
-			if (info.status !== 'stopped') {
+			if (info.status !== 'stopped' && info.status !== 'error') {
 				info.status = 'stopped';
 				onStatusChange(info);
 			}

@@ -1,5 +1,5 @@
 import { TWITCH_CLIENT_ID } from './twitchApi.js';
-import type { ChatMessage, ChatCallback } from './types.js';
+import type { ChatCallback } from './types.js';
 
 const PAGE_DELAY_MS = 150;
 const MAX_RETRIES = 5;
@@ -53,7 +53,7 @@ async function fetchAllPages(entry: QueueEntry) {
 	try {
 		while (!entry.stopped) {
 			let res: Response | undefined;
-			let data: any;
+			let data: any = undefined;
 
 			let retryable = false;
 			for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -100,6 +100,11 @@ async function fetchAllPages(entry: QueueEntry) {
 
 			if (!res.ok) {
 				console.error(`[vod-chat:${entry.videoId}] HTTP ${res.status} — aborting`);
+				break;
+			}
+
+			if (!data) {
+				console.error(`[vod-chat:${entry.videoId}] No response data — aborting`);
 				break;
 			}
 
