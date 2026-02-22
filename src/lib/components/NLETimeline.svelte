@@ -15,7 +15,15 @@
 		seekRequest,
 		type ClipRegion
 	} from '$lib/stores/streams.js';
-	import { applyTimelineZoom, clampPps, computeTickInterval, handleTimelineWheel, zoomIn as tzZoomIn, zoomOut as tzZoomOut, reCenter as tzReCenter } from '$lib/timeline.js';
+	import {
+		applyTimelineZoom,
+		clampPps,
+		computeTickInterval,
+		handleTimelineWheel,
+		zoomIn as tzZoomIn,
+		zoomOut as tzZoomOut,
+		reCenter as tzReCenter
+	} from '$lib/timeline.js';
 	import { splitClipRegion, removeClipRegionAction } from '$lib/clipActions.js';
 	import { TRACK_COLORS as COLORS } from '$lib/constants.js';
 	import { getChatHeatmap } from '$lib/streams.remote';
@@ -208,9 +216,7 @@
 	);
 
 	// Visible tracks (excludes hidden) — used for timeline range calculation
-	let visibleTracksData = $derived(
-		tracksData.filter((t) => !hiddenTracks.has(t.key))
-	);
+	let visibleTracksData = $derived(tracksData.filter((t) => !hiddenTracks.has(t.key)));
 
 	// Pre-compute clip regions grouped by stream ID for O(1) lookup in template
 	let clipRegionsByStream = $derived.by(() => {
@@ -417,9 +423,7 @@
 	// Master time is a pure self-advancing clock in epoch seconds. Streams follow it, never the reverse.
 	let masterCurrentTimeState = $state(Date.now() / 1000);
 
-	let masterCurrentTime = $derived(
-		frozenMasterTime !== null ? frozenMasterTime : masterCurrentTimeState
-	);
+	let masterCurrentTime = $derived(frozenMasterTime !== null ? frozenMasterTime : masterCurrentTimeState);
 
 	// Sync to shared store (read by StreamGrid for intersection filtering)
 	$effect(() => {
@@ -525,14 +529,23 @@
 
 	function reCenter() {
 		autoScroll = true;
-		tzReCenter(scrollAreaEl, playheadX, () => { ignoreScrollEvents = true; });
+		tzReCenter(scrollAreaEl, playheadX, () => {
+			ignoreScrollEvents = true;
+		});
 	}
 
 	// --- Zoom (Ctrl+Wheel) / Pan (bare scroll) ---
 	function handleWheel(e: WheelEvent) {
 		const newPps = handleTimelineWheel(
-			e, scrollAreaEl, pixelsPerSecond, effectiveTimelineStart,
-			MIN_PPS, MAX_PPS, () => { ignoreScrollEvents = true; }
+			e,
+			scrollAreaEl,
+			pixelsPerSecond,
+			effectiveTimelineStart,
+			MIN_PPS,
+			MAX_PPS,
+			() => {
+				ignoreScrollEvents = true;
+			}
 		);
 		if (newPps !== null) pixelsPerSecond = newPps;
 	}
@@ -613,9 +626,7 @@
 				const timeDelta = -dragOffsetDelta; // offset up = bar moves left = markers move left
 				clipRegions.update((regions) =>
 					regions.map((r) =>
-						r.streamId === streamId
-							? { ...r, startTime: r.startTime + timeDelta, endTime: r.endTime + timeDelta }
-							: r
+						r.streamId === streamId ? { ...r, startTime: r.startTime + timeDelta, endTime: r.endTime + timeDelta } : r
 					)
 				);
 				// Persist shifted regions to server
@@ -668,9 +679,7 @@
 				break;
 			case 'update-region':
 				// Undo marker move → restore old snapshot
-				clipRegions.update((regions) =>
-					regions.map((r) => (r.id === entry.before.id ? { ...entry.before } : r))
-				);
+				clipRegions.update((regions) => regions.map((r) => (r.id === entry.before.id ? { ...entry.before } : r)));
 				saveClipRegion(entry.before);
 				break;
 			case 'offset-drag': {
@@ -697,9 +706,7 @@
 			case 'split-region': {
 				// Undo split → remove the two halves, re-add original
 				const { original, createdIds } = entry;
-				clipRegions.update((regions) =>
-					[...regions.filter((r) => !createdIds.includes(r.id)), original]
-				);
+				clipRegions.update((regions) => [...regions.filter((r) => !createdIds.includes(r.id)), original]);
 				removeClipRegionAction({ ...original, id: createdIds[0] });
 				removeClipRegionAction({ ...original, id: createdIds[1] });
 				// Re-add original (removeClipRegionAction removed from store, but we re-added above)
@@ -721,10 +728,10 @@
 			togglePlayPause();
 		} else if (e.key === 'ArrowUp') {
 			e.preventDefault();
-			$masterPlaybackRate = Math.min(4, +(($masterPlaybackRate + 0.25).toFixed(2)));
+			$masterPlaybackRate = Math.min(4, +($masterPlaybackRate + 0.25).toFixed(2));
 		} else if (e.key === 'ArrowDown') {
 			e.preventDefault();
-			$masterPlaybackRate = Math.max(0.25, +(($masterPlaybackRate - 0.25).toFixed(2)));
+			$masterPlaybackRate = Math.max(0.25, +($masterPlaybackRate - 0.25).toFixed(2));
 		} else if (e.key === 'w' || e.key === 'W') {
 			if (!e.repeat && $masterPlaying && $focusedStreamId && !markingStreamId) {
 				markingStreamId = $focusedStreamId;
@@ -741,9 +748,7 @@
 					pushUndo({ type: 'update-region', before: { ...region } });
 					clipRegions.update((regions) =>
 						regions.map((r) =>
-							r.id === region.id
-								? { ...r, ...(isStart ? { startTime: now } : { endTime: now }) }
-								: r
+							r.id === region.id ? { ...r, ...(isStart ? { startTime: now } : { endTime: now }) } : r
 						)
 					);
 					saveClipRegion({
@@ -755,26 +760,18 @@
 					let target: ClipRegion | undefined;
 					if (isStart) {
 						// Q outside: find nearest start marker in the future, pull it back
-						target = streamRegions
-							.filter((r) => r.startTime > now)
-							.sort((a, b) => a.startTime - b.startTime)[0];
+						target = streamRegions.filter((r) => r.startTime > now).sort((a, b) => a.startTime - b.startTime)[0];
 						if (target) {
 							pushUndo({ type: 'update-region', before: { ...target } });
-							clipRegions.update((regions) =>
-								regions.map((r) => r.id === target!.id ? { ...r, startTime: now } : r)
-							);
+							clipRegions.update((regions) => regions.map((r) => (r.id === target!.id ? { ...r, startTime: now } : r)));
 							saveClipRegion({ ...target, startTime: now });
 						}
 					} else {
 						// E outside: find nearest end marker in the past, extend it forward
-						target = streamRegions
-							.filter((r) => r.endTime < now)
-							.sort((a, b) => b.endTime - a.endTime)[0];
+						target = streamRegions.filter((r) => r.endTime < now).sort((a, b) => b.endTime - a.endTime)[0];
 						if (target) {
 							pushUndo({ type: 'update-region', before: { ...target } });
-							clipRegions.update((regions) =>
-								regions.map((r) => r.id === target!.id ? { ...r, endTime: now } : r)
-							);
+							clipRegions.update((regions) => regions.map((r) => (r.id === target!.id ? { ...r, endTime: now } : r)));
 							saveClipRegion({ ...target, endTime: now });
 						}
 					}
@@ -800,7 +797,11 @@
 				if (region) {
 					const result = splitClipRegion(region, now);
 					if (result) {
-						pushUndo({ type: 'split-region', original: region, createdIds: [result.firstHalf.id, result.secondHalf.id] });
+						pushUndo({
+							type: 'split-region',
+							original: region,
+							createdIds: [result.firstHalf.id, result.secondHalf.id]
+						});
 					}
 				}
 			}
@@ -812,9 +813,7 @@
 		} else if (e.shiftKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
 			e.preventDefault();
 			const now = masterCurrentTimeState;
-			const regions = $focusedStreamId
-				? $clipRegions.filter((r) => r.streamId === $focusedStreamId)
-				: $clipRegions;
+			const regions = $focusedStreamId ? $clipRegions.filter((r) => r.streamId === $focusedStreamId) : $clipRegions;
 			const markers = regions.flatMap((r) => [r.startTime, r.endTime]);
 			let target: number | undefined;
 			if (e.key === 'ArrowLeft') {
@@ -911,9 +910,7 @@
 			<span class="zoom-label">{pixelsPerSecond.toFixed(0)} px/s</span>
 			<button class="btn-tool btn-small" onclick={zoomIn} title="Zoom in">+</button>
 			{#if !autoScroll}
-				<button class="btn-tool btn-small" onclick={reCenter} title="Re-center playhead">
-					⊙
-				</button>
+				<button class="btn-tool btn-small" onclick={reCenter} title="Re-center playhead"> ⊙ </button>
 			{/if}
 		</div>
 
@@ -936,13 +933,15 @@
 							class:track-hidden={hiddenTracks.has(track.key)}
 							onclick={() => toggleTrackVisibility(track.key)}
 							title={hiddenTracks.has(track.key) ? 'Show track' : 'Hide track'}
-						>{hiddenTracks.has(track.key) ? '👁‍🗨' : '👁'}</button>
+							>{hiddenTracks.has(track.key) ? '👁‍🗨' : '👁'}</button
+						>
 						<button
 							class="btn-lock-track"
 							class:locked={lockedTracks.has(track.key)}
 							onclick={() => toggleTrackLock(track.key)}
 							title={lockedTracks.has(track.key) ? 'Unlock track (L)' : 'Lock track (L)'}
-						>{lockedTracks.has(track.key) ? '🔒' : '🔓'}</button>
+							>{lockedTracks.has(track.key) ? '🔒' : '🔓'}</button
+						>
 					</div>
 				{/each}
 			</div>
@@ -968,49 +967,43 @@
 						<!-- svelte-ignore a11y_no_static_element_interactions -->
 						<div class="track-row" class:hidden-track={hiddenTracks.has(track.key)}>
 							{#if !hiddenTracks.has(track.key)}
-							{#each track.bars as bar}
-								{@const barLeft = (bar.anchor - bar.offset - effectiveTimelineStart) * pixelsPerSecond}
-								{@const barWidth = bar.duration * pixelsPerSecond}
-								{#if barWidth > 0}
-									<!-- svelte-ignore a11y_no_static_element_interactions -->
-									<div
-										class="track-bar"
-										class:dragging={draggingStreamId === bar.streamId}
-										class:locked={lockedTracks.has(track.key)}
-										style="left: {barLeft}px; width: {barWidth}px; background: {track.color};"
-										onmousedown={(e) => handleTrackMouseDown(e, bar.streamId)}
-									>
+								{#each track.bars as bar}
+									{@const barLeft = (bar.anchor - bar.offset - effectiveTimelineStart) * pixelsPerSecond}
+									{@const barWidth = bar.duration * pixelsPerSecond}
+									{#if barWidth > 0}
+										<!-- svelte-ignore a11y_no_static_element_interactions -->
 										<div
-											class="bar-progress"
-											style="width: {(barProgress[bar.streamId] ?? 0).toFixed(1)}%"
-										></div>
-										<span class="bar-label">{bar.channel}{bar.sourceType === 'vod' ? ' (VOD)' : ''}</span>
+											class="track-bar"
+											class:dragging={draggingStreamId === bar.streamId}
+											class:locked={lockedTracks.has(track.key)}
+											style="left: {barLeft}px; width: {barWidth}px; background: {track.color};"
+											onmousedown={(e) => handleTrackMouseDown(e, bar.streamId)}
+										>
+											<div class="bar-progress" style="width: {(barProgress[bar.streamId] ?? 0).toFixed(1)}%"></div>
+											<span class="bar-label">{bar.channel}{bar.sourceType === 'vod' ? ' (VOD)' : ''}</span>
+										</div>
+									{/if}
+								{/each}
+								{#each track.bars as hbar}
+									<canvas class="chat-heatmap-canvas" use:bindHeatmapCanvas={hbar.streamId}></canvas>
+								{/each}
+								{#each trackClipRegions.get(track.key) ?? [] as region}
+									{@const dragShift = draggingStreamId === region.streamId ? -dragOffsetDelta : 0}
+									{@const clipLeft = (region.startTime + dragShift - effectiveTimelineStart) * pixelsPerSecond}
+									{@const clipWidth = (region.endTime - region.startTime) * pixelsPerSecond}
+									<div class="clip-region" style="left: {clipLeft}px; width: {clipWidth}px">
+										<div class="clip-edge clip-edge-start"></div>
+										<div class="clip-edge clip-edge-end"></div>
+									</div>
+								{/each}
+								{#if track.streamIds.includes(markingStreamId ?? '')}
+									{@const markLeft = (markingStartTime - effectiveTimelineStart) * pixelsPerSecond}
+									{@const markWidth = (masterCurrentTime - markingStartTime) * pixelsPerSecond}
+									<div class="clip-region clip-region-active" style="left: {markLeft}px; width: {markWidth}px">
+										<div class="clip-edge clip-edge-start"></div>
+										<div class="clip-edge clip-edge-end"></div>
 									</div>
 								{/if}
-							{/each}
-							{#each track.bars as hbar}
-								<canvas
-									class="chat-heatmap-canvas"
-									use:bindHeatmapCanvas={hbar.streamId}
-								></canvas>
-							{/each}
-							{#each trackClipRegions.get(track.key) ?? [] as region}
-								{@const dragShift = draggingStreamId === region.streamId ? -dragOffsetDelta : 0}
-								{@const clipLeft = (region.startTime + dragShift - effectiveTimelineStart) * pixelsPerSecond}
-								{@const clipWidth = (region.endTime - region.startTime) * pixelsPerSecond}
-								<div class="clip-region" style="left: {clipLeft}px; width: {clipWidth}px">
-									<div class="clip-edge clip-edge-start"></div>
-									<div class="clip-edge clip-edge-end"></div>
-								</div>
-							{/each}
-							{#if track.streamIds.includes(markingStreamId ?? '')}
-								{@const markLeft = (markingStartTime - effectiveTimelineStart) * pixelsPerSecond}
-								{@const markWidth = (masterCurrentTime - markingStartTime) * pixelsPerSecond}
-								<div class="clip-region clip-region-active" style="left: {markLeft}px; width: {markWidth}px">
-									<div class="clip-edge clip-edge-start"></div>
-									<div class="clip-edge clip-edge-end"></div>
-								</div>
-							{/if}
 							{/if}
 						</div>
 					{/each}
@@ -1142,7 +1135,9 @@
 		line-height: 1;
 		flex-shrink: 0;
 		opacity: 0;
-		transition: opacity 0.15s, color 0.15s;
+		transition:
+			opacity 0.15s,
+			color 0.15s;
 	}
 
 	.btn-lock-track.locked {
@@ -1168,7 +1163,9 @@
 		line-height: 1;
 		flex-shrink: 0;
 		opacity: 0;
-		transition: opacity 0.15s, color 0.15s;
+		transition:
+			opacity 0.15s,
+			color 0.15s;
 		margin-left: auto;
 	}
 

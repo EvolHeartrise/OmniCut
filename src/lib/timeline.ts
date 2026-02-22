@@ -70,7 +70,12 @@ export function handleTimelineWheel(
 		e.preventDefault();
 		if (!scrollAreaEl) return null;
 		const { newPps, scheduleScrollRestore } = applyTimelineZoom(
-			e, scrollAreaEl, pixelsPerSecond, timelineStart, minPps, maxPps
+			e,
+			scrollAreaEl,
+			pixelsPerSecond,
+			timelineStart,
+			minPps,
+			maxPps
 		);
 		scheduleScrollRestore(setIgnoreScroll);
 		return newPps;
@@ -96,14 +101,9 @@ export function zoomOut(pixelsPerSecond: number, minPps: number, maxPps: number)
 /**
  * Re-center the scroll area so the playhead is in the middle.
  */
-export function reCenter(
-	scrollAreaEl: HTMLDivElement | null,
-	playheadX: number,
-	setIgnoreScroll: () => void
-): void {
+export function reCenter(scrollAreaEl: HTMLDivElement | null, playheadX: number, setIgnoreScroll: () => void): void {
 	if (scrollAreaEl) {
 		setIgnoreScroll();
 		scrollAreaEl.scrollLeft = playheadX - scrollAreaEl.clientWidth / 2;
 	}
 }
-

@@ -8,9 +8,7 @@
 	let result = $state<{ success: boolean; message: string } | null>(null);
 	let logEl = $state<HTMLDivElement | null>(null);
 
-	let sortedClips = $derived(
-		[...$clipRegions].sort((a, b) => a.startTime - b.startTime)
-	);
+	let sortedClips = $derived([...$clipRegions].sort((a, b) => a.startTime - b.startTime));
 
 	let clipSummary = $derived(
 		sortedClips.map((clip) => {
@@ -24,20 +22,20 @@
 		})
 	);
 
-	let totalDuration = $derived(
-		clipSummary.reduce((sum, c) => sum + c.duration, 0)
-	);
+	let totalDuration = $derived(clipSummary.reduce((sum, c) => sum + c.duration, 0));
 
 	let chaptersText = $derived.by(() => {
 		let offset = 0;
-		return clipSummary.map((clip) => {
-			const mins = Math.floor(offset / 60);
-			const secs = Math.floor(offset % 60);
-			const ts = `${mins}:${secs.toString().padStart(2, '0')}`;
-			const line = `${ts} ${clip.title}`;
-			offset += clip.duration;
-			return line;
-		}).join('\n');
+		return clipSummary
+			.map((clip) => {
+				const mins = Math.floor(offset / 60);
+				const secs = Math.floor(offset % 60);
+				const ts = `${mins}:${secs.toString().padStart(2, '0')}`;
+				const line = `${ts} ${clip.title}`;
+				offset += clip.duration;
+				return line;
+			})
+			.join('\n');
 	});
 
 	let chaptersCopied = $state(false);
@@ -45,7 +43,7 @@
 	function copyChapters() {
 		navigator.clipboard.writeText(chaptersText).then(() => {
 			chaptersCopied = true;
-			setTimeout(() => chaptersCopied = false, 2000);
+			setTimeout(() => (chaptersCopied = false), 2000);
 		});
 	}
 
@@ -110,15 +108,13 @@
 						bind:value={filename}
 						placeholder="filename"
 						disabled={exporting}
-						onkeydown={(e) => { if (e.key === 'Enter') handleExport(); }}
+						onkeydown={(e) => {
+							if (e.key === 'Enter') handleExport();
+						}}
 					/>
 					<span class="filename-ext">.mp4</span>
 				</div>
-				<button
-					class="btn-export"
-					onclick={handleExport}
-					disabled={exporting || !filename.trim()}
-				>
+				<button class="btn-export" onclick={handleExport} disabled={exporting || !filename.trim()}>
 					{exporting ? 'Exporting...' : 'Export'}
 				</button>
 			</div>

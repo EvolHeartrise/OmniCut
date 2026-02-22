@@ -47,20 +47,14 @@ export async function exportVideo(
 
 		let encodedPath = getEncodedClipPath(clip.id);
 		if (!encodedPath) {
-			onProgress(
-				`Waiting for clip ${i + 1}/${clips.length} to finish encoding (${dur.toFixed(1)}s)`,
-				i, totalSteps
-			);
+			onProgress(`Waiting for clip ${i + 1}/${clips.length} to finish encoding (${dur.toFixed(1)}s)`, i, totalSteps);
 			const finalStatus = await waitForClipReady(clip.id);
 			if (finalStatus === 'error') {
 				throw new Error(`Clip ${i + 1} failed to encode`);
 			}
 			encodedPath = getEncodedClipPath(clip.id);
 		} else {
-			onProgress(
-				`Using pre-encoded clip ${i + 1}/${clips.length} (${dur.toFixed(1)}s)`,
-				i, totalSteps
-			);
+			onProgress(`Using pre-encoded clip ${i + 1}/${clips.length} (${dur.toFixed(1)}s)`, i, totalSteps);
 		}
 
 		if (!encodedPath) {
@@ -75,30 +69,38 @@ export async function exportVideo(
 
 	try {
 		const concatListPath = path.join(tempDir, 'concat.txt');
-		const concatContent = clipFiles
-			.map((f) => ffmpegConcatEscape(f))
-			.join('\n');
+		const concatContent = clipFiles.map((f) => ffmpegConcatEscape(f)).join('\n');
 		fs.writeFileSync(concatListPath, concatContent);
 
 		const safeName = path.basename(filename).replace(/[<>:"/\\|?*]/g, '_');
 		const outputPath = path.join(EXPORTS_DIR, `${safeName}.mp4`);
 
-		onProgress(
-			`Concatenating ${clipFiles.length} clips into ${safeName}.mp4`,
-			clips.length, totalSteps
-		);
+		onProgress(`Concatenating ${clipFiles.length} clips into ${safeName}.mp4`, clips.length, totalSteps);
 
 		// Fast concat — all clips are already encoded mp4s with consistent format
 		await runFfmpeg([
-			'-f', 'concat', '-safe', '0', '-i', concatListPath,
-			'-c', 'copy', '-movflags', '+faststart',
-			'-y', outputPath
+			'-f',
+			'concat',
+			'-safe',
+			'0',
+			'-i',
+			concatListPath,
+			'-c',
+			'copy',
+			'-movflags',
+			'+faststart',
+			'-y',
+			outputPath
 		]);
 
 		onProgress(`Done — saved to ${outputPath}`, totalSteps, totalSteps);
 		return { outputPath };
 	} finally {
-		try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch { /* best effort */ }
+		try {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		} catch {
+			/* best effort */
+		}
 	}
 }
 
@@ -124,18 +126,35 @@ let nvencCached: boolean | null = null;
 export async function detectNvenc(): Promise<boolean> {
 	if (nvencCached !== null) return nvencCached;
 	try {
-		const proc = Bun.spawn([
-			'ffmpeg',
-			'-f', 'lavfi', '-i', 'nullsrc=s=64x64:d=0.1',
-			'-f', 'lavfi', '-i', 'anullsrc=d=0.1',
-			'-c:v', 'h264_nvenc', '-preset', 'p4', '-qp', '18',
-			'-c:a', 'aac',
-			'-f', 'null', '-'
-		], {
-			stdin: 'ignore',
-			stdout: 'pipe',
-			stderr: 'pipe'
-		});
+		const proc = Bun.spawn(
+			[
+				'ffmpeg',
+				'-f',
+				'lavfi',
+				'-i',
+				'nullsrc=s=64x64:d=0.1',
+				'-f',
+				'lavfi',
+				'-i',
+				'anullsrc=d=0.1',
+				'-c:v',
+				'h264_nvenc',
+				'-preset',
+				'p4',
+				'-qp',
+				'18',
+				'-c:a',
+				'aac',
+				'-f',
+				'null',
+				'-'
+			],
+			{
+				stdin: 'ignore',
+				stdout: 'pipe',
+				stderr: 'pipe'
+			}
+		);
 
 		const code = await proc.exited;
 		nvencCached = code === 0;

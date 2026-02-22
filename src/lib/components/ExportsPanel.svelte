@@ -59,17 +59,25 @@
 
 	function statusInfo(status: string): { label: string; cls: string } {
 		switch (status) {
-			case 'ready': return { label: 'Ready', cls: 'status-ready' };
-			case 'exporting': return { label: 'Exporting...', cls: 'status-exporting' };
-			case 'pending': return { label: 'Pending', cls: 'status-pending' };
-			case 'error': return { label: 'Error', cls: 'status-error' };
-			default: return { label: status, cls: 'status-pending' };
+			case 'ready':
+				return { label: 'Ready', cls: 'status-ready' };
+			case 'exporting':
+				return { label: 'Exporting...', cls: 'status-exporting' };
+			case 'pending':
+				return { label: 'Pending', cls: 'status-pending' };
+			case 'error':
+				return { label: 'Error', cls: 'status-error' };
+			default:
+				return { label: status, cls: 'status-pending' };
 		}
 	}
 
 	function formatDate(epoch: number): string {
 		return new Date(epoch * 1000).toLocaleString(undefined, {
-			month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
+			month: 'short',
+			day: 'numeric',
+			hour: '2-digit',
+			minute: '2-digit'
 		});
 	}
 
@@ -119,7 +127,9 @@
 								<div class="progress-bar">
 									<div
 										class="progress-fill"
-										style="width: {activeProgress.totalSteps > 0 ? (activeProgress.step / activeProgress.totalSteps) * 100 : 0}%"
+										style="width: {activeProgress.totalSteps > 0
+											? (activeProgress.step / activeProgress.totalSteps) * 100
+											: 0}%"
 									></div>
 								</div>
 								<span class="progress-text">{activeProgress.message}</span>

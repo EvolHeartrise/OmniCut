@@ -32,11 +32,7 @@
 	<header class="app-header">
 		<nav class="mode-tabs">
 			{#each tabs as tab}
-				<a
-					class="mode-tab"
-					class:active={pathname === tab.href}
-					href={tab.href}
-				>{tab.label}</a>
+				<a class="mode-tab" class:active={pathname === tab.href} href={tab.href}>{tab.label}</a>
 			{/each}
 		</nav>
 		<div class="header-info">
@@ -45,13 +41,13 @@
 				<button
 					class="btn-tool"
 					class:btn-tool-active={$transcriptPanelOpen}
-					onclick={() => $transcriptPanelOpen = !$transcriptPanelOpen}
-				>Transcript</button>
+					onclick={() => ($transcriptPanelOpen = !$transcriptPanelOpen)}>Transcript</button
+				>
 				<button
 					class="btn-tool"
 					class:btn-tool-active={$chatPanelOpen}
-					onclick={() => $chatPanelOpen = !$chatPanelOpen}
-				>Chat</button>
+					onclick={() => ($chatPanelOpen = !$chatPanelOpen)}>Chat</button
+				>
 			{/if}
 			<span class="shortcut-hint">1-6: Focus | Esc: Unfocus | T (hold): Clip transcript | P: Transcript | C: Chat</span>
 		</div>
@@ -121,7 +117,9 @@
 		cursor: pointer;
 		text-transform: uppercase;
 		letter-spacing: 0.5px;
-		transition: background 0.15s, color 0.15s;
+		transition:
+			background 0.15s,
+			color 0.15s;
 		text-decoration: none;
 	}
 
@@ -147,7 +145,9 @@
 		padding: 3px 10px;
 		border-radius: 4px;
 		cursor: pointer;
-		transition: background 0.15s, color 0.15s;
+		transition:
+			background 0.15s,
+			color 0.15s;
 	}
 
 	.btn-tool:hover {

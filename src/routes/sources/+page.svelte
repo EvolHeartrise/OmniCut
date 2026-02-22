@@ -8,8 +8,12 @@
 
 <main class="sources-content">
 	<div class="sources-tabs">
-		<button class="sources-tab" class:active={sourcesTab === 'library'} onclick={() => sourcesTab = 'library'}>Library</button>
-		<button class="sources-tab" class:active={sourcesTab === 'browse'} onclick={() => sourcesTab = 'browse'}>Browse</button>
+		<button class="sources-tab" class:active={sourcesTab === 'library'} onclick={() => (sourcesTab = 'library')}
+			>Library</button
+		>
+		<button class="sources-tab" class:active={sourcesTab === 'browse'} onclick={() => (sourcesTab = 'browse')}
+			>Browse</button
+		>
 	</div>
 	{#if sourcesTab === 'library'}
 		<MediaLibrary />
@@ -51,7 +55,9 @@
 		cursor: pointer;
 		text-transform: uppercase;
 		letter-spacing: 0.5px;
-		transition: background 0.15s, color 0.15s;
+		transition:
+			background 0.15s,
+			color 0.15s;
 	}
 
 	.sources-tab:hover {

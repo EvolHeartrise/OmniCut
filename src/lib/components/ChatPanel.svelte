@@ -1,9 +1,5 @@
 <script lang="ts">
-	import {
-		masterTime,
-		masterPlaying,
-		seekRequest
-	} from '$lib/stores/streams.js';
+	import { masterTime, masterPlaying, seekRequest } from '$lib/stores/streams.js';
 	import { createPanelQueryState } from '$lib/panelQueryRanges.svelte.js';
 	import { usernameColor } from '$lib/utils.js';
 	import { getMultiStreamChat } from '$lib/streams.remote';
@@ -54,16 +50,15 @@
 	let searchFiltered = $derived.by(() => {
 		if (!searchQuery.trim()) return fetchedEntries;
 		const q = searchQuery.trim().toLowerCase();
-		return fetchedEntries.filter(
-			(e) => e.text.toLowerCase().includes(q) || e.username.toLowerCase().includes(q)
-		);
+		return fetchedEntries.filter((e) => e.text.toLowerCase().includes(q) || e.username.toLowerCase().includes(q));
 	});
 
 	// Only show messages at or before the current playhead (no future messages)
 	let displayEntries = $derived.by(() => {
 		const now = $masterTime;
 		// Binary search for the cutoff: first entry with masterTime > now
-		let lo = 0, hi = searchFiltered.length;
+		let lo = 0,
+			hi = searchFiltered.length;
 		while (lo < hi) {
 			const mid = (lo + hi) >>> 1;
 			if (searchFiltered[mid].masterTime <= now) lo = mid + 1;
@@ -86,12 +81,17 @@
 		const atBottom = listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight < 50;
 		if (atBottom) {
 			userScrolled = false;
-			if (scrollTimeout) { clearTimeout(scrollTimeout); scrollTimeout = null; }
+			if (scrollTimeout) {
+				clearTimeout(scrollTimeout);
+				scrollTimeout = null;
+			}
 			return;
 		}
 		userScrolled = true;
 		if (scrollTimeout) clearTimeout(scrollTimeout);
-		scrollTimeout = setTimeout(() => { userScrolled = false; }, 5000);
+		scrollTimeout = setTimeout(() => {
+			userScrolled = false;
+		}, 5000);
 	}
 
 	// Clean up scroll timeout on unmount
@@ -122,12 +122,7 @@
 	</div>
 
 	<div class="search-bar">
-		<input
-			type="text"
-			class="search-input"
-			placeholder="Filter..."
-			bind:value={searchQuery}
-		/>
+		<input type="text" class="search-input" placeholder="Filter..." bind:value={searchQuery} />
 		{#if searchQuery}
 			<button class="search-clear" onclick={clearSearch}>&times;</button>
 		{/if}
@@ -153,9 +148,7 @@
 	</div>
 
 	{#if userScrolled}
-		<button class="scroll-bottom" onclick={scrollToBottom}>
-			More messages below
-		</button>
+		<button class="scroll-bottom" onclick={scrollToBottom}> More messages below </button>
 	{/if}
 </div>
 

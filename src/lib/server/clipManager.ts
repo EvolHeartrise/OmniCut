@@ -31,15 +31,18 @@ export function restoreClipRegions(): void {
  */
 export function addClipRegion(region: ClipRegion): void {
 	if (region.startTime >= region.endTime) {
-		throw new Error(`Invalid clip region: startTime (${region.startTime}) must be less than endTime (${region.endTime})`);
+		throw new Error(
+			`Invalid clip region: startTime (${region.startTime}) must be less than endTime (${region.endTime})`
+		);
 	}
 
 	// Check if this is an update with changed times — invalidate and re-encode
 	const existing = clipRegionsStore.get(region.id);
-	const timesChanged = !existing
-		|| existing.startTime !== region.startTime
-		|| existing.endTime !== region.endTime
-		|| existing.streamId !== region.streamId;
+	const timesChanged =
+		!existing ||
+		existing.startTime !== region.startTime ||
+		existing.endTime !== region.endTime ||
+		existing.streamId !== region.streamId;
 
 	clipRegionsStore.set(region.id, region);
 	db.saveClipRegion(region);

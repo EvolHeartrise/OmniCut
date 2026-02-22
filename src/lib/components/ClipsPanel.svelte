@@ -136,9 +136,7 @@
 		selectedIds = new Set();
 	}
 
-	let allSelected = $derived(
-		filteredClips.length > 0 && filteredClips.every((c) => selectedIds.has(c.id))
-	);
+	let allSelected = $derived(filteredClips.length > 0 && filteredClips.every((c) => selectedIds.has(c.id)));
 
 	// --- Editing ---
 	function startEdit(clip: ClipRegion) {
@@ -156,9 +154,7 @@
 		const clip = $clipRegions.find((c) => c.id === editingId);
 		if (!clip) return;
 		const updated = { ...clip, title: editTitle || undefined, notes: editNotes || undefined };
-		clipRegions.update((regions) =>
-			regions.map((r) => (r.id === updated.id ? updated : r))
-		);
+		clipRegions.update((regions) => regions.map((r) => (r.id === updated.id ? updated : r)));
 		saveClipRegion(updated);
 		editingId = null;
 	}
@@ -231,7 +227,12 @@
 		const localStart = clip.startTime - anchor + offset;
 
 		const autoPlay = () => {
-			previewVideoEl!.play().then(() => { previewPlaying = true; }).catch(() => {});
+			previewVideoEl!
+				.play()
+				.then(() => {
+					previewPlaying = true;
+				})
+				.catch(() => {});
 		};
 
 		if (Hls.isSupported()) {
@@ -325,9 +326,15 @@
 	}
 
 	function handleSeekCommit() {
-		if (!previewVideoEl || !previewClip) { isSeeking = false; return; }
+		if (!previewVideoEl || !previewClip) {
+			isSeeking = false;
+			return;
+		}
 		const bounds = getClipLocalBounds(previewClip);
-		if (!bounds) { isSeeking = false; return; }
+		if (!bounds) {
+			isSeeking = false;
+			return;
+		}
 		const { localStart, localEnd } = bounds;
 		previewVideoEl.currentTime = localStart + previewProgress * (localEnd - localStart);
 		isSeeking = false;
@@ -336,9 +343,7 @@
 	// --- Export ---
 	async function createExport() {
 		// Get selected clips in order from the filtered list
-		const selectedClipIds = filteredClips
-			.filter((c) => selectedIds.has(c.id))
-			.map((c) => c.id);
+		const selectedClipIds = filteredClips.filter((c) => selectedIds.has(c.id)).map((c) => c.id);
 		if (selectedClipIds.length === 0) return;
 		const title = exportTitle.trim() || `Export ${new Date().toISOString().slice(0, 16)}`;
 		exporting = true;
@@ -388,18 +393,26 @@
 	// Cleanup on unmount
 	$effect(() => {
 		return () => {
-			if (previewHls) { previewHls.destroy(); previewHls = null; }
+			if (previewHls) {
+				previewHls.destroy();
+				previewHls = null;
+			}
 		};
 	});
 
 	// Helper: get encode status badge info
 	function encodeStatusInfo(status: string | undefined): { label: string; cls: string } {
 		switch (status) {
-			case 'ready': return { label: 'Encoded', cls: 'badge-ready' };
-			case 'encoding': return { label: 'Encoding...', cls: 'badge-encoding' };
-			case 'pending': return { label: 'Pending', cls: 'badge-pending' };
-			case 'error': return { label: 'Error', cls: 'badge-error' };
-			default: return { label: 'Unknown', cls: 'badge-unknown' };
+			case 'ready':
+				return { label: 'Encoded', cls: 'badge-ready' };
+			case 'encoding':
+				return { label: 'Encoding...', cls: 'badge-encoding' };
+			case 'pending':
+				return { label: 'Pending', cls: 'badge-pending' };
+			case 'error':
+				return { label: 'Error', cls: 'badge-error' };
+			default:
+				return { label: 'Unknown', cls: 'badge-unknown' };
 		}
 	}
 
@@ -410,7 +423,10 @@
 
 	function clipDate(epoch: number): string {
 		return new Date(epoch * 1000).toLocaleString(undefined, {
-			month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
+			month: 'short',
+			day: 'numeric',
+			hour: '2-digit',
+			minute: '2-digit'
 		});
 	}
 </script>
@@ -457,11 +473,7 @@
 			<!-- Selection toolbar -->
 			<div class="selection-bar">
 				<label class="select-all-label">
-					<input
-						type="checkbox"
-						checked={allSelected}
-						onchange={() => allSelected ? selectNone() : selectAll()}
-					/>
+					<input type="checkbox" checked={allSelected} onchange={() => (allSelected ? selectNone() : selectAll())} />
 					{#if selectedIds.size > 0}
 						{selectedIds.size} selected ({formatDuration(totalSelectedDuration)})
 					{:else}
@@ -475,13 +487,11 @@
 							class="export-title-input"
 							bind:value={exportTitle}
 							placeholder="Export title..."
-							onkeydown={(e) => { if (e.key === 'Enter') createExport(); }}
+							onkeydown={(e) => {
+								if (e.key === 'Enter') createExport();
+							}}
 						/>
-						<button
-							class="btn-export"
-							onclick={createExport}
-							disabled={exporting || selectedIds.size === 0}
-						>
+						<button class="btn-export" onclick={createExport} disabled={exporting || selectedIds.size === 0}>
 							{exporting ? 'Queueing...' : `Export ${selectedIds.size} clips`}
 						</button>
 					</div>
@@ -512,11 +522,7 @@
 					{@const isPreviewing = previewClip?.id === clip.id}
 					<div class="clip-item" class:selected={selectedIds.has(clip.id)} class:previewing={isPreviewing}>
 						<div class="clip-item-main">
-							<input
-								type="checkbox"
-								checked={selectedIds.has(clip.id)}
-								onchange={() => toggleSelect(clip.id)}
-							/>
+							<input type="checkbox" checked={selectedIds.has(clip.id)} onchange={() => toggleSelect(clip.id)} />
 							<div class="clip-meta">
 								{#if isEditing}
 									<input
@@ -524,14 +530,19 @@
 										class="edit-input edit-title"
 										bind:value={editTitle}
 										placeholder="Clip title..."
-										onkeydown={(e) => { if (e.key === 'Enter') saveEdit(); if (e.key === 'Escape') cancelEdit(); }}
+										onkeydown={(e) => {
+											if (e.key === 'Enter') saveEdit();
+											if (e.key === 'Escape') cancelEdit();
+										}}
 									/>
 									<textarea
 										class="edit-input edit-notes"
 										bind:value={editNotes}
 										placeholder="Notes..."
 										rows="2"
-										onkeydown={(e) => { if (e.key === 'Escape') cancelEdit(); }}
+										onkeydown={(e) => {
+											if (e.key === 'Escape') cancelEdit();
+										}}
 									></textarea>
 									<div class="edit-actions">
 										<button class="btn-sm btn-save" onclick={saveEdit}>Save</button>
@@ -557,17 +568,17 @@
 							</div>
 							<div class="clip-actions">
 								{#if !isEditing}
-									<button class="btn-icon" onclick={() => copyClipId(clip.id)} title="Copy clip ID">
-										ID
-									</button>
+									<button class="btn-icon" onclick={() => copyClipId(clip.id)} title="Copy clip ID"> ID </button>
 									<button class="btn-icon" onclick={() => openPreview(clip)} title="Preview">
 										{isPreviewing ? '✕' : '▶'}
 									</button>
-									<button class="btn-icon" onclick={() => startEdit(clip)} title="Edit">
-										&#9998;
-									</button>
+									<button class="btn-icon" onclick={() => startEdit(clip)} title="Edit"> &#9998; </button>
 									{#if clip.createdBy === 'ai'}
-										<button class="btn-icon btn-approve" onclick={() => approveClip(clip)} title="Approve (mark as human)">
+										<button
+											class="btn-icon btn-approve"
+											onclick={() => approveClip(clip)}
+											title="Approve (mark as human)"
+										>
 											&#10003;
 										</button>
 									{/if}
@@ -598,18 +609,18 @@
 										{previewPlaying ? '⏸' : '▶'}
 									</button>
 									<span class="preview-time">{previewCurrentTime}</span>
-								<input
-									type="range"
-									class="preview-seek"
-									min="0"
-									max="1"
-									step="0.001"
-									value={previewProgress}
-									oninput={handleSeekInput}
-									onchange={handleSeekCommit}
-								/>
-								<span class="preview-time">{previewDuration}</span>
-								<button class="btn-ctl" onclick={closePreview}>Close</button>
+									<input
+										type="range"
+										class="preview-seek"
+										min="0"
+										max="1"
+										step="0.001"
+										value={previewProgress}
+										oninput={handleSeekInput}
+										onchange={handleSeekCommit}
+									/>
+									<span class="preview-time">{previewDuration}</span>
+									<button class="btn-ctl" onclick={closePreview}>Close</button>
 								</div>
 							</div>
 						{/if}
@@ -653,7 +664,8 @@
 		font-weight: 600;
 	}
 
-	.filter-select, .filter-input {
+	.filter-select,
+	.filter-input {
 		background: #1a1a2e;
 		border: 1px solid #2a2a4a;
 		color: #e0e0ff;
@@ -663,7 +675,8 @@
 		outline: none;
 	}
 
-	.filter-select:focus, .filter-input:focus {
+	.filter-select:focus,
+	.filter-input:focus {
 		border-color: #7c3aed;
 	}
 
@@ -806,7 +819,7 @@
 		padding: 10px 20px;
 	}
 
-	.clip-item-main > input[type="checkbox"] {
+	.clip-item-main > input[type='checkbox'] {
 		margin-top: 3px;
 		flex-shrink: 0;
 	}
@@ -971,8 +984,12 @@
 	}
 
 	@keyframes pulse-delete {
-		from { opacity: 0.7; }
-		to { opacity: 1; }
+		from {
+			opacity: 0.7;
+		}
+		to {
+			opacity: 1;
+		}
 	}
 
 	/* Edit mode */

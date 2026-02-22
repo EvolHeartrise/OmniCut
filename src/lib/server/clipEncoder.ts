@@ -76,7 +76,11 @@ export function enqueueClipEncode(clipId: string): void {
 	// Delete stale encoded file if it exists
 	const existing = encodeStatus.get(clipId);
 	if (existing?.outputPath) {
-		try { fs.unlinkSync(existing.outputPath); } catch { /* ok */ }
+		try {
+			fs.unlinkSync(existing.outputPath);
+		} catch {
+			/* ok */
+		}
 	}
 
 	encodeStatus.set(clipId, { status: 'pending' });
@@ -104,7 +108,11 @@ export function cancelClipEncode(clipId: string): void {
 	// Delete encoded file
 	const entry = encodeStatus.get(clipId);
 	if (entry?.outputPath) {
-		try { fs.unlinkSync(entry.outputPath); } catch { /* ok */ }
+		try {
+			fs.unlinkSync(entry.outputPath);
+		} catch {
+			/* ok */
+		}
 	}
 
 	encodeStatus.delete(clipId);
@@ -163,7 +171,11 @@ export function restoreEncodeState(clipIds: string[]): void {
 				continue;
 			}
 			// Empty file — delete and re-encode
-			try { fs.unlinkSync(filePath); } catch { /* ok */ }
+			try {
+				fs.unlinkSync(filePath);
+			} catch {
+				/* ok */
+			}
 		}
 		// No valid file — enqueue for encoding
 		encodeStatus.set(clipId, { status: 'pending' });
@@ -240,20 +252,39 @@ async function encodeClip(clipId: string): Promise<void> {
 			: ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18'];
 
 		const args = [
-			'-f', 'concat', '-safe', '0', '-i', concatPath,
-			'-ss', trimStart.toFixed(3), '-t', dur.toFixed(3),
-			'-map', '0:v:0', '-map', '0:a:0',
-			'-vf', 'format=yuv420p',
+			'-f',
+			'concat',
+			'-safe',
+			'0',
+			'-i',
+			concatPath,
+			'-ss',
+			trimStart.toFixed(3),
+			'-t',
+			dur.toFixed(3),
+			'-map',
+			'0:v:0',
+			'-map',
+			'0:a:0',
+			'-vf',
+			'format=yuv420p',
 			...encodeArgs,
-			'-c:a', 'aac', '-b:a', '192k',
-			'-movflags', '+faststart',
-			'-y', outputPath
+			'-c:a',
+			'aac',
+			'-b:a',
+			'192k',
+			'-movflags',
+			'+faststart',
+			'-y',
+			outputPath
 		];
 
 		let success = false;
 		try {
 			const proc = Bun.spawn(['ffmpeg', ...args], {
-				stdin: 'ignore', stdout: 'pipe', stderr: 'pipe'
+				stdin: 'ignore',
+				stdout: 'pipe',
+				stderr: 'pipe'
 			});
 			activeEncode = { clipId, proc };
 
@@ -266,17 +297,41 @@ async function encodeClip(clipId: string): Promise<void> {
 			if (useNvenc) {
 				console.error(`[clip-encoder] NVENC failed for ${clipId}, retrying with libx264`);
 				const fallbackArgs = [
-					'-f', 'concat', '-safe', '0', '-i', concatPath,
-					'-ss', trimStart.toFixed(3), '-t', dur.toFixed(3),
-					'-map', '0:v:0', '-map', '0:a:0',
-					'-vf', 'format=yuv420p',
-					'-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18',
-					'-c:a', 'aac', '-b:a', '192k',
-					'-movflags', '+faststart',
-					'-y', outputPath
+					'-f',
+					'concat',
+					'-safe',
+					'0',
+					'-i',
+					concatPath,
+					'-ss',
+					trimStart.toFixed(3),
+					'-t',
+					dur.toFixed(3),
+					'-map',
+					'0:v:0',
+					'-map',
+					'0:a:0',
+					'-vf',
+					'format=yuv420p',
+					'-c:v',
+					'libx264',
+					'-preset',
+					'ultrafast',
+					'-crf',
+					'18',
+					'-c:a',
+					'aac',
+					'-b:a',
+					'192k',
+					'-movflags',
+					'+faststart',
+					'-y',
+					outputPath
 				];
 				const proc = Bun.spawn(['ffmpeg', ...fallbackArgs], {
-					stdin: 'ignore', stdout: 'pipe', stderr: 'pipe'
+					stdin: 'ignore',
+					stdout: 'pipe',
+					stderr: 'pipe'
 				});
 				activeEncode = { clipId, proc };
 
@@ -290,7 +345,11 @@ async function encodeClip(clipId: string): Promise<void> {
 		}
 
 		// Clean up concat file
-		try { fs.unlinkSync(concatPath); } catch { /* ok */ }
+		try {
+			fs.unlinkSync(concatPath);
+		} catch {
+			/* ok */
+		}
 
 		if (success) {
 			encodeStatus.set(clipId, { status: 'ready', outputPath });
@@ -304,8 +363,16 @@ async function encodeClip(clipId: string): Promise<void> {
 		console.error(`[clip-encoder] Failed to encode clip ${clipId}:`, message);
 
 		// Clean up partial output
-		try { fs.unlinkSync(outputPath); } catch { /* ok */ }
-		try { fs.unlinkSync(outputPath + '.concat.txt'); } catch { /* ok */ }
+		try {
+			fs.unlinkSync(outputPath);
+		} catch {
+			/* ok */
+		}
+		try {
+			fs.unlinkSync(outputPath + '.concat.txt');
+		} catch {
+			/* ok */
+		}
 	} finally {
 		activeEncode = null;
 		processQueue();

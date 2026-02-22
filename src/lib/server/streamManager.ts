@@ -77,9 +77,14 @@ function createStatusCallback(opts: CaptureCallbackOpts): (info: StreamInfo) => 
 		// Start streaming transcription on capturing (for live streams & addVodStream)
 		if (info.status === 'capturing' && opts.streamTranscribeOnCapturing && !handle.transcriptionStarted) {
 			handle.transcriptionStarted = true;
-			startTranscription(opts.id, info.recordingDir, (_sid, text, startTime, endTime, words) => {
-				broadcastTranscription(opts.id, text, startTime, endTime, words);
-			}, opts.language);
+			startTranscription(
+				opts.id,
+				info.recordingDir,
+				(_sid, text, startTime, endTime, words) => {
+					broadcastTranscription(opts.id, text, startTime, endTime, words);
+				},
+				opts.language
+			);
 		}
 
 		// Start live chat collection (Twitch IRC) — guarded, only once per capture
@@ -95,25 +100,36 @@ function createStatusCallback(opts: CaptureCallbackOpts): (info: StreamInfo) => 
 		// Start VOD chat download — guarded, only once per capture
 		if (info.status === 'capturing' && opts.vodChat && !handle.chatStarted) {
 			handle.chatStarted = true;
-			handle.stopChat = startVodChatFetch(opts.id, opts.vodChat.videoId, (_sid, msg) => {
-				persistChatMessage(opts.id, msg);
-			}, (success) => {
-				if (success) {
-					handle.info.chatComplete = true;
-					db.saveStream(handle.info);
-					broadcastUpdate(handle.info);
+			handle.stopChat = startVodChatFetch(
+				opts.id,
+				opts.vodChat.videoId,
+				(_sid, msg) => {
+					persistChatMessage(opts.id, msg);
+				},
+				(success) => {
+					if (success) {
+						handle.info.chatComplete = true;
+						db.saveStream(handle.info);
+						broadcastUpdate(handle.info);
+					}
+				},
+				(_sid, msgs) => {
+					persistChatMessagesBatch(opts.id, msgs);
 				}
-			}, (_sid, msgs) => {
-				persistChatMessagesBatch(opts.id, msgs);
-			});
+			);
 		}
 
 		// Full-file transcription when VOD download completes
 		if (info.status === 'stopped' && opts.fullTranscribeOnStop && !handle.transcriptionStarted) {
 			handle.transcriptionStarted = true;
-			transcribeFullRecording(opts.id, info.recordingDir, (_sid, text, startTime, endTime, words) => {
-				broadcastTranscription(opts.id, text, startTime, endTime, words);
-			}, opts.language).catch((err) => {
+			transcribeFullRecording(
+				opts.id,
+				info.recordingDir,
+				(_sid, text, startTime, endTime, words) => {
+					broadcastTranscription(opts.id, text, startTime, endTime, words);
+				},
+				opts.language
+			).catch((err) => {
 				console.error(`[transcribe:${info.channel}] Full transcription failed:`, err);
 			});
 		}
@@ -226,7 +242,11 @@ function findCaptureBySourceUrl(url: string): CaptureHandle | undefined {
  * Returns the stream info with an assigned ID.
  * Automatically spawns a VOD capture if the streamer has an ongoing archive.
  */
-export async function addStream(channel: string, language?: string | null, platform: 'twitch' | 'douyu' = 'twitch'): Promise<StreamInfo> {
+export async function addStream(
+	channel: string,
+	language?: string | null,
+	platform: 'twitch' | 'douyu' = 'twitch'
+): Promise<StreamInfo> {
 	if (findActiveCapture(channel, platform, 'live')) {
 		throw new Error(`Already capturing channel: ${channel}`);
 	}
@@ -288,10 +308,7 @@ export async function addVodStream(channel: string, language?: string | null): P
 
 	// Link to the live capture if one exists
 	for (const [id, handle] of captures) {
-		if (
-			handle.info.channel.toLowerCase() === channel.toLowerCase() &&
-			handle.info.sourceType === 'live'
-		) {
+		if (handle.info.channel.toLowerCase() === channel.toLowerCase() && handle.info.sourceType === 'live') {
 			vodHandle.info.parentStreamId = id;
 			break;
 		}
@@ -318,7 +335,9 @@ export async function addVodByUrl(vodUrl: string, language?: string | null): Pro
 	// Normalize the source URL for dedup: extract canonical form
 	const canonicalUrl = isDouyu
 		? `https://douyu.com/${douyuRoomId}`
-		: twitchVideoId ? `https://twitch.tv/videos/${twitchVideoId}` : vodUrl.trim();
+		: twitchVideoId
+			? `https://twitch.tv/videos/${twitchVideoId}`
+			: vodUrl.trim();
 
 	// Check for duplicate VOD by source URL
 	if (findCaptureBySourceUrl(canonicalUrl)) {
@@ -461,14 +480,22 @@ export function resumeVodStream(id: string): boolean {
 		fullTranscribeOnStop: true
 	});
 
-	newHandle = startCapture(channel, id, RECORDINGS_DIR, (info) => {
-		// Preserve original metadata across status changes
-		info.startedAt = originalStartedAt;
-		info.streamTitle = originalStreamTitle;
-		info.gameName = originalGameName;
-		info.parentStreamId = originalParentStreamId;
-		baseCallback(info);
-	}, sourceUrl, 'twitch', hlsStartOffset);
+	newHandle = startCapture(
+		channel,
+		id,
+		RECORDINGS_DIR,
+		(info) => {
+			// Preserve original metadata across status changes
+			info.startedAt = originalStartedAt;
+			info.streamTitle = originalStreamTitle;
+			info.gameName = originalGameName;
+			info.parentStreamId = originalParentStreamId;
+			baseCallback(info);
+		},
+		sourceUrl,
+		'twitch',
+		hlsStartOffset
+	);
 
 	// Don't re-fetch chat on resume
 	newHandle.chatStarted = true;
@@ -501,17 +528,23 @@ export function refetchVodChat(id: string): boolean {
 	db.saveStream(handle.info);
 	broadcastUpdate(handle.info);
 
-	handle.stopChat = startVodChatFetch(id, videoId, (_sid, msg) => {
-		persistChatMessage(id, msg);
-	}, (success) => {
-		if (success) {
-			handle.info.chatComplete = true;
-			db.saveStream(handle.info);
-			broadcastUpdate(handle.info);
+	handle.stopChat = startVodChatFetch(
+		id,
+		videoId,
+		(_sid, msg) => {
+			persistChatMessage(id, msg);
+		},
+		(success) => {
+			if (success) {
+				handle.info.chatComplete = true;
+				db.saveStream(handle.info);
+				broadcastUpdate(handle.info);
+			}
+		},
+		(_sid, msgs) => {
+			persistChatMessagesBatch(id, msgs);
 		}
-	}, (_sid, msgs) => {
-		persistChatMessagesBatch(id, msgs);
-	});
+	);
 
 	console.log(`[vod-chat:${handle.info.channel}] Refetching chat for video ${videoId}`);
 	return true;
@@ -535,9 +568,14 @@ export function retranscribeStream(id: string): boolean {
 	const language = db.getChannelSettings(handle.info.channel)?.language ?? null;
 
 	// Full transcription with error logging
-	transcribeFullRecording(id, handle.info.recordingDir, (_streamId, text, startTime, endTime, words) => {
-		broadcastTranscription(id, text, startTime, endTime, words);
-	}, language).catch((err) => {
+	transcribeFullRecording(
+		id,
+		handle.info.recordingDir,
+		(_streamId, text, startTime, endTime, words) => {
+			broadcastTranscription(id, text, startTime, endTime, words);
+		},
+		language
+	).catch((err) => {
 		console.error(`[retranscribe:${handle.info.channel}] Full transcription failed:`, err);
 	});
 
@@ -627,21 +665,35 @@ export function getClipEncodeStatuses(clipIds: string[]): Record<string, ClipEnc
 	return result;
 }
 
-export function getTranscriptionsInRange(id: string, fromTime: number, toTime: number, query?: string): Array<{ id: number; text: string; startTime: number; endTime: number }> {
+export function getTranscriptionsInRange(
+	id: string,
+	fromTime: number,
+	toTime: number,
+	query?: string
+): Array<{ id: number; text: string; startTime: number; endTime: number }> {
 	return db.loadTranscriptionsInRange(id, fromTime, toTime, query);
 }
 
 /**
  * Get chat messages for a stream within a time range (stream-local seconds).
  */
-export function getChatMessagesInRange(id: string, fromTime: number, toTime: number, query?: string, limit?: number): (ChatMessage & { id: number })[] {
+export function getChatMessagesInRange(
+	id: string,
+	fromTime: number,
+	toTime: number,
+	query?: string,
+	limit?: number
+): (ChatMessage & { id: number })[] {
 	return db.loadChatMessagesInRange(id, fromTime, toTime, query, limit);
 }
 
 /**
  * Get pre-bucketed chat heatmap data for a stream.
  */
-export function getChatHeatmap(id: string, bucketSeconds: number): { buckets: Array<{ time: number; count: number }>; max: number } {
+export function getChatHeatmap(
+	id: string,
+	bucketSeconds: number
+): { buckets: Array<{ time: number; count: number }>; max: number } {
 	const rows = db.loadChatHeatmap(id, bucketSeconds);
 	let max = 0;
 	const buckets = rows.map((r) => {

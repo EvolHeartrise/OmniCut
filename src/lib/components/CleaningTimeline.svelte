@@ -1,15 +1,14 @@
 <script lang="ts">
 	import { tick } from 'svelte';
 	import Hls from 'hls.js';
-	import {
-		streams,
-		syncOffsets,
-		clipRegions,
-		saveClipRegion,
-		type ClipRegion
-	} from '$lib/stores/streams.js';
+	import { streams, syncOffsets, clipRegions, saveClipRegion, type ClipRegion } from '$lib/stores/streams.js';
 	import { formatDuration, createHlsConfig } from '$lib/utils.js';
-	import { handleTimelineWheel, zoomIn as tzZoomIn, zoomOut as tzZoomOut, reCenter as tzReCenter } from '$lib/timeline.js';
+	import {
+		handleTimelineWheel,
+		zoomIn as tzZoomIn,
+		zoomOut as tzZoomOut,
+		reCenter as tzReCenter
+	} from '$lib/timeline.js';
 	import { splitClipRegion, removeClipRegionAction } from '$lib/clipActions.js';
 
 	interface ClipSegment {
@@ -18,13 +17,11 @@
 		cumulativeStart: number;
 		duration: number;
 		localStart: number; // video-local start time
-		localEnd: number;   // video-local end time
+		localEnd: number; // video-local end time
 	}
 
 	// Build sorted concatenated clip segments
-	let sortedClips = $derived(
-		[...$clipRegions].sort((a, b) => a.startTime - b.startTime)
-	);
+	let sortedClips = $derived([...$clipRegions].sort((a, b) => a.startTime - b.startTime));
 
 	let segments = $derived.by(() => {
 		let cumulative = 0;
@@ -50,9 +47,7 @@
 	});
 
 	let totalDuration = $derived(
-		segments.length > 0
-			? segments[segments.length - 1].cumulativeStart + segments[segments.length - 1].duration
-			: 0
+		segments.length > 0 ? segments[segments.length - 1].cumulativeStart + segments[segments.length - 1].duration : 0
 	);
 
 	// Own playback state
@@ -67,7 +62,10 @@
 	let activePlayer = $state<'A' | 'B'>('A');
 	let videoEl = $derived(activePlayer === 'A' ? videoElA : videoElB);
 
-	interface HlsSlot { hls: Hls | null; streamId: string | null; }
+	interface HlsSlot {
+		hls: Hls | null;
+		streamId: string | null;
+	}
 	const slots: Record<'A' | 'B', HlsSlot> = {
 		A: { hls: null, streamId: null },
 		B: { hls: null, streamId: null }
@@ -109,7 +107,10 @@
 		const el = slot === 'A' ? videoElA : videoElB;
 		if (!el) return;
 
-		if (s.hls) { s.hls.destroy(); s.hls = null; }
+		if (s.hls) {
+			s.hls.destroy();
+			s.hls = null;
+		}
 		s.streamId = streamId;
 		const url = `/hls/${streamId}/playlist.m3u8`;
 
@@ -191,7 +192,10 @@
 		if (preloadedForSeg === idx && preloadS.streamId === seg.clip.streamId) {
 			// Swap to preloaded player
 			const oldEl = activePlayer === 'A' ? videoElA : videoElB;
-			if (oldEl) { oldEl.pause(); oldEl.muted = true; }
+			if (oldEl) {
+				oldEl.pause();
+				oldEl.muted = true;
+			}
 
 			activePlayer = preloadKey;
 			preloadedForSeg = null;
@@ -336,10 +340,9 @@
 	}
 
 	function handleWheel(e: WheelEvent) {
-		const newPps = handleTimelineWheel(
-			e, scrollAreaEl, pixelsPerSecond, 0,
-			MIN_PPS, MAX_PPS, () => { ignoreScrollEvents = true; }
-		);
+		const newPps = handleTimelineWheel(e, scrollAreaEl, pixelsPerSecond, 0, MIN_PPS, MAX_PPS, () => {
+			ignoreScrollEvents = true;
+		});
 		if (newPps !== null) pixelsPerSecond = newPps;
 	}
 
@@ -358,7 +361,10 @@
 	function splitClip(clip: ClipRegion, splitMasterTime: number) {
 		const result = splitClipRegion(clip, splitMasterTime);
 		if (result) {
-			undoStack = [...undoStack, { type: 'split', original: clip, createdIds: [result.firstHalf.id, result.secondHalf.id] }];
+			undoStack = [
+				...undoStack,
+				{ type: 'split', original: clip, createdIds: [result.firstHalf.id, result.secondHalf.id] }
+			];
 		}
 	}
 
@@ -374,10 +380,7 @@
 				break;
 			case 'split': {
 				const { original, createdIds } = entry;
-				clipRegions.update((regions) => [
-					...regions.filter((r) => !createdIds.includes(r.id)),
-					original
-				]);
+				clipRegions.update((regions) => [...regions.filter((r) => !createdIds.includes(r.id)), original]);
 				removeClipRegionAction({ ...original, id: createdIds[0] });
 				removeClipRegionAction({ ...original, id: createdIds[1] });
 				saveClipRegion(original);
@@ -395,9 +398,7 @@
 		// Don't allow start >= end
 		if (updated.startTime >= updated.endTime) return;
 
-		clipRegions.update((regions) =>
-			regions.map((r) => (r.id === clip.id ? updated : r))
-		);
+		clipRegions.update((regions) => regions.map((r) => (r.id === clip.id ? updated : r)));
 		saveClipRegion(updated);
 
 		// Re-seek if playhead is now outside the adjusted clip
@@ -405,7 +406,10 @@
 			if (currentSegIndex < segments.length) {
 				const newSeg = segments[currentSegIndex];
 				if (cleaningTime < newSeg.cumulativeStart || cleaningTime > newSeg.cumulativeStart + newSeg.duration) {
-					cleaningTime = Math.max(newSeg.cumulativeStart, Math.min(cleaningTime, newSeg.cumulativeStart + newSeg.duration));
+					cleaningTime = Math.max(
+						newSeg.cumulativeStart,
+						Math.min(cleaningTime, newSeg.cumulativeStart + newSeg.duration)
+					);
 				}
 				seekToSegmentPosition(currentSegIndex);
 			}
@@ -422,7 +426,9 @@
 
 	function reCenter() {
 		autoScroll = true;
-		tzReCenter(scrollAreaEl, playheadX, () => { ignoreScrollEvents = true; });
+		tzReCenter(scrollAreaEl, playheadX, () => {
+			ignoreScrollEvents = true;
+		});
 	}
 
 	// Keyboard shortcuts for cleaning mode
@@ -438,10 +444,10 @@
 			togglePlayPause();
 		} else if (e.key === 'ArrowUp') {
 			e.preventDefault();
-			playbackRate = Math.min(4, +((playbackRate + 0.25).toFixed(2)));
+			playbackRate = Math.min(4, +(playbackRate + 0.25).toFixed(2));
 		} else if (e.key === 'ArrowDown') {
 			e.preventDefault();
-			playbackRate = Math.max(0.25, +((playbackRate - 0.25).toFixed(2)));
+			playbackRate = Math.max(0.25, +(playbackRate - 0.25).toFixed(2));
 		} else if (e.shiftKey && e.key === 'ArrowLeft') {
 			e.preventDefault();
 			if (currentSegIndex < segments.length) {
@@ -500,14 +506,23 @@
 			if (!e.repeat && currentSegIndex < segments.length) {
 				const seg = segments[currentSegIndex];
 				const wasPaused = !playing;
-				if (playing) { playing = false; videoEl?.pause(); cancelAnimationFrame(rafId); }
+				if (playing) {
+					playing = false;
+					videoEl?.pause();
+					cancelAnimationFrame(rafId);
+				}
 				removeClip(seg.clip);
 				tick().then(() => {
 					if (segments.length > 0) {
 						const newIdx = Math.min(currentSegIndex, segments.length - 1);
 						cleaningTime = segments[newIdx]?.cumulativeStart ?? 0;
 						loadSegment(newIdx);
-						if (!wasPaused) { playing = true; lastFrameTime = performance.now(); videoEl?.play().catch(() => {}); rafId = requestAnimationFrame(advanceLoop); }
+						if (!wasPaused) {
+							playing = true;
+							lastFrameTime = performance.now();
+							videoEl?.play().catch(() => {});
+							rafId = requestAnimationFrame(advanceLoop);
+						}
 					} else {
 						cleaningTime = 0;
 						slots.A.streamId = null;
@@ -537,9 +552,7 @@
 	});
 
 	// Current segment info
-	let currentSeg = $derived(
-		currentSegIndex < segments.length ? segments[currentSegIndex] : null
-	);
+	let currentSeg = $derived(currentSegIndex < segments.length ? segments[currentSegIndex] : null);
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
@@ -604,12 +617,7 @@
 		</div>
 
 		<!-- svelte-ignore a11y_no_static_element_interactions -->
-		<div
-			class="track-scroll-area"
-			bind:this={scrollAreaEl}
-			onscroll={handleScroll}
-			onmousedown={handleTimelineClick}
-		>
+		<div class="track-scroll-area" bind:this={scrollAreaEl} onscroll={handleScroll} onmousedown={handleTimelineClick}>
 			<div class="track-content" style="width: {contentWidth}px">
 				{#each segments as seg, i (seg.clip.id)}
 					{@const left = seg.cumulativeStart * pixelsPerSecond}
@@ -619,7 +627,10 @@
 						class:active={i === currentSegIndex}
 						class:ai-clip={seg.clip.createdBy === 'ai'}
 						style="left: {left}px; width: {width}px"
-						title="{seg.channel}: {formatDuration(seg.duration)}{seg.clip.title ? ` — ${seg.clip.title}` : ''}{seg.clip.notes ? `\n${seg.clip.notes}` : ''}{seg.clip.createdBy === 'ai' ? ' (AI)' : ''}"
+						title="{seg.channel}: {formatDuration(seg.duration)}{seg.clip.title ? ` — ${seg.clip.title}` : ''}{seg.clip
+							.notes
+							? `\n${seg.clip.notes}`
+							: ''}{seg.clip.createdBy === 'ai' ? ' (AI)' : ''}"
 					>
 						<span class="clip-block-label">{seg.channel}</span>
 					</div>

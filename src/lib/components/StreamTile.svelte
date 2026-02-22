@@ -21,10 +21,22 @@
 	import { get } from 'svelte/store';
 	import Hls from 'hls.js';
 	import type { StreamState } from '$lib/stores/streams.js';
-	import { syncOffsets, streamPlaybackStates, masterControl, masterPlaying, masterPlaybackRate, masterTime, transcriptions } from '$lib/stores/streams.js';
+	import {
+		syncOffsets,
+		streamPlaybackStates,
+		masterControl,
+		masterPlaying,
+		masterPlaybackRate,
+		masterTime,
+		transcriptions
+	} from '$lib/stores/streams.js';
 	import { createHlsConfig, formatBytes } from '$lib/utils.js';
 
-	let { stream, focused = false, trackNumber = 0 }: { stream: StreamState; focused?: boolean; trackNumber?: number } = $props();
+	let {
+		stream,
+		focused = false,
+		trackNumber = 0
+	}: { stream: StreamState; focused?: boolean; trackNumber?: number } = $props();
 
 	let videoEl: HTMLVideoElement;
 	let hls: Hls | null = null;
@@ -58,7 +70,10 @@
 		// No active caption — find the most recent past caption and show last two
 		let lastIdx = -1;
 		for (let i = allCaptions.length - 1; i >= 0; i--) {
-			if (localTime >= allCaptions[i].endTime) { lastIdx = i; break; }
+			if (localTime >= allCaptions[i].endTime) {
+				lastIdx = i;
+				break;
+			}
 		}
 		if (lastIdx === -1) return { current: '', prev: '' };
 		const current = allCaptions[lastIdx].text;
@@ -252,10 +267,16 @@
 <div class="stream-tile" class:focused class:starting={stream.status === 'starting'}>
 	<div class="stream-header">
 		<span class="channel-name">
-			{#if trackNumber}<span class="track-number">{trackNumber}</span>{/if}<a href="https://twitch.tv/{stream.channel}" target="_blank" rel="noopener noreferrer" class="channel-link">{stream.channel}</a>{#if stream.sourceType === 'vod'}<span class="vod-badge">(VOD)</span>{/if}
+			{#if trackNumber}<span class="track-number">{trackNumber}</span>{/if}<a
+				href="https://twitch.tv/{stream.channel}"
+				target="_blank"
+				rel="noopener noreferrer"
+				class="channel-link">{stream.channel}</a
+			>{#if stream.sourceType === 'vod'}<span class="vod-badge">(VOD)</span>{/if}
 			{#if stream.streamTitle}<span class="stream-title">{stream.streamTitle}</span>{/if}
 			<span class="disk-usage">{formatBytes(stream.diskUsageBytes)}</span>
-			{#if stream.chatMessageCount > 0}<span class="chat-count">{stream.chatMessageCount.toLocaleString()} msgs</span>{/if}
+			{#if stream.chatMessageCount > 0}<span class="chat-count">{stream.chatMessageCount.toLocaleString()} msgs</span
+				>{/if}
 		</span>
 		{#if stream.status === 'stopped'}
 			<span class="status-badge">Stopped</span>
@@ -291,7 +312,6 @@
 				<p class="sub-current">{captionLines.current}</p>
 			</div>
 		{/if}
-
 	</div>
 
 	<div class="controls">
@@ -438,7 +458,6 @@
 		background: #dc2626;
 		color: white;
 	}
-
 
 	.video-container {
 		position: relative;

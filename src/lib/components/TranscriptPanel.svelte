@@ -1,10 +1,5 @@
 <script lang="ts">
-	import {
-		masterTime,
-		seekRequest,
-		transcriptions,
-		type TranscriptionEntry
-	} from '$lib/stores/streams.js';
+	import { masterTime, seekRequest, transcriptions, type TranscriptionEntry } from '$lib/stores/streams.js';
 	import { createPanelQueryState } from '$lib/panelQueryRanges.svelte.js';
 	import { getMultiStreamTranscriptions } from '$lib/streams.remote';
 	import { formatTime } from '$lib/utils.js';
@@ -74,7 +69,8 @@
 		if (entries.length === 0) return -1;
 
 		// Binary search: find the last entry whose masterStart <= now
-		let lo = 0, hi = entries.length;
+		let lo = 0,
+			hi = entries.length;
 		while (lo < hi) {
 			const mid = (lo + hi) >>> 1;
 			if (entries[mid].masterStart <= now) lo = mid + 1;
@@ -131,12 +127,7 @@
 	</div>
 
 	<div class="search-bar">
-		<input
-			type="text"
-			class="search-input"
-			placeholder="Search transcripts..."
-			bind:value={searchQuery}
-		/>
+		<input type="text" class="search-input" placeholder="Search transcripts..." bind:value={searchQuery} />
 		{#if searchQuery}
 			<button class="search-clear" onclick={clearSearch}>&times;</button>
 		{/if}
@@ -144,12 +135,7 @@
 
 	<div class="entry-list" bind:this={listEl} onscroll={handleListScroll}>
 		{#each filteredEntries as entry, i (entry.id)}
-			<button
-				class="entry-row"
-				class:active={i === activeEntryIndex}
-				data-index={i}
-				onclick={() => seekToEntry(entry)}
-			>
+			<button class="entry-row" class:active={i === activeEntryIndex} data-index={i} onclick={() => seekToEntry(entry)}>
 				<div class="entry-meta">
 					<span class="color-dot" style="background: {entry.color}"></span>
 					<span class="entry-channel">{entry.channel}</span>

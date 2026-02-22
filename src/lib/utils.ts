@@ -29,9 +29,21 @@ export function normalizeChannel(input: string): string {
 
 /** Twitch-style username color palette (from Twitch's default set). */
 const USERNAME_COLORS = [
-	'#ff0000', '#0000ff', '#008000', '#b22222', '#ff7f50',
-	'#9acd32', '#ff4500', '#2e8b57', '#daa520', '#d2691e',
-	'#5f9ea0', '#1e90ff', '#ff69b4', '#8a2be2', '#00ff7f'
+	'#ff0000',
+	'#0000ff',
+	'#008000',
+	'#b22222',
+	'#ff7f50',
+	'#9acd32',
+	'#ff4500',
+	'#2e8b57',
+	'#daa520',
+	'#d2691e',
+	'#5f9ea0',
+	'#1e90ff',
+	'#ff69b4',
+	'#8a2be2',
+	'#00ff7f'
 ];
 
 /** Deterministic color for a username (hash-based). */

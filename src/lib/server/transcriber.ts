@@ -78,11 +78,30 @@ interface Pool {
 	label: string;
 }
 
-const livePool: Pool = { workers: [], queue: [], readyCount: 0, initStarted: false, failed: false, size: LIVE_POOL_SIZE, label: 'live' };
-const vodPool: Pool = { workers: [], queue: [], readyCount: 0, initStarted: false, failed: false, size: VOD_POOL_SIZE, label: 'vod' };
+const livePool: Pool = {
+	workers: [],
+	queue: [],
+	readyCount: 0,
+	initStarted: false,
+	failed: false,
+	size: LIVE_POOL_SIZE,
+	label: 'live'
+};
+const vodPool: Pool = {
+	workers: [],
+	queue: [],
+	readyCount: 0,
+	initStarted: false,
+	failed: false,
+	size: VOD_POOL_SIZE,
+	label: 'vod'
+};
 
 // Map worker → pending resolve/reject callbacks
-const workerResolvers = new Map<PoolWorker, { resolve: (sentences: Sentence[]) => void; reject: (err: Error) => void }>();
+const workerResolvers = new Map<
+	PoolWorker,
+	{ resolve: (sentences: Sentence[]) => void; reject: (err: Error) => void }
+>();
 
 // Track consecutive respawn failures per worker slot to prevent infinite loops
 const respawnAttempts = new Map<string, number>(); // key: `${pool.label}:${workerId}`
@@ -158,7 +177,9 @@ function spawnWorker(pool: Pool, workerId: number): PoolWorker | null {
 						}
 					}
 				}
-			} catch { /* stream closed */ }
+			} catch {
+				/* stream closed */
+			}
 		})();
 
 		// Log stderr
@@ -172,7 +193,9 @@ function spawnWorker(pool: Pool, workerId: number): PoolWorker | null {
 					const msg = decoder.decode(value).trim();
 					if (msg) console.error(`[transcriber:${pool.label}:w${workerId}] ${msg}`);
 				}
-			} catch { /* stream closed */ }
+			} catch {
+				/* stream closed */
+			}
 		})();
 
 		// Handle worker exit with backoff to prevent infinite respawn loops
@@ -199,7 +222,9 @@ function spawnWorker(pool: Pool, workerId: number): PoolWorker | null {
 				respawnAttempts.set(slotKey, attempts);
 
 				if (attempts > MAX_RESPAWN_ATTEMPTS) {
-					console.error(`[transcriber:${pool.label}:w${workerId}] Max respawn attempts (${MAX_RESPAWN_ATTEMPTS}) reached — giving up`);
+					console.error(
+						`[transcriber:${pool.label}:w${workerId}] Max respawn attempts (${MAX_RESPAWN_ATTEMPTS}) reached — giving up`
+					);
 					if (pool.workers.length === 0) {
 						pool.failed = true;
 					}
@@ -207,7 +232,9 @@ function spawnWorker(pool: Pool, workerId: number): PoolWorker | null {
 				}
 
 				const delay = RESPAWN_BACKOFF_MS * attempts;
-				console.log(`[transcriber:${pool.label}:w${workerId}] Respawning in ${delay}ms (attempt ${attempts}/${MAX_RESPAWN_ATTEMPTS})`);
+				console.log(
+					`[transcriber:${pool.label}:w${workerId}] Respawning in ${delay}ms (attempt ${attempts}/${MAX_RESPAWN_ATTEMPTS})`
+				);
 				setTimeout(() => {
 					if (pool.failed) return;
 					const newWorker = spawnWorker(pool, workerId);
@@ -301,7 +328,13 @@ function processQueue(pool: Pool) {
 	}
 }
 
-function transcribeAudio(pool: Pool, wavPath: string, language: string | null, beamSize: number = 1, timeoutMs: number = QUEUE_ITEM_TIMEOUT_MS): Promise<Sentence[]> {
+function transcribeAudio(
+	pool: Pool,
+	wavPath: string,
+	language: string | null,
+	beamSize: number = 1,
+	timeoutMs: number = QUEUE_ITEM_TIMEOUT_MS
+): Promise<Sentence[]> {
 	const task = language && language !== 'en' ? 'translate' : 'transcribe';
 	return new Promise((resolve, reject) => {
 		if (!ensurePool(pool) && pool.workers.length === 0) {
@@ -312,14 +345,17 @@ function transcribeAudio(pool: Pool, wavPath: string, language: string | null, b
 		// Timeout: reject if the request sits in the queue or is processing too long
 		// A timeout of 0 means no timeout (for long-running VOD transcriptions)
 		let settled = false;
-		const timer = timeoutMs > 0 ? setTimeout(() => {
-			if (settled) return;
-			settled = true;
-			// Remove from queue if still pending
-			const idx = pool.queue.findIndex((q) => q.resolve === wrappedResolve);
-			if (idx !== -1) pool.queue.splice(idx, 1);
-			reject(new Error(`Transcription timed out after ${timeoutMs / 1000}s`));
-		}, timeoutMs) : null;
+		const timer =
+			timeoutMs > 0
+				? setTimeout(() => {
+						if (settled) return;
+						settled = true;
+						// Remove from queue if still pending
+						const idx = pool.queue.findIndex((q) => q.resolve === wrappedResolve);
+						if (idx !== -1) pool.queue.splice(idx, 1);
+						reject(new Error(`Transcription timed out after ${timeoutMs / 1000}s`));
+					}, timeoutMs)
+				: null;
 
 		const wrappedResolve = (sentences: Sentence[]) => {
 			if (settled) return;
@@ -343,14 +379,34 @@ function transcribeAudio(pool: Pool, wavPath: string, language: string | null, b
 
 async function extractAudio(recordingDir: string, segmentFiles: string[]): Promise<string | null> {
 	const listPath = path.join(recordingDir, '_concat.txt');
-	const wavPath = path.join(recordingDir, '_transcribe_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6) + '.wav');
+	const wavPath = path.join(
+		recordingDir,
+		'_transcribe_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6) + '.wav'
+	);
 
 	// Write concat file list (relative filenames, ffmpeg runs with cwd=recordingDir)
 	const listContent = segmentFiles.map((s) => `file '${s}'`).join('\n');
 	fs.writeFileSync(listPath, listContent);
 
 	const proc = Bun.spawn(
-		['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-vn', '-ar', '16000', '-ac', '1', '-f', 'wav', wavPath],
+		[
+			'ffmpeg',
+			'-y',
+			'-f',
+			'concat',
+			'-safe',
+			'0',
+			'-i',
+			listPath,
+			'-vn',
+			'-ar',
+			'16000',
+			'-ac',
+			'1',
+			'-f',
+			'wav',
+			wavPath
+		],
 		{
 			cwd: recordingDir,
 			stdin: 'ignore',
@@ -415,8 +471,10 @@ async function checkForNewSegments(streamId: string) {
 	const needed = BATCH_SIZE + 1; // need BATCH_SIZE for transcription + 1 buffer
 
 	const probes = Array.from({ length: needed }, (_, i) =>
-		fs.promises.access(path.join(tracker.recordingDir, segmentFilename(startIdx + i)))
-			.then(() => true, () => false)
+		fs.promises.access(path.join(tracker.recordingDir, segmentFilename(startIdx + i))).then(
+			() => true,
+			() => false
+		)
 	);
 	const results = await Promise.all(probes);
 	// Count consecutive available segments from the start
@@ -444,7 +502,9 @@ async function checkForNewSegments(streamId: string) {
 		try {
 			sentences = deduplicateSentences(await transcribeAudio(livePool, wavPath, tracker.language));
 		} catch (err) {
-			console.warn(`[transcriber:live] Transcription failed for stream ${streamId} batch at index ${startIdx}: ${err instanceof Error ? err.message : err}`);
+			console.warn(
+				`[transcriber:live] Transcription failed for stream ${streamId} batch at index ${startIdx}: ${err instanceof Error ? err.message : err}`
+			);
 			return;
 		}
 		const batchOffset = startIdx * SEGMENT_DURATION;
@@ -474,7 +534,13 @@ async function checkForNewSegments(streamId: string) {
 
 		// If no sentences came back, clear any stale partial
 		if (sentences.length === 0 && tracker.pendingPartial) {
-			tracker.callback(streamId, tracker.pendingPartial.text, tracker.pendingPartial.startTime, tracker.pendingPartial.endTime, tracker.pendingPartial.words);
+			tracker.callback(
+				streamId,
+				tracker.pendingPartial.text,
+				tracker.pendingPartial.startTime,
+				tracker.pendingPartial.endTime,
+				tracker.pendingPartial.words
+			);
 			tracker.pendingPartial = null;
 		}
 	} finally {
@@ -523,7 +589,13 @@ export function stopTranscription(streamId: string): void {
 	if (!tracker) return;
 	// Flush any pending partial sentence before stopping
 	if (tracker.pendingPartial) {
-		tracker.callback(streamId, tracker.pendingPartial.text, tracker.pendingPartial.startTime, tracker.pendingPartial.endTime, tracker.pendingPartial.words);
+		tracker.callback(
+			streamId,
+			tracker.pendingPartial.text,
+			tracker.pendingPartial.startTime,
+			tracker.pendingPartial.endTime,
+			tracker.pendingPartial.words
+		);
 		tracker.pendingPartial = null;
 	}
 	tracker.active = false;
@@ -582,7 +654,9 @@ async function doFullTranscription(job: VodJob): Promise<void> {
 	const poolWaitStart = Date.now();
 	while (vodPool.readyCount === 0 && !vodPool.failed) {
 		if (Date.now() - poolWaitStart > POOL_READY_TIMEOUT_MS) {
-			console.error(`[transcriber:vod] Pool not ready after ${POOL_READY_TIMEOUT_MS / 1000}s, giving up on stream ${streamId}`);
+			console.error(
+				`[transcriber:vod] Pool not ready after ${POOL_READY_TIMEOUT_MS / 1000}s, giving up on stream ${streamId}`
+			);
 			return;
 		}
 		await new Promise((r) => setTimeout(r, 500));
@@ -603,7 +677,9 @@ async function doFullTranscription(job: VodJob): Promise<void> {
 		for (const s of sentences) {
 			onResult(streamId, s.text, s.start, s.end, s.words);
 		}
-		console.log(`[transcriber:vod] Full transcription complete for stream ${streamId}: ${sentences.length} sentences${skipped > 0 ? ` (${skipped} duplicates removed)` : ''}`);
+		console.log(
+			`[transcriber:vod] Full transcription complete for stream ${streamId}: ${sentences.length} sentences${skipped > 0 ? ` (${skipped} duplicates removed)` : ''}`
+		);
 	} finally {
 		try {
 			fs.unlinkSync(wavPath);

@@ -114,7 +114,9 @@ async function fetchAllPages(entry: QueueEntry) {
 						break;
 					}
 					const delay = INITIAL_BACKOFF_MS * 2 ** attempt;
-					console.warn(`[vod-chat:${entry.videoId}] Retryable error, retrying in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
+					console.warn(
+						`[vod-chat:${entry.videoId}] Retryable error, retrying in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES})`
+					);
 					await new Promise((r) => setTimeout(r, delay));
 					continue;
 				}
@@ -202,7 +204,7 @@ function processQueue() {
 	}
 
 	activeEntry = next;
-	const pending = chatQueue.filter(e => !e.stopped).length;
+	const pending = chatQueue.filter((e) => !e.stopped).length;
 	if (pending > 0) {
 		console.log(`[vod-chat] ${pending} more in queue`);
 	}

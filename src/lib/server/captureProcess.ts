@@ -51,7 +51,11 @@ async function getDouyuSignParams(roomId: string): Promise<Record<string, string
 	const output = await new Response(proc.stdout).text();
 	await proc.exited;
 
-	try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
+	try {
+		fs.unlinkSync(tmpPath);
+	} catch {
+		/* ignore */
+	}
 
 	// Parse the query string result into key-value pairs
 	const params: Record<string, string> = {};
@@ -96,8 +100,18 @@ export async function fetchDouyuStreamMeta(roomId: string): Promise<StreamMeta> 
 
 export async function fetchStreamMeta(channel: string): Promise<StreamMeta> {
 	try {
-		const data = await twitchGql<{ data?: { user?: { stream?: Record<string, unknown> } } }>(STREAM_META_GQL, { login: channel });
-		const stream = data?.data?.user?.stream as { viewersCount?: number; title?: string; game?: { name: string }; createdAt?: string; archiveVideo?: { id: string } } | undefined;
+		const data = await twitchGql<{ data?: { user?: { stream?: Record<string, unknown> } } }>(STREAM_META_GQL, {
+			login: channel
+		});
+		const stream = data?.data?.user?.stream as
+			| {
+					viewersCount?: number;
+					title?: string;
+					game?: { name: string };
+					createdAt?: string;
+					archiveVideo?: { id: string };
+			  }
+			| undefined;
 		return {
 			viewerCount: stream?.viewersCount ?? null,
 			title: stream?.title ?? null,
@@ -120,7 +134,9 @@ export interface VodMeta {
 export async function fetchVodMeta(vodId: string): Promise<VodMeta> {
 	try {
 		const data = await twitchGql<{ data?: { video?: Record<string, unknown> } }>(VOD_META_GQL, { id: vodId });
-		const video = data?.data?.video as { owner?: { login: string }; title?: string; createdAt?: string; lengthSeconds?: number } | undefined;
+		const video = data?.data?.video as
+			| { owner?: { login: string }; title?: string; createdAt?: string; lengthSeconds?: number }
+			| undefined;
 		if (!video) {
 			return { channel: '', title: null, createdAt: null, durationSeconds: null };
 		}
@@ -224,7 +240,9 @@ export function startCapture(
 					info.viewerCount = meta.viewerCount;
 					info.streamTitle = meta.title;
 					info.gameName = meta.gameName;
-				} catch { /* network error — will retry next interval */ }
+				} catch {
+					/* network error — will retry next interval */
+				}
 			}
 		}, 30000);
 		fetchMeta(channel).then((meta) => {
@@ -242,8 +260,16 @@ export function startCapture(
 	const kill = () => {
 		info.status = 'stopped';
 		clearPolling();
-		try { sourceProc?.kill(); } catch { /* already dead */ }
-		try { ffmpegProc?.kill(); } catch { /* already dead */ }
+		try {
+			sourceProc?.kill();
+		} catch {
+			/* already dead */
+		}
+		try {
+			ffmpegProc?.kill();
+		} catch {
+			/* already dead */
+		}
 		onStatusChange(info);
 	};
 
@@ -267,7 +293,9 @@ export function startCapture(
 						if (errLine) lastErrors[label] = errLine.trim().slice(0, 200);
 					}
 				}
-			} catch { /* stream closed */ }
+			} catch {
+				/* stream closed */
+			}
 		})();
 	}
 
@@ -281,14 +309,22 @@ export function startCapture(
 				ffmpegProc = Bun.spawn(
 					[
 						'ffmpeg',
-						'-i', streamUrl,
-						'-c:v', 'copy',
-						'-c:a', 'copy',
-						'-f', 'hls',
-						'-hls_time', '2',
-						'-hls_list_size', '0',
-						'-hls_flags', 'append_list+independent_segments',
-						'-hls_segment_filename', segmentPattern,
+						'-i',
+						streamUrl,
+						'-c:v',
+						'copy',
+						'-c:a',
+						'copy',
+						'-f',
+						'hls',
+						'-hls_time',
+						'2',
+						'-hls_list_size',
+						'0',
+						'-hls_flags',
+						'append_list+independent_segments',
+						'-hls_segment_filename',
+						segmentPattern,
 						playlistPath
 					],
 					{ stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' }
@@ -344,14 +380,22 @@ export function startCapture(
 		ffmpegProc = Bun.spawn(
 			[
 				'ffmpeg',
-				'-i', 'pipe:0',
-				'-c:v', 'copy',
-				'-c:a', 'copy',
-				'-f', 'hls',
-				'-hls_time', '2',
-				'-hls_list_size', '0',
-				'-hls_flags', 'append_list+independent_segments',
-				'-hls_segment_filename', segmentPattern,
+				'-i',
+				'pipe:0',
+				'-c:v',
+				'copy',
+				'-c:a',
+				'copy',
+				'-f',
+				'hls',
+				'-hls_time',
+				'2',
+				'-hls_list_size',
+				'0',
+				'-hls_flags',
+				'append_list+independent_segments',
+				'-hls_segment_filename',
+				segmentPattern,
 				playlistPath
 			],
 			{ stdin: sourceProc.stdout, stdout: 'pipe', stderr: 'pipe' }

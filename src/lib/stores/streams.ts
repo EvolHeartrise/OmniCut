@@ -114,7 +114,12 @@ export const chatPanelOpen = writable(false);
 export const seekRequest = writable<{ time: number; seq: number }>({ time: 0, seq: 0 });
 
 /** Build visible stream metadata for panels (TranscriptPanel, ChatPanel). */
-export function deriveVisibleStreams(allStreams: StreamState[], offsets: Record<string, number>, focused: string | null, COLORS: readonly string[]) {
+export function deriveVisibleStreams(
+	allStreams: StreamState[],
+	offsets: Record<string, number>,
+	focused: string | null,
+	COLORS: readonly string[]
+) {
 	return allStreams
 		.filter((s) => !focused || s.id === focused)
 		.map((s, i) => ({
@@ -153,7 +158,6 @@ export async function refreshStreams() {
 		if (data.clipRegions) {
 			clipRegions.set(data.clipRegions);
 		}
-
 	} catch (err) {
 		console.error('Failed to refresh streams:', err);
 	}
@@ -162,7 +166,10 @@ export async function refreshStreams() {
 /**
  * Add a new stream by channel name.
  */
-export async function addStream(channel: string, opts?: { language?: string | null; vod?: boolean; vodUrl?: string; platform?: 'twitch' | 'douyu' }): Promise<void> {
+export async function addStream(
+	channel: string,
+	opts?: { language?: string | null; vod?: boolean; vodUrl?: string; platform?: 'twitch' | 'douyu' }
+): Promise<void> {
 	try {
 		await addStreamCmd({
 			channel,
@@ -324,12 +331,15 @@ export function connectSSE(): () => void {
 			} else if (data.type === 'clip-encode-status') {
 				clipEncodeStatuses.update((current) => ({ ...current, [data.clipId]: data.status }));
 			} else if (data.type === 'export-status') {
-				exportStatusEvents.update((events) => [...events, {
-					exportId: data.exportId,
-					status: data.status,
-					outputPath: data.outputPath,
-					error: data.error
-				}]);
+				exportStatusEvents.update((events) => [
+					...events,
+					{
+						exportId: data.exportId,
+						status: data.status,
+						outputPath: data.outputPath,
+						error: data.error
+					}
+				]);
 			}
 		} catch {
 			// Ignore parse errors (keepalive pings etc)

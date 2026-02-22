@@ -14,9 +14,7 @@
 
 	// --- Current clip under review (oldest AI clip) ---
 	let aiClips = $derived(
-		[...$clipRegions]
-			.filter((c) => c.createdBy === 'ai')
-			.sort((a, b) => a.startTime - b.startTime)
+		[...$clipRegions].filter((c) => c.createdBy === 'ai').sort((a, b) => a.startTime - b.startTime)
 	);
 	let currentClip = $derived<ClipRegion | null>(aiClips[0] ?? null);
 
@@ -25,9 +23,7 @@
 	let deleteConfirmTimer: ReturnType<typeof setTimeout> | null = null;
 
 	// --- Undo stack ---
-	type ReviewUndoEntry =
-		| { type: 'update-region'; before: ClipRegion }
-		| { type: 'delete-region'; region: ClipRegion };
+	type ReviewUndoEntry = { type: 'update-region'; before: ClipRegion } | { type: 'delete-region'; region: ClipRegion };
 
 	let undoStack = $state<ReviewUndoEntry[]>([]);
 	function pushUndo(entry: ReviewUndoEntry) {
@@ -47,9 +43,7 @@
 				break;
 			case 'update-region':
 				// Undo edit/approve/boundary change → restore old snapshot
-				clipRegions.update((regions) =>
-					regions.map((r) => (r.id === entry.before.id ? { ...entry.before } : r))
-				);
+				clipRegions.update((regions) => regions.map((r) => (r.id === entry.before.id ? { ...entry.before } : r)));
 				saveClipRegion(entry.before);
 				break;
 		}
@@ -78,7 +72,10 @@
 
 	function clipDate(epoch: number): string {
 		return new Date(epoch * 1000).toLocaleString(undefined, {
-			month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
+			month: 'short',
+			day: 'numeric',
+			hour: '2-digit',
+			minute: '2-digit'
 		});
 	}
 
@@ -99,11 +96,16 @@
 
 	function encodeStatusInfo(status: string | undefined): { label: string; cls: string } {
 		switch (status) {
-			case 'ready': return { label: 'Encoded', cls: 'badge-ready' };
-			case 'encoding': return { label: 'Encoding...', cls: 'badge-encoding' };
-			case 'pending': return { label: 'Pending', cls: 'badge-pending' };
-			case 'error': return { label: 'Error', cls: 'badge-error' };
-			default: return { label: 'Unknown', cls: 'badge-unknown' };
+			case 'ready':
+				return { label: 'Encoded', cls: 'badge-ready' };
+			case 'encoding':
+				return { label: 'Encoding...', cls: 'badge-encoding' };
+			case 'pending':
+				return { label: 'Pending', cls: 'badge-pending' };
+			case 'error':
+				return { label: 'Error', cls: 'badge-error' };
+			default:
+				return { label: 'Unknown', cls: 'badge-unknown' };
 		}
 	}
 
@@ -113,7 +115,10 @@
 		const stream = $streams.find((s) => s.id === clip.streamId);
 		if (!stream) return;
 
-		if (hls) { hls.destroy(); hls = null; }
+		if (hls) {
+			hls.destroy();
+			hls = null;
+		}
 
 		const url = `/hls/${clip.streamId}/playlist.m3u8`;
 		const offset = $syncOffsets[clip.streamId] || 0;
@@ -122,7 +127,12 @@
 
 		const autoPlay = () => {
 			videoEl!.playbackRate = playbackRate;
-			videoEl!.play().then(() => { playing = true; }).catch(() => {});
+			videoEl!
+				.play()
+				.then(() => {
+					playing = true;
+				})
+				.catch(() => {});
 		};
 
 		if (Hls.isSupported()) {
@@ -152,7 +162,10 @@
 	$effect(() => {
 		const clip = currentClip;
 		if (!clip) {
-			if (hls) { hls.destroy(); hls = null; }
+			if (hls) {
+				hls.destroy();
+				hls = null;
+			}
 			loadedClipId = null;
 			playing = false;
 			return;
@@ -211,16 +224,23 @@
 	}
 
 	function handleSeekCommit() {
-		if (!videoEl || !currentClip) { isSeeking = false; return; }
+		if (!videoEl || !currentClip) {
+			isSeeking = false;
+			return;
+		}
 		const bounds = getClipLocalBounds(currentClip);
-		if (!bounds) { isSeeking = false; return; }
+		if (!bounds) {
+			isSeeking = false;
+			return;
+		}
 		videoEl.currentTime = bounds.localStart + progress * (bounds.localEnd - bounds.localStart);
 		isSeeking = false;
 	}
 
 	function togglePlay() {
 		if (!videoEl) return;
-		if (playing) videoEl.pause(); else videoEl.play().catch(() => {});
+		if (playing) videoEl.pause();
+		else videoEl.play().catch(() => {});
 		playing = !playing;
 	}
 
@@ -238,7 +258,10 @@
 			// Snapshot the clip before deleting for undo
 			const clip = $clipRegions.find((c) => c.id === id);
 			if (clip) pushUndo({ type: 'delete-region', region: { ...clip } });
-			if (hls) { hls.destroy(); hls = null; }
+			if (hls) {
+				hls.destroy();
+				hls = null;
+			}
 			loadedClipId = null;
 			playing = false;
 			deleteClipRegion(id);
@@ -376,7 +399,12 @@
 
 	// Cleanup
 	$effect(() => {
-		return () => { if (hls) { hls.destroy(); hls = null; } };
+		return () => {
+			if (hls) {
+				hls.destroy();
+				hls = null;
+			}
+		};
 	});
 </script>
 
@@ -407,12 +435,7 @@
 			<!-- Video preview -->
 			<div class="video-container">
 				<!-- svelte-ignore a11y_media_has_caption -->
-				<video
-					bind:this={videoEl}
-					ontimeupdate={handleTimeUpdate}
-					playsinline
-					class="review-video"
-				></video>
+				<video bind:this={videoEl} ontimeupdate={handleTimeUpdate} playsinline class="review-video"></video>
 				<div class="video-controls">
 					<button class="btn-ctl" onclick={togglePlay}>
 						{playing ? '⏸' : '▶'}
@@ -441,14 +464,19 @@
 						class="edit-input edit-title"
 						bind:value={editTitle}
 						placeholder="Clip title..."
-						onkeydown={(e) => { if (e.key === 'Enter') saveEdit(); if (e.key === 'Escape') cancelEdit(); }}
+						onkeydown={(e) => {
+							if (e.key === 'Enter') saveEdit();
+							if (e.key === 'Escape') cancelEdit();
+						}}
 					/>
 					<textarea
 						class="edit-input edit-notes"
 						bind:value={editNotes}
 						placeholder="Notes..."
 						rows="3"
-						onkeydown={(e) => { if (e.key === 'Escape') cancelEdit(); }}
+						onkeydown={(e) => {
+							if (e.key === 'Escape') cancelEdit();
+						}}
 					></textarea>
 					<div class="edit-actions">
 						<button class="btn-sm btn-save" onclick={saveEdit}>Save</button>
@@ -496,9 +524,7 @@
 							&#8630; Undo<span class="undo-count">{undoStack.length}</span>
 						</button>
 					{/if}
-					<button class="btn-action btn-copy" onclick={() => copyClipId(clip.id)}>
-						ID
-					</button>
+					<button class="btn-action btn-copy" onclick={() => copyClipId(clip.id)}> ID </button>
 				</div>
 			{/if}
 		</div>
@@ -716,11 +742,26 @@
 		font-weight: 500;
 	}
 
-	.badge-ready { background: rgba(22, 163, 74, 0.15); color: #4ade80; }
-	.badge-encoding { background: rgba(234, 179, 8, 0.15); color: #fbbf24; }
-	.badge-pending { background: rgba(100, 100, 100, 0.15); color: #999; }
-	.badge-error { background: rgba(220, 38, 38, 0.15); color: #f87171; }
-	.badge-unknown { background: rgba(80, 80, 80, 0.15); color: #666; }
+	.badge-ready {
+		background: rgba(22, 163, 74, 0.15);
+		color: #4ade80;
+	}
+	.badge-encoding {
+		background: rgba(234, 179, 8, 0.15);
+		color: #fbbf24;
+	}
+	.badge-pending {
+		background: rgba(100, 100, 100, 0.15);
+		color: #999;
+	}
+	.badge-error {
+		background: rgba(220, 38, 38, 0.15);
+		color: #f87171;
+	}
+	.badge-unknown {
+		background: rgba(80, 80, 80, 0.15);
+		color: #666;
+	}
 
 	/* Actions */
 	.review-actions {
@@ -741,7 +782,10 @@
 		font-size: 0.8rem;
 		font-weight: 600;
 		background: none;
-		transition: background 0.15s, color 0.15s, border-color 0.15s;
+		transition:
+			background 0.15s,
+			color 0.15s,
+			border-color 0.15s;
 	}
 
 	.action-icon {
@@ -771,8 +815,12 @@
 	}
 
 	@keyframes pulse-delete {
-		from { opacity: 0.7; }
-		to { opacity: 1; }
+		from {
+			opacity: 0.7;
+		}
+		to {
+			opacity: 1;
+		}
 	}
 
 	.btn-edit {
@@ -859,8 +907,18 @@
 		cursor: pointer;
 	}
 
-	.btn-save { background: #7c3aed; color: #fff; }
-	.btn-save:hover { background: #6d28d9; }
-	.btn-cancel { background: #2a2a4a; color: #ccc; }
-	.btn-cancel:hover { background: #3a3a5a; }
+	.btn-save {
+		background: #7c3aed;
+		color: #fff;
+	}
+	.btn-save:hover {
+		background: #6d28d9;
+	}
+	.btn-cancel {
+		background: #2a2a4a;
+		color: #ccc;
+	}
+	.btn-cancel:hover {
+		background: #3a3a5a;
+	}
 </style>

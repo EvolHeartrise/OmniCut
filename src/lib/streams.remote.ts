@@ -101,65 +101,66 @@ export const getMultiStreamTranscriptions = query(
 // ---------------------------------------------------------------------------
 
 /** Browse live Twitch streams, optionally filtered by game. */
-export const browseStreams = query(
-	'unchecked',
-	async (args: { gameId?: string; first?: number; after?: string }) => {
-		const gameId = args.gameId;
-		const maxFirst = gameId ? 100 : 30;
-		const first = Math.min(Math.max(args.first ?? maxFirst, 1), maxFirst);
-		const after = args.after;
+export const browseStreams = query('unchecked', async (args: { gameId?: string; first?: number; after?: string }) => {
+	const gameId = args.gameId;
+	const maxFirst = gameId ? 100 : 30;
+	const first = Math.min(Math.max(args.first ?? maxFirst, 1), maxFirst);
+	const after = args.after;
 
-		try {
-			const gqlQuery = gameId ? BROWSE_GAME_STREAMS_GQL : BROWSE_STREAMS_GQL;
-			const variables: Record<string, unknown> = { first, opts: { languages: ['EN'] } };
-			if (after) variables.after = after;
-			if (gameId) variables.id = gameId;
+	try {
+		const gqlQuery = gameId ? BROWSE_GAME_STREAMS_GQL : BROWSE_STREAMS_GQL;
+		const variables: Record<string, unknown> = { first, opts: { languages: ['EN'] } };
+		if (after) variables.after = after;
+		if (gameId) variables.id = gameId;
 
-			const data = await twitchGql<Record<string, unknown>>(gqlQuery, variables);
+		const data = await twitchGql<Record<string, unknown>>(gqlQuery, variables);
 
-			if ((data as { errors?: unknown[] }).errors) {
-				console.error('Twitch GQL errors:', (data as { errors: unknown[] }).errors);
-				return { streams: [] as ChannelInfo[], cursor: null as string | null, hasNextPage: false };
-			}
-
-			const connection = gameId
-				? (data as { data?: { game?: { streams?: { edges: BrowseStreamEdge[]; pageInfo?: { hasNextPage?: boolean } } } } })?.data?.game?.streams
-				: (data as { data?: { streams?: { edges: BrowseStreamEdge[]; pageInfo?: { hasNextPage?: boolean } } } })?.data?.streams;
-
-			if (!connection) {
-				return { streams: [] as ChannelInfo[], cursor: null as string | null, hasNextPage: false };
-			}
-
-			const edges: BrowseStreamEdge[] = connection.edges ?? [];
-			const { streams, cursor: lastCursor } = mapBrowseEdges(edges);
-			const hasNextPage = connection.pageInfo?.hasNextPage ?? false;
-
-			return { streams, cursor: lastCursor, hasNextPage };
-		} catch (err) {
-			console.error('Browse API error:', err);
+		if ((data as { errors?: unknown[] }).errors) {
+			console.error('Twitch GQL errors:', (data as { errors: unknown[] }).errors);
 			return { streams: [] as ChannelInfo[], cursor: null as string | null, hasNextPage: false };
 		}
+
+		const connection = gameId
+			? (
+					data as {
+						data?: { game?: { streams?: { edges: BrowseStreamEdge[]; pageInfo?: { hasNextPage?: boolean } } } };
+					}
+				)?.data?.game?.streams
+			: (data as { data?: { streams?: { edges: BrowseStreamEdge[]; pageInfo?: { hasNextPage?: boolean } } } })?.data
+					?.streams;
+
+		if (!connection) {
+			return { streams: [] as ChannelInfo[], cursor: null as string | null, hasNextPage: false };
+		}
+
+		const edges: BrowseStreamEdge[] = connection.edges ?? [];
+		const { streams, cursor: lastCursor } = mapBrowseEdges(edges);
+		const hasNextPage = connection.pageInfo?.hasNextPage ?? false;
+
+		return { streams, cursor: lastCursor, hasNextPage };
+	} catch (err) {
+		console.error('Browse API error:', err);
+		return { streams: [] as ChannelInfo[], cursor: null as string | null, hasNextPage: false };
 	}
-);
+});
 
 /** Search Twitch game categories by name. */
-export const searchCategories = query(
-	'unchecked',
-	async (args: { query: string }) => {
-		const q = args.query ?? '';
-		if (!q.trim()) return { categories: [] as Array<{ id: string; name: string }> };
+export const searchCategories = query('unchecked', async (args: { query: string }) => {
+	const q = args.query ?? '';
+	if (!q.trim()) return { categories: [] as Array<{ id: string; name: string }> };
 
-		try {
-			const data = await twitchGql<{ data?: { searchCategories?: { edges?: Array<{ node: { id: string; name: string } }> } } }>(SEARCH_CATEGORIES_GQL, { query: q });
-			const edges = data?.data?.searchCategories?.edges ?? [];
-			const categories = edges.map((e) => ({ id: e.node.id, name: e.node.name }));
-			return { categories };
-		} catch (err) {
-			console.error('Category search error:', err);
-			return { categories: [] as Array<{ id: string; name: string }> };
-		}
+	try {
+		const data = await twitchGql<{
+			data?: { searchCategories?: { edges?: Array<{ node: { id: string; name: string } }> } };
+		}>(SEARCH_CATEGORIES_GQL, { query: q });
+		const edges = data?.data?.searchCategories?.edges ?? [];
+		const categories = edges.map((e) => ({ id: e.node.id, name: e.node.name }));
+		return { categories };
+	} catch (err) {
+		console.error('Category search error:', err);
+		return { categories: [] as Array<{ id: string; name: string }> };
 	}
-);
+});
 
 /** Load ignored channel logins from the database. */
 export const getIgnoredChannels = query(async () => {
@@ -167,62 +168,59 @@ export const getIgnoredChannels = query(async () => {
 });
 
 /** Batch channel info lookup (Twitch or Douyu). */
-export const lookupChannels = query(
-	'unchecked',
-	async (args: { channels: string[]; platform?: string }) => {
-		const channels = args.channels;
-		const platform = args.platform || 'twitch';
+export const lookupChannels = query('unchecked', async (args: { channels: string[]; platform?: string }) => {
+	const channels = args.channels;
+	const platform = args.platform || 'twitch';
 
-		if (!Array.isArray(channels) || channels.length === 0) {
-			return { channels: [] as ChannelInfo[] };
-		}
-
-		const fetcher = platform === 'douyu' ? fetchDouyuChannel : fetchTwitchChannel;
-		const results = await Promise.all(channels.map(fetcher));
-		return { channels: results };
+	if (!Array.isArray(channels) || channels.length === 0) {
+		return { channels: [] as ChannelInfo[] };
 	}
-);
+
+	const fetcher = platform === 'douyu' ? fetchDouyuChannel : fetchTwitchChannel;
+	const results = await Promise.all(channels.map(fetcher));
+	return { channels: results };
+});
 
 /** Get past VODs for a Twitch channel. */
-export const getChannelVods = query(
-	'unchecked',
-	async (args: { login: string; first?: number; after?: string }) => {
-		const login = args.login;
-		const first = Math.min(Math.max(args.first ?? 20, 1), 100);
-		const after = args.after;
+export const getChannelVods = query('unchecked', async (args: { login: string; first?: number; after?: string }) => {
+	const login = args.login;
+	const first = Math.min(Math.max(args.first ?? 20, 1), 100);
+	const after = args.after;
 
-		if (!login) {
-			return { vods: [] as VodInfo[], cursor: null as string | null, hasNextPage: false };
-		}
-
-		try {
-			const variables: Record<string, unknown> = { login, first, type: 'ARCHIVE' };
-			if (after) variables.after = after;
-
-			const data = await twitchGql<{ errors?: unknown[]; data?: { user?: { videos?: { edges: VideoEdge[]; pageInfo?: { hasNextPage?: boolean } } } } }>(CHANNEL_VODS_GQL, variables);
-
-			if (data.errors) {
-				console.error('Twitch GQL errors (vods):', data.errors);
-				return { vods: [] as VodInfo[], cursor: null as string | null, hasNextPage: false };
-			}
-
-			const connection = data?.data?.user?.videos;
-			if (!connection) {
-				return { vods: [] as VodInfo[], cursor: null as string | null, hasNextPage: false };
-			}
-
-			const edges: VideoEdge[] = connection.edges ?? [];
-			const lastCursor = edges.length > 0 ? edges[edges.length - 1].cursor : null;
-			const hasNextPage = connection.pageInfo?.hasNextPage ?? false;
-			const vods = mapVideoEdges(edges);
-
-			return { vods, cursor: lastCursor, hasNextPage };
-		} catch (err) {
-			console.error('Vods API error:', err);
-			return { vods: [] as VodInfo[], cursor: null as string | null, hasNextPage: false };
-		}
+	if (!login) {
+		return { vods: [] as VodInfo[], cursor: null as string | null, hasNextPage: false };
 	}
-);
+
+	try {
+		const variables: Record<string, unknown> = { login, first, type: 'ARCHIVE' };
+		if (after) variables.after = after;
+
+		const data = await twitchGql<{
+			errors?: unknown[];
+			data?: { user?: { videos?: { edges: VideoEdge[]; pageInfo?: { hasNextPage?: boolean } } } };
+		}>(CHANNEL_VODS_GQL, variables);
+
+		if (data.errors) {
+			console.error('Twitch GQL errors (vods):', data.errors);
+			return { vods: [] as VodInfo[], cursor: null as string | null, hasNextPage: false };
+		}
+
+		const connection = data?.data?.user?.videos;
+		if (!connection) {
+			return { vods: [] as VodInfo[], cursor: null as string | null, hasNextPage: false };
+		}
+
+		const edges: VideoEdge[] = connection.edges ?? [];
+		const lastCursor = edges.length > 0 ? edges[edges.length - 1].cursor : null;
+		const hasNextPage = connection.pageInfo?.hasNextPage ?? false;
+		const vods = mapVideoEdges(edges);
+
+		return { vods, cursor: lastCursor, hasNextPage };
+	} catch (err) {
+		console.error('Vods API error:', err);
+		return { vods: [] as VodInfo[], cursor: null as string | null, hasNextPage: false };
+	}
+});
 
 // ---------------------------------------------------------------------------
 // Queries — Settings & Watchlist
@@ -314,7 +312,15 @@ export const updateOffsetCmd = command('unchecked', async (args: { id: string; o
 /** Save (upsert) a clip region. */
 export const saveClipCmd = command(
 	'unchecked',
-	async (region: { id: string; streamId: string; startTime: number; endTime: number; createdBy?: 'human' | 'ai'; title?: string; notes?: string }) => {
+	async (region: {
+		id: string;
+		streamId: string;
+		startTime: number;
+		endTime: number;
+		createdBy?: 'human' | 'ai';
+		title?: string;
+		notes?: string;
+	}) => {
 		addClipRegion(region);
 	}
 );
@@ -341,10 +347,13 @@ export const unignoreChannelCmd = command('unchecked', async (args: { login: str
 });
 
 /** Save per-channel transcription language setting. */
-export const saveChannelSettingsCmd = command('unchecked', async (args: { login: string; language?: string | null }) => {
-	if (!args.login?.trim()) throw new Error('login required');
-	saveChannelSettings(args.login.trim(), args.language || null);
-});
+export const saveChannelSettingsCmd = command(
+	'unchecked',
+	async (args: { login: string; language?: string | null }) => {
+		if (!args.login?.trim()) throw new Error('login required');
+		saveChannelSettings(args.login.trim(), args.language || null);
+	}
+);
 
 /** Add a channel to the watchlist. */
 export const addToWatchlistCmd = command('unchecked', async (args: { login: string; platform?: string }) => {
@@ -369,9 +378,7 @@ export const exportVideoCmd = command('unchecked', async (args: { filename: stri
 		throw new Error('No clip regions to export');
 	}
 	// Sort by startTime for the UI export path
-	const sortedIds = [...clips]
-		.sort((a, b) => a.startTime - b.startTime)
-		.map((c) => c.id);
+	const sortedIds = [...clips].sort((a, b) => a.startTime - b.startTime).map((c) => c.id);
 	const record = createAndQueueExport(sortedIds, args.filename.trim());
 	return { success: true, exportId: record.id };
 });

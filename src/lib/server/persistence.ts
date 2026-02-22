@@ -129,7 +129,7 @@ export async function initDatabase(): Promise<void> {
 
 	// Migration: add chat_complete flag
 	try {
-		db.exec("ALTER TABLE streams ADD COLUMN chat_complete INTEGER NOT NULL DEFAULT 0");
+		db.exec('ALTER TABLE streams ADD COLUMN chat_complete INTEGER NOT NULL DEFAULT 0');
 	} catch {
 		// Column already exists — ignore
 	}
@@ -196,9 +196,9 @@ export async function initDatabase(): Promise<void> {
 
 	// Migration: remove ON DELETE CASCADE from clip_regions so clips survive stream deletion.
 	// SQLite doesn't support ALTER FOREIGN KEY, so we recreate the table.
-	const hasClipCascade = db.query(
-		"SELECT sql FROM sqlite_master WHERE type='table' AND name='clip_regions'"
-	).get() as { sql: string } | null;
+	const hasClipCascade = db.query("SELECT sql FROM sqlite_master WHERE type='table' AND name='clip_regions'").get() as {
+		sql: string;
+	} | null;
 	if (hasClipCascade?.sql?.includes('ON DELETE CASCADE')) {
 		db.exec(`
 			CREATE TABLE clip_regions_new (
@@ -445,16 +445,24 @@ export function updateStreamOffset(id: string, offset: number): void {
 
 // --- Transcriptions ---
 
-export function saveTranscription(streamId: string, text: string, startTime: number, endTime: number, words?: WordTimestamp[]): void {
+export function saveTranscription(
+	streamId: string,
+	text: string,
+	startTime: number,
+	endTime: number,
+	words?: WordTimestamp[]
+): void {
 	const d = getDb();
 	try {
 		if (stmtSaveTranscription) {
 			stmtSaveTranscription.run(streamId, text, startTime, endTime);
 		} else {
-			d.run(
-				'INSERT INTO transcriptions (stream_id, text, start_time, end_time) VALUES (?, ?, ?, ?)',
-				[streamId, text, startTime, endTime]
-			);
+			d.run('INSERT INTO transcriptions (stream_id, text, start_time, end_time) VALUES (?, ?, ?, ?)', [
+				streamId,
+				text,
+				startTime,
+				endTime
+			]);
 		}
 	} catch (err: any) {
 		if (err?.code === 'SQLITE_CONSTRAINT_FOREIGNKEY') {
@@ -466,40 +474,53 @@ export function saveTranscription(streamId: string, text: string, startTime: num
 
 	if (words && words.length > 0) {
 		const transcriptionId = (d.query('SELECT last_insert_rowid() as id').get() as { id: number }).id;
-		const ws = stmtSaveWord ?? d.prepare(
-			'INSERT INTO transcription_words (transcription_id, word, start_time, end_time) VALUES (?, ?, ?, ?)'
-		);
+		const ws =
+			stmtSaveWord ??
+			d.prepare('INSERT INTO transcription_words (transcription_id, word, start_time, end_time) VALUES (?, ?, ?, ?)');
 		for (const w of words) {
 			ws.run(transcriptionId, w.word, w.start, w.end);
 		}
 	}
 }
 
-export function loadTranscriptionsInRange(streamId: string, fromTime: number, toTime: number, query?: string): Array<{ id: number; text: string; startTime: number; endTime: number }> {
+export function loadTranscriptionsInRange(
+	streamId: string,
+	fromTime: number,
+	toTime: number,
+	query?: string
+): Array<{ id: number; text: string; startTime: number; endTime: number }> {
 	const d = getDb();
 	if (query) {
-		const rows = d.query(
-			'SELECT id, text, start_time, end_time FROM transcriptions WHERE stream_id = ? AND end_time >= ? AND start_time <= ? AND text LIKE ? ORDER BY start_time'
-		).all(streamId, fromTime, toTime, `%${query}%`) as TranscriptionRow[];
+		const rows = d
+			.query(
+				'SELECT id, text, start_time, end_time FROM transcriptions WHERE stream_id = ? AND end_time >= ? AND start_time <= ? AND text LIKE ? ORDER BY start_time'
+			)
+			.all(streamId, fromTime, toTime, `%${query}%`) as TranscriptionRow[];
 		return rows.map((r) => ({ id: r.id, text: r.text, startTime: r.start_time, endTime: r.end_time }));
 	}
-	const rows = d.query(
-		'SELECT id, text, start_time, end_time FROM transcriptions WHERE stream_id = ? AND end_time >= ? AND start_time <= ? ORDER BY start_time'
-	).all(streamId, fromTime, toTime) as TranscriptionRow[];
+	const rows = d
+		.query(
+			'SELECT id, text, start_time, end_time FROM transcriptions WHERE stream_id = ? AND end_time >= ? AND start_time <= ? ORDER BY start_time'
+		)
+		.all(streamId, fromTime, toTime) as TranscriptionRow[];
 	return rows.map((r) => ({ id: r.id, text: r.text, startTime: r.start_time, endTime: r.end_time }));
 }
 
 export function countTranscriptions(streamId: string): number {
 	const d = getDb();
-	const row = d.query('SELECT COUNT(*) as cnt FROM transcriptions WHERE stream_id = ?').get(streamId) as { cnt: number } | null;
+	const row = d.query('SELECT COUNT(*) as cnt FROM transcriptions WHERE stream_id = ?').get(streamId) as {
+		cnt: number;
+	} | null;
 	return row?.cnt ?? 0;
 }
 
-export function loadWordTimestamps(transcriptionId: number): Array<{ word: string; startTime: number; endTime: number }> {
+export function loadWordTimestamps(
+	transcriptionId: number
+): Array<{ word: string; startTime: number; endTime: number }> {
 	const d = getDb();
-	const rows = d.query(
-		'SELECT word, start_time, end_time FROM transcription_words WHERE transcription_id = ? ORDER BY start_time'
-	).all(transcriptionId) as Array<{ word: string; start_time: number; end_time: number }>;
+	const rows = d
+		.query('SELECT word, start_time, end_time FROM transcription_words WHERE transcription_id = ? ORDER BY start_time')
+		.all(transcriptionId) as Array<{ word: string; start_time: number; end_time: number }>;
 	return rows.map((r) => ({ word: r.word, startTime: r.start_time, endTime: r.end_time }));
 }
 
@@ -515,10 +536,13 @@ export function saveChatMessage(streamId: string, msg: ChatMessage): void {
 		stmtSaveChatMessage.run(streamId, msg.username, msg.text, msg.timestamp, msg.color ?? null);
 	} else {
 		const d = getDb();
-		d.run(
-			'INSERT OR IGNORE INTO chat_messages (stream_id, username, text, timestamp, color) VALUES (?, ?, ?, ?, ?)',
-			[streamId, msg.username, msg.text, msg.timestamp, msg.color ?? null]
-		);
+		d.run('INSERT OR IGNORE INTO chat_messages (stream_id, username, text, timestamp, color) VALUES (?, ?, ?, ?, ?)', [
+			streamId,
+			msg.username,
+			msg.text,
+			msg.timestamp,
+			msg.color ?? null
+		]);
 	}
 }
 
@@ -526,9 +550,11 @@ export function saveChatMessage(streamId: string, msg: ChatMessage): void {
 export function saveChatMessagesBatch(streamId: string, messages: ChatMessage[]): void {
 	if (messages.length === 0) return;
 	const d = getDb();
-	const stmt = stmtSaveChatMessage ?? d.prepare(
-		'INSERT OR IGNORE INTO chat_messages (stream_id, username, text, timestamp, color) VALUES (?, ?, ?, ?, ?)'
-	);
+	const stmt =
+		stmtSaveChatMessage ??
+		d.prepare(
+			'INSERT OR IGNORE INTO chat_messages (stream_id, username, text, timestamp, color) VALUES (?, ?, ?, ?, ?)'
+		);
 	d.exec('BEGIN');
 	try {
 		for (const msg of messages) {
@@ -543,44 +569,59 @@ export function saveChatMessagesBatch(streamId: string, messages: ChatMessage[])
 
 export function countChatMessages(streamId: string): number {
 	const d = getDb();
-	const row = d.query('SELECT COUNT(*) as cnt FROM chat_messages WHERE stream_id = ?').get(streamId) as { cnt: number } | null;
+	const row = d.query('SELECT COUNT(*) as cnt FROM chat_messages WHERE stream_id = ?').get(streamId) as {
+		cnt: number;
+	} | null;
 	return row?.cnt ?? 0;
 }
 
-export function loadChatMessagesInRange(streamId: string, fromTime: number, toTime: number, query?: string, limit?: number): (ChatMessage & { id: number })[] {
+export function loadChatMessagesInRange(
+	streamId: string,
+	fromTime: number,
+	toTime: number,
+	query?: string,
+	limit?: number
+): (ChatMessage & { id: number })[] {
 	const d = getDb();
 	const cap = limit ?? 0;
-	const mapRow = (r: ChatRow) => ({ id: r.id, username: r.username, text: r.text, timestamp: r.timestamp, color: r.color ?? null });
+	const mapRow = (r: ChatRow) => ({
+		id: r.id,
+		username: r.username,
+		text: r.text,
+		timestamp: r.timestamp,
+		color: r.color ?? null
+	});
 	if (query) {
 		// When limited, fetch the LAST N messages in the range (most recent, near the playhead)
-		const sql = cap > 0
-			? 'SELECT * FROM (SELECT id, username, text, timestamp, color FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? AND text LIKE ? ORDER BY timestamp DESC LIMIT ?) ORDER BY timestamp'
-			: 'SELECT id, username, text, timestamp, color FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? AND text LIKE ? ORDER BY timestamp';
-		const params = cap > 0
-			? [streamId, fromTime, toTime, `%${query}%`, cap]
-			: [streamId, fromTime, toTime, `%${query}%`];
+		const sql =
+			cap > 0
+				? 'SELECT * FROM (SELECT id, username, text, timestamp, color FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? AND text LIKE ? ORDER BY timestamp DESC LIMIT ?) ORDER BY timestamp'
+				: 'SELECT id, username, text, timestamp, color FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? AND text LIKE ? ORDER BY timestamp';
+		const params =
+			cap > 0 ? [streamId, fromTime, toTime, `%${query}%`, cap] : [streamId, fromTime, toTime, `%${query}%`];
 		return (d.query(sql).all(...params) as ChatRow[]).map(mapRow);
 	}
-	const sql = cap > 0
-		? 'SELECT * FROM (SELECT id, username, text, timestamp, color FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp DESC LIMIT ?) ORDER BY timestamp'
-		: 'SELECT id, username, text, timestamp, color FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp';
-	const params = cap > 0
-		? [streamId, fromTime, toTime, cap]
-		: [streamId, fromTime, toTime];
+	const sql =
+		cap > 0
+			? 'SELECT * FROM (SELECT id, username, text, timestamp, color FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp DESC LIMIT ?) ORDER BY timestamp'
+			: 'SELECT id, username, text, timestamp, color FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp';
+	const params = cap > 0 ? [streamId, fromTime, toTime, cap] : [streamId, fromTime, toTime];
 	return (d.query(sql).all(...params) as ChatRow[]).map(mapRow);
 }
 
 export function loadChatHeatmap(streamId: string, bucketSeconds: number): Array<{ bucket: number; count: number }> {
 	const d = getDb();
-	const rows = d.query(
-		`SELECT
+	const rows = d
+		.query(
+			`SELECT
 			CAST(timestamp / ? AS INTEGER) * ? AS bucket,
 			COUNT(*) AS count
 		FROM chat_messages
 		WHERE stream_id = ?
 		GROUP BY bucket
 		ORDER BY bucket`
-	).all(bucketSeconds, bucketSeconds, streamId) as HeatmapRow[];
+		)
+		.all(bucketSeconds, bucketSeconds, streamId) as HeatmapRow[];
 	return rows.map((r) => ({ bucket: r.bucket, count: r.count }));
 }
 
@@ -591,7 +632,15 @@ export function saveClipRegion(region: ClipRegion): void {
 	d.run(
 		`INSERT INTO clip_regions (id, stream_id, start_time, end_time, created_by, title, notes) VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET start_time = excluded.start_time, end_time = excluded.end_time, created_by = excluded.created_by, title = excluded.title, notes = excluded.notes`,
-		[region.id, region.streamId, region.startTime, region.endTime, region.createdBy ?? 'human', region.title ?? null, region.notes ?? null]
+		[
+			region.id,
+			region.streamId,
+			region.startTime,
+			region.endTime,
+			region.createdBy ?? 'human',
+			region.title ?? null,
+			region.notes ?? null
+		]
 	);
 }
 
@@ -602,7 +651,9 @@ export function deleteClipRegion(id: string): void {
 
 export function loadAllClipRegions(): ClipRegion[] {
 	const d = getDb();
-	const rows = d.query('SELECT id, stream_id, start_time, end_time, created_by, title, notes FROM clip_regions').all() as ClipRow[];
+	const rows = d
+		.query('SELECT id, stream_id, start_time, end_time, created_by, title, notes FROM clip_regions')
+		.all() as ClipRow[];
 	return rows.map((r) => ({
 		id: r.id,
 		streamId: r.stream_id,
@@ -629,14 +680,17 @@ export function removeIgnoredChannel(login: string): void {
 export function loadIgnoredChannels(): string[] {
 	const d = getDb();
 	const rows = d.query('SELECT login FROM ignored_channels ORDER BY ignored_at').all() as { login: string }[];
-	return rows.map(r => r.login);
+	return rows.map((r) => r.login);
 }
 
 // --- Channel Settings ---
 
 export function getChannelSettings(login: string): { login: string; language: string | null } | null {
 	const d = getDb();
-	const row = d.query('SELECT login, language FROM channel_settings WHERE login = ?').get(login.toLowerCase()) as { login: string; language: string | null } | null;
+	const row = d.query('SELECT login, language FROM channel_settings WHERE login = ?').get(login.toLowerCase()) as {
+		login: string;
+		language: string | null;
+	} | null;
 	return row ?? null;
 }
 
@@ -651,7 +705,10 @@ export function saveChannelSettings(login: string, language: string | null): voi
 
 export function loadAllChannelSettings(): { login: string; language: string | null }[] {
 	const d = getDb();
-	const rows = d.query('SELECT login, language FROM channel_settings ORDER BY login').all() as { login: string; language: string | null }[];
+	const rows = d.query('SELECT login, language FROM channel_settings ORDER BY login').all() as {
+		login: string;
+		language: string | null;
+	}[];
 	return rows;
 }
 
@@ -659,7 +716,10 @@ export function loadAllChannelSettings(): { login: string; language: string | nu
 
 export function loadWatchlist(): Array<{ login: string; platform: string }> {
 	const d = getDb();
-	const rows = d.query('SELECT login, platform FROM watchlist ORDER BY added_at').all() as { login: string; platform: string }[];
+	const rows = d.query('SELECT login, platform FROM watchlist ORDER BY added_at').all() as {
+		login: string;
+		platform: string;
+	}[];
 	return rows;
 }
 
@@ -701,7 +761,7 @@ export function updateExportStatus(
 	error?: string
 ): void {
 	const d = getDb();
-	const completedAt = (status === 'ready' || status === 'error') ? Math.floor(Date.now() / 1000) : null;
+	const completedAt = status === 'ready' || status === 'error' ? Math.floor(Date.now() / 1000) : null;
 	d.run(
 		`UPDATE exports SET status = ?, output_path = COALESCE(?, output_path), error = ?, completed_at = COALESCE(?, completed_at) WHERE id = ?`,
 		[status, outputPath ?? null, error ?? null, completedAt, id]

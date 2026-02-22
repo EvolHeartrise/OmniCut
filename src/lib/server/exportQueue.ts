@@ -22,11 +22,7 @@ let activeExport: { exportId: string } | null = null;
  * Create and enqueue a new export. Returns the ExportRecord.
  * Validates that all clip IDs exist before creating.
  */
-export function createAndQueueExport(
-	clipIds: string[],
-	title: string,
-	description?: string
-): ExportRecord {
+export function createAndQueueExport(clipIds: string[], title: string, description?: string): ExportRecord {
 	// Validate all clip IDs exist
 	const missing: string[] = [];
 	for (const clipId of clipIds) {
@@ -113,9 +109,7 @@ async function runExport(exportId: string): Promise<void> {
 	activeExport = { exportId };
 
 	// Resolve clip IDs → ClipRegion objects, preserving caller-specified order
-	const clips = record.clipIds
-		.map((id) => getClipRegion(id))
-		.filter((c) => c !== undefined);
+	const clips = record.clipIds.map((id) => getClipRegion(id)).filter((c) => c !== undefined);
 
 	if (clips.length === 0) {
 		db.updateExportStatus(exportId, 'error', undefined, 'No valid clips found');
@@ -133,13 +127,9 @@ async function runExport(exportId: string): Promise<void> {
 	const safeName = record.title.replace(/[<>:"/\\|?*]/g, '_').slice(0, 100);
 
 	try {
-		const { outputPath } = await exportVideo(
-			clips,
-			safeName,
-			(_message, _step, _totalSteps) => {
-				// Progress is already broadcast by exporter via broadcastExportProgress
-			}
-		);
+		const { outputPath } = await exportVideo(clips, safeName, (_message, _step, _totalSteps) => {
+			// Progress is already broadcast by exporter via broadcastExportProgress
+		});
 
 		db.updateExportStatus(exportId, 'ready', outputPath);
 		broadcastExportStatus(exportId, 'ready', outputPath);

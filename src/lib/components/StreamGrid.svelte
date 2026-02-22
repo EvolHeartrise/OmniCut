@@ -1,6 +1,13 @@
 <script lang="ts">
 	import StreamTile from './StreamTile.svelte';
-	import { streams, focusedStreamId, soloStreamId, masterTime, syncOffsets, streamPlaybackStates } from '$lib/stores/streams.js';
+	import {
+		streams,
+		focusedStreamId,
+		soloStreamId,
+		masterTime,
+		syncOffsets,
+		streamPlaybackStates
+	} from '$lib/stores/streams.js';
 	import { trackKeyFor } from '$lib/utils.js';
 
 	let activeStreams = $derived($streams);
@@ -138,7 +145,11 @@
 			class:is-focused={stream.id === focused && hasFocus}
 			class:is-sidebar={hasFocus && stream.id !== focused}
 		>
-			<StreamTile {stream} focused={isSolo || (stream.id === focused && hasFocus)} trackNumber={trackKeys.indexOf(trackKeyFor(stream)) + 1} />
+			<StreamTile
+				{stream}
+				focused={isSolo || (stream.id === focused && hasFocus)}
+				trackNumber={trackKeys.indexOf(trackKeyFor(stream)) + 1}
+			/>
 		</div>
 	{/each}
 

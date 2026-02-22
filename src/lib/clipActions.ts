@@ -25,11 +25,7 @@ export function splitClipRegion(
 		endTime: clip.endTime
 	};
 
-	clipRegions.update((regions) => [
-		...regions.filter((r) => r.id !== clip.id),
-		firstHalf,
-		secondHalf
-	]);
+	clipRegions.update((regions) => [...regions.filter((r) => r.id !== clip.id), firstHalf, secondHalf]);
 	deleteClipRegion(clip.id);
 	saveClipRegion(firstHalf);
 	saveClipRegion(secondHalf);

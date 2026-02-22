@@ -3,10 +3,10 @@ export interface ClipRegion {
 	id: string;
 	streamId: string;
 	startTime: number; // master time (epoch seconds)
-	endTime: number;   // master time (epoch seconds)
+	endTime: number; // master time (epoch seconds)
 	createdBy?: 'human' | 'ai'; // who created this clip (default: human)
-	title?: string;    // short clip label
-	notes?: string;    // longer description/context
+	title?: string; // short clip label
+	notes?: string; // longer description/context
 }
 
 /** VOD info returned by the channel vods API. */

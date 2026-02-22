@@ -51,11 +51,21 @@ export function createPanelQueryState() {
 
 	$effect(() => {
 		const unsubs = [
-			masterTime.subscribe((v) => { currentMasterTime = v; }),
-			streams.subscribe((v) => { currentStreams = v; }),
-			syncOffsets.subscribe((v) => { currentOffsets = v; }),
-			focusedStreamId.subscribe((v) => { currentFocused = v; }),
-			soloStreamId.subscribe((v) => { currentSolo = v; })
+			masterTime.subscribe((v) => {
+				currentMasterTime = v;
+			}),
+			streams.subscribe((v) => {
+				currentStreams = v;
+			}),
+			syncOffsets.subscribe((v) => {
+				currentOffsets = v;
+			}),
+			focusedStreamId.subscribe((v) => {
+				currentFocused = v;
+			}),
+			soloStreamId.subscribe((v) => {
+				currentSolo = v;
+			})
 		];
 		return () => unsubs.forEach((u) => u());
 	});
@@ -97,7 +107,11 @@ export function createPanelQueryState() {
 	);
 
 	return {
-		get visibleStreams() { return visibleStreams; },
-		get ranges() { return ranges; }
+		get visibleStreams() {
+			return visibleStreams;
+		},
+		get ranges() {
+			return ranges;
+		}
 	};
 }

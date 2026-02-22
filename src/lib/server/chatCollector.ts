@@ -123,7 +123,9 @@ export function startChatCollection(
 		if (ws) {
 			try {
 				ws.close();
-			} catch { /* already closed */ }
+			} catch {
+				/* already closed */
+			}
 			ws = null;
 		}
 		console.log(`[chat:${channel}] Chat collection stopped`);

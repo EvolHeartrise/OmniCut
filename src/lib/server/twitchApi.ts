@@ -168,9 +168,26 @@ export async function fetchTwitchChannel(login: string): Promise<ChannelInfo> {
 		const data = await twitchGql<{ data?: { user?: Record<string, unknown> } }>(CHANNEL_LOOKUP_GQL, { login });
 		const user = data?.data?.user;
 		if (!user) {
-			return { login, displayName: null, profileImageUrl: null, isLive: false, title: null, gameName: null, viewerCount: null, startedAt: null, hasVod: false, platform: 'twitch' };
+			return {
+				login,
+				displayName: null,
+				profileImageUrl: null,
+				isLive: false,
+				title: null,
+				gameName: null,
+				viewerCount: null,
+				startedAt: null,
+				hasVod: false,
+				platform: 'twitch'
+			};
 		}
-		const stream = user.stream as { viewersCount?: number; title?: string; game?: { name: string }; createdAt?: string; archiveVideo?: { id: string } } | null;
+		const stream = user.stream as {
+			viewersCount?: number;
+			title?: string;
+			game?: { name: string };
+			createdAt?: string;
+			archiveVideo?: { id: string };
+		} | null;
 		return {
 			login,
 			displayName: (user.displayName as string) ?? null,
@@ -184,7 +201,18 @@ export async function fetchTwitchChannel(login: string): Promise<ChannelInfo> {
 			platform: 'twitch'
 		};
 	} catch {
-		return { login, displayName: null, profileImageUrl: null, isLive: false, title: null, gameName: null, viewerCount: null, startedAt: null, hasVod: false, platform: 'twitch' };
+		return {
+			login,
+			displayName: null,
+			profileImageUrl: null,
+			isLive: false,
+			title: null,
+			gameName: null,
+			viewerCount: null,
+			startedAt: null,
+			hasVod: false,
+			platform: 'twitch'
+		};
 	}
 }
 
@@ -195,7 +223,18 @@ export async function fetchDouyuChannel(roomId: string): Promise<ChannelInfo> {
 		const data = await res.json();
 		const room = data?.data;
 		if (!room) {
-			return { login: roomId, displayName: null, profileImageUrl: null, isLive: false, title: null, gameName: null, viewerCount: null, startedAt: null, hasVod: false, platform: 'douyu' };
+			return {
+				login: roomId,
+				displayName: null,
+				profileImageUrl: null,
+				isLive: false,
+				title: null,
+				gameName: null,
+				viewerCount: null,
+				startedAt: null,
+				hasVod: false,
+				platform: 'douyu'
+			};
 		}
 		const isLive = String(room.room_status) === '1';
 		return {
@@ -211,7 +250,18 @@ export async function fetchDouyuChannel(roomId: string): Promise<ChannelInfo> {
 			platform: 'douyu'
 		};
 	} catch {
-		return { login: roomId, displayName: null, profileImageUrl: null, isLive: false, title: null, gameName: null, viewerCount: null, startedAt: null, hasVod: false, platform: 'douyu' };
+		return {
+			login: roomId,
+			displayName: null,
+			profileImageUrl: null,
+			isLive: false,
+			title: null,
+			gameName: null,
+			viewerCount: null,
+			startedAt: null,
+			hasVod: false,
+			platform: 'douyu'
+		};
 	}
 }
 

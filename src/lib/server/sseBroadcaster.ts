@@ -86,7 +86,13 @@ export function broadcastUpdate(info: StreamInfo) {
 	broadcast(payload);
 }
 
-export function broadcastTranscription(streamId: string, text: string, startTime: number, endTime: number, words?: WordTimestamp[]) {
+export function broadcastTranscription(
+	streamId: string,
+	text: string,
+	startTime: number,
+	endTime: number,
+	words?: WordTimestamp[]
+) {
 	db.saveTranscription(streamId, text, startTime, endTime, words);
 	transcriptionCounts.set(streamId, (transcriptionCounts.get(streamId) ?? 0) + 1);
 	broadcast(JSON.stringify({ type: 'transcription', streamId, text, startTime, endTime }));
@@ -119,14 +125,36 @@ export function broadcastTranscriptionCleared(streamId: string) {
 	broadcast(JSON.stringify({ type: 'transcription-cleared', streamId }));
 }
 
-export function broadcastClipRegionsChanged(clipRegions: Array<{ id: string; streamId: string; startTime: number; endTime: number; createdBy?: string; title?: string; notes?: string }>) {
+export function broadcastClipRegionsChanged(
+	clipRegions: Array<{
+		id: string;
+		streamId: string;
+		startTime: number;
+		endTime: number;
+		createdBy?: string;
+		title?: string;
+		notes?: string;
+	}>
+) {
 	broadcast(JSON.stringify({ type: 'clip-regions-changed', clipRegions }));
 }
 
-export function broadcastClipEncodeStatus(clipId: string, status: 'pending' | 'encoding' | 'ready' | 'error', error?: string) {
+export function broadcastClipEncodeStatus(
+	clipId: string,
+	status: 'pending' | 'encoding' | 'ready' | 'error',
+	error?: string
+) {
 	broadcast(JSON.stringify({ type: 'clip-encode-status', clipId, status, ...(error && { error }) }));
 }
 
 export function broadcastExportStatus(exportId: string, status: string, outputPath?: string, error?: string) {
-	broadcast(JSON.stringify({ type: 'export-status', exportId, status, ...(outputPath && { outputPath }), ...(error && { error }) }));
+	broadcast(
+		JSON.stringify({
+			type: 'export-status',
+			exportId,
+			status,
+			...(outputPath && { outputPath }),
+			...(error && { error })
+		})
+	);
 }

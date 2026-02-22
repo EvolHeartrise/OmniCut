@@ -14,7 +14,10 @@
 	} from '$lib/streams.remote.js';
 
 	type Platform = 'twitch' | 'douyu';
-	interface WatchlistEntry { login: string; platform: Platform; }
+	interface WatchlistEntry {
+		login: string;
+		platform: Platform;
+	}
 
 	const LEGACY_STORAGE_KEY = 'omni-channel-history';
 	const POLL_INTERVAL = 30_000;
@@ -38,7 +41,7 @@
 		{ code: 'tr', label: 'Turkish', badge: 'TR' },
 		{ code: 'pl', label: 'Polish', badge: 'PL' },
 		{ code: 'uk', label: 'Ukrainian', badge: 'UK' },
-		{ code: 'hi', label: 'Hindi', badge: 'HI' },
+		{ code: 'hi', label: 'Hindi', badge: 'HI' }
 	];
 
 	let channelInput = $state('');
@@ -52,15 +55,8 @@
 
 	// Detect input type: VOD URL, Douyu URL/room, or Twitch channel
 	let isVodInput = $derived(!!channelInput.match(/(?:twitch\.tv\/videos\/|^)(\d{8,})\b/));
-	let isDouyuInput = $derived(
-		!!channelInput.match(/douyu\.com\/(\d+)/) ||
-		!!channelInput.match(/^\d{6,7}$/)
-	);
-	let inputPrefix = $derived(
-		isVodInput ? 'twitch.tv/videos/' :
-		isDouyuInput ? 'douyu.com/' :
-		'twitch.tv/'
-	);
+	let isDouyuInput = $derived(!!channelInput.match(/douyu\.com\/(\d+)/) || !!channelInput.match(/^\d{6,7}$/));
+	let inputPrefix = $derived(isVodInput ? 'twitch.tv/videos/' : isDouyuInput ? 'douyu.com/' : 'twitch.tv/');
 
 	// Channel language settings (login → language code or null)
 	let channelSettings = $state(new Map<string, string | null>());
@@ -69,10 +65,14 @@
 
 	// Set of channel logins currently being captured (live and vod separately)
 	let capturingLogins = $derived(
-		new Set($streams.filter(s => s.sourceType === 'live' && s.status !== 'stopped').map(s => s.channel.toLowerCase()))
+		new Set(
+			$streams.filter((s) => s.sourceType === 'live' && s.status !== 'stopped').map((s) => s.channel.toLowerCase())
+		)
 	);
 	let capturingVodLogins = $derived(
-		new Set($streams.filter(s => s.sourceType === 'vod' && s.status !== 'stopped').map(s => s.channel.toLowerCase()))
+		new Set(
+			$streams.filter((s) => s.sourceType === 'vod' && s.status !== 'stopped').map((s) => s.channel.toLowerCase())
+		)
 	);
 
 	// --- VOD browser state ---
@@ -83,12 +83,17 @@
 	let vodsHasMore = $state(false);
 
 	// Set of already-added VOD IDs (from sourceUrl)
-	let addedVodIds = $derived(new Set(
-		$streams
-			.filter(s => s.sourceType === 'vod' && s.sourceUrl)
-			.map(s => { const m = s.sourceUrl!.match(/videos\/(\d+)/); return m?.[1]; })
-			.filter(Boolean) as string[]
-	));
+	let addedVodIds = $derived(
+		new Set(
+			$streams
+				.filter((s) => s.sourceType === 'vod' && s.sourceUrl)
+				.map((s) => {
+					const m = s.sourceUrl!.match(/videos\/(\d+)/);
+					return m?.[1];
+				})
+				.filter(Boolean) as string[]
+		)
+	);
 
 	// Sorted channel list: live+capturing first, then live+available, then offline
 	let sortedChannels = $derived.by(() => {
@@ -122,7 +127,7 @@
 	async function addToWatchlist(channel: string, platform: Platform = 'twitch') {
 		const lower = channel.toLowerCase().trim();
 		if (!lower) return;
-		if (watchlist.some(w => w.login === lower && w.platform === platform)) return;
+		if (watchlist.some((w) => w.login === lower && w.platform === platform)) return;
 		try {
 			await addToWatchlistCmd({ login: lower, platform });
 			watchlist = [...watchlist, { login: lower, platform }];
@@ -135,8 +140,8 @@
 	async function removeFromWatchlist(login: string, platform: Platform) {
 		try {
 			await removeFromWatchlistCmd({ login, platform });
-			watchlist = watchlist.filter(w => !(w.login === login && w.platform === platform));
-			channelData = channelData.filter(c => !(c.login === login && c.platform === platform));
+			watchlist = watchlist.filter((w) => !(w.login === login && w.platform === platform));
+			channelData = channelData.filter((c) => !(c.login === login && c.platform === platform));
 		} catch (err) {
 			console.error('Failed to remove from watchlist:', err);
 		}
@@ -208,7 +213,7 @@
 	function getLanguageBadge(login: string): string {
 		const lang = channelSettings.get(login);
 		if (!lang) return '';
-		const opt = LANGUAGE_OPTIONS.find(o => o.code === lang);
+		const opt = LANGUAGE_OPTIONS.find((o) => o.code === lang);
 		return opt?.badge || lang.toUpperCase();
 	}
 
@@ -304,7 +309,7 @@
 		loading = true;
 		error = '';
 		try {
-			const lang = expandedVodsLogin ? (channelSettings.get(expandedVodsLogin) || undefined) : undefined;
+			const lang = expandedVodsLogin ? channelSettings.get(expandedVodsLogin) || undefined : undefined;
 			await addStream('_vod', { vodUrl: `https://twitch.tv/videos/${vodId}`, language: lang });
 		} catch (err) {
 			error = err instanceof Error ? err.message : 'Failed to add VOD';
@@ -312,7 +317,6 @@
 			loading = false;
 		}
 	}
-
 
 	function formatDate(iso: string | null): string {
 		if (!iso) return '';
@@ -379,9 +383,9 @@
 				return;
 			}
 			// Add each to server as Twitch
-			await Promise.all(old.map(login =>
-				addToWatchlistCmd({ login: login.toLowerCase().trim(), platform: 'twitch' })
-			));
+			await Promise.all(
+				old.map((login) => addToWatchlistCmd({ login: login.toLowerCase().trim(), platform: 'twitch' }))
+			);
 			localStorage.removeItem(LEGACY_STORAGE_KEY);
 		} catch {
 			// Non-fatal — keep localStorage for next attempt
@@ -394,7 +398,9 @@
 		fetchChannelData();
 		fetchChannelSettings();
 		pollTimer = setInterval(fetchChannelData, POLL_INTERVAL);
-		tickTimer = setInterval(() => { now = Date.now(); }, 10_000);
+		tickTimer = setInterval(() => {
+			now = Date.now();
+		}, 10_000);
 		window.addEventListener('watchlist-add', handleWatchlistAdd);
 	});
 
@@ -417,11 +423,7 @@
 			placeholder="channel name or VOD URL"
 			class="channel-input"
 		/>
-		<button
-			onclick={handleSubmit}
-			disabled={!channelInput.trim() || loading}
-			class="add-btn"
-		>
+		<button onclick={handleSubmit} disabled={!channelInput.trim() || loading} class="add-btn">
 			{isVodInput ? '+ Add VOD' : isDouyuInput ? '+ Add DY' : '+ Add'}
 		</button>
 	</div>
@@ -436,11 +438,7 @@
 				{@const isCapturing = capturingLogins.has(channel.login.toLowerCase())}
 				{@const isVodCapturing = capturingVodLogins.has(channel.login.toLowerCase())}
 				{@const langBadge = getLanguageBadge(channel.login)}
-				<div
-					class="channel-row"
-					class:offline={!channel.isLive}
-					class:capturing={isCapturing}
-				>
+				<div class="channel-row" class:offline={!channel.isLive} class:capturing={isCapturing}>
 					<div class="channel-pfp">
 						{#if channel.profileImageUrl}
 							<img src={channel.profileImageUrl} alt="" class="pfp-img" />
@@ -487,46 +485,44 @@
 						</div>
 
 						<div class="capture-actions">
-							<button
-								class="capture-btn"
-								disabled={isCapturing || loading}
-								onclick={() => handleAddStream(channel)}
-							>Stream</button>
+							<button class="capture-btn" disabled={isCapturing || loading} onclick={() => handleAddStream(channel)}
+								>Stream</button
+							>
 							{#if channel.hasVod}
 								<button
 									class="capture-btn vod"
 									disabled={isVodCapturing || loading}
-									onclick={() => handleAddVod(channel)}
-								>VOD</button>
+									onclick={() => handleAddVod(channel)}>VOD</button
+								>
 							{/if}
 						</div>
 					{/if}
 
 					{#if channel.platform === 'twitch'}
-					<button
-						class="vods-btn"
-						class:active={expandedVodsLogin === channel.login}
-						onclick={() => toggleVodBrowser(channel.login)}
-						title="Browse past VODs"
-					>VODs</button>
-				{/if}
+						<button
+							class="vods-btn"
+							class:active={expandedVodsLogin === channel.login}
+							onclick={() => toggleVodBrowser(channel.login)}
+							title="Browse past VODs">VODs</button
+						>
+					{/if}
 
-				<button
-						class="settings-btn"
-						onclick={() => openSettingsModal(channel.login)}
-						title="Language settings"
-					>
+					<button class="settings-btn" onclick={() => openSettingsModal(channel.login)} title="Language settings">
 						<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
-							<path d="M8 4.754a3.246 3.246 0 1 0 0 6.492 3.246 3.246 0 0 0 0-6.492zM5.754 8a2.246 2.246 0 1 1 4.492 0 2.246 2.246 0 0 1-4.492 0z"/>
-							<path d="M9.796 1.343c-.527-1.79-3.065-1.79-3.592 0l-.094.319a.873.873 0 0 1-1.255.52l-.292-.16c-1.64-.892-3.433.902-2.54 2.541l.159.292a.873.873 0 0 1-.52 1.255l-.319.094c-1.79.527-1.79 3.065 0 3.592l.319.094a.873.873 0 0 1 .52 1.255l-.16.292c-.892 1.64.901 3.434 2.541 2.54l.292-.159a.873.873 0 0 1 1.255.52l.094.319c.527 1.79 3.065 1.79 3.592 0l.094-.319a.873.873 0 0 1 1.255-.52l.292.16c1.64.893 3.434-.902 2.54-2.541l-.159-.292a.873.873 0 0 1 .52-1.255l.319-.094c1.79-.527 1.79-3.065 0-3.592l-.319-.094a.873.873 0 0 1-.52-1.255l.16-.292c.893-1.64-.902-3.433-2.541-2.54l-.292.159a.873.873 0 0 1-1.255-.52l-.094-.319zm-2.633.283c.246-.835 1.428-.835 1.674 0l.094.319a1.873 1.873 0 0 0 2.693 1.115l.291-.16c.764-.415 1.6.42 1.184 1.185l-.159.292a1.873 1.873 0 0 0 1.116 2.692l.318.094c.835.246.835 1.428 0 1.674l-.319.094a1.873 1.873 0 0 0-1.115 2.693l.16.291c.415.764-.421 1.6-1.185 1.184l-.291-.159a1.873 1.873 0 0 0-2.693 1.116l-.094.318c-.246.835-1.428.835-1.674 0l-.094-.319a1.873 1.873 0 0 0-2.692-1.115l-.292.16c-.764.415-1.6-.421-1.184-1.185l.159-.291A1.873 1.873 0 0 0 1.945 8.93l-.319-.094c-.835-.246-.835-1.428 0-1.674l.319-.094A1.873 1.873 0 0 0 3.06 4.377l-.16-.292c-.415-.764.42-1.6 1.185-1.184l.292.159a1.873 1.873 0 0 0 2.692-1.115l.094-.319z"/>
+							<path
+								d="M8 4.754a3.246 3.246 0 1 0 0 6.492 3.246 3.246 0 0 0 0-6.492zM5.754 8a2.246 2.246 0 1 1 4.492 0 2.246 2.246 0 0 1-4.492 0z"
+							/>
+							<path
+								d="M9.796 1.343c-.527-1.79-3.065-1.79-3.592 0l-.094.319a.873.873 0 0 1-1.255.52l-.292-.16c-1.64-.892-3.433.902-2.54 2.541l.159.292a.873.873 0 0 1-.52 1.255l-.319.094c-1.79.527-1.79 3.065 0 3.592l.319.094a.873.873 0 0 1 .52 1.255l-.16.292c-.892 1.64.901 3.434 2.541 2.54l.292-.159a.873.873 0 0 1 1.255.52l.094.319c.527 1.79 3.065 1.79 3.592 0l.094-.319a.873.873 0 0 1 1.255-.52l.292.16c1.64.893 3.434-.902 2.54-2.541l-.159-.292a.873.873 0 0 1 .52-1.255l.319-.094c1.79-.527 1.79-3.065 0-3.592l-.319-.094a.873.873 0 0 1-.52-1.255l.16-.292c.893-1.64-.902-3.433-2.541-2.54l-.292.159a.873.873 0 0 1-1.255-.52l-.094-.319zm-2.633.283c.246-.835 1.428-.835 1.674 0l.094.319a1.873 1.873 0 0 0 2.693 1.115l.291-.16c.764-.415 1.6.42 1.184 1.185l-.159.292a1.873 1.873 0 0 0 1.116 2.692l.318.094c.835.246.835 1.428 0 1.674l-.319.094a1.873 1.873 0 0 0-1.115 2.693l.16.291c.415.764-.421 1.6-1.185 1.184l-.291-.159a1.873 1.873 0 0 0-2.693 1.116l-.094.318c-.246.835-1.428.835-1.674 0l-.094-.319a1.873 1.873 0 0 0-2.692-1.115l-.292.16c-.764.415-1.6-.421-1.184-1.185l.159-.291A1.873 1.873 0 0 0 1.945 8.93l-.319-.094c-.835-.246-.835-1.428 0-1.674l.319-.094A1.873 1.873 0 0 0 3.06 4.377l-.16-.292c-.415-.764.42-1.6 1.185-1.184l.292.159a1.873 1.873 0 0 0 2.692-1.115l.094-.319z"
+							/>
 						</svg>
 					</button>
 
 					<button
 						class="remove-btn"
 						onclick={() => removeFromWatchlist(channel.login, channel.platform)}
-						title="Remove from watchlist"
-					>&times;</button>
+						title="Remove from watchlist">&times;</button
+					>
 				</div>
 
 				{#if expandedVodsLogin === channel.login}
@@ -552,11 +548,9 @@
 											{#if vod.viewCount != null}&nbsp;&middot; {formatVodViews(vod.viewCount)} views{/if}
 										</span>
 									</div>
-									<button
-										class="vod-add-btn"
-										disabled={isAdded || loading}
-										onclick={() => handleAddVodById(vod.id)}
-									>{isAdded ? 'Added' : '+ Add'}</button>
+									<button class="vod-add-btn" disabled={isAdded || loading} onclick={() => handleAddVodById(vod.id)}
+										>{isAdded ? 'Added' : '+ Add'}</button
+									>
 								</div>
 							{/each}
 							{#if vodsHasMore}
@@ -564,7 +558,8 @@
 									class="vod-load-more"
 									disabled={vodsLoading}
 									onclick={() => fetchVods(channel.login, vodsCursor ?? undefined)}
-								>{vodsLoading ? 'Loading...' : 'Load more'}</button>
+									>{vodsLoading ? 'Loading...' : 'Load more'}</button
+								>
 							{/if}
 						{/if}
 					</div>
@@ -575,10 +570,15 @@
 </div>
 
 {#if settingsModalLogin}
-	{@const modalChannel = channelData.find(c => c.login === settingsModalLogin)}
+	{@const modalChannel = channelData.find((c) => c.login === settingsModalLogin)}
 	<!-- svelte-ignore a11y_click_events_have_key_events -->
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div class="modal-backdrop" onclick={() => { settingsModalLogin = null; }}>
+	<div
+		class="modal-backdrop"
+		onclick={() => {
+			settingsModalLogin = null;
+		}}
+	>
 		<!-- svelte-ignore a11y_click_events_have_key_events -->
 		<!-- svelte-ignore a11y_no_static_element_interactions -->
 		<div class="modal-panel" onclick={(e) => e.stopPropagation()}>
@@ -596,12 +596,16 @@
 			</label>
 
 			<p class="modal-hint">
-				Non-English languages will be auto-translated to English.
-				Changes apply to new captures only.
+				Non-English languages will be auto-translated to English. Changes apply to new captures only.
 			</p>
 
 			<div class="modal-actions">
-				<button class="modal-btn cancel" onclick={() => { settingsModalLogin = null; }}>Cancel</button>
+				<button
+					class="modal-btn cancel"
+					onclick={() => {
+						settingsModalLogin = null;
+					}}>Cancel</button
+				>
 				<button class="modal-btn save" onclick={saveSettings}>Save</button>
 			</div>
 		</div>
@@ -855,7 +859,9 @@
 		font-weight: 600;
 		cursor: pointer;
 		white-space: nowrap;
-		transition: background 0.15s, opacity 0.15s;
+		transition:
+			background 0.15s,
+			opacity 0.15s;
 	}
 
 	.capture-btn:hover:not(:disabled) {

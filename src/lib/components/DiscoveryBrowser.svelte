@@ -14,7 +14,6 @@
 	const STORAGE_KEY = 'omni-discovery-categories';
 	const VIEWER_STORAGE_KEY = 'omni-discovery-viewers';
 
-
 	type FilterMode = 'include' | 'exclude';
 	interface CategoryFilter {
 		name: string;
@@ -57,41 +56,42 @@
 	let viewerMax = $state('');
 
 	let capturingLogins = $derived(
-		new Set($streams.filter(s => s.sourceType === 'live' && s.status !== 'stopped').map(s => s.channel.toLowerCase()))
+		new Set(
+			$streams.filter((s) => s.sourceType === 'live' && s.status !== 'stopped').map((s) => s.channel.toLowerCase())
+		)
 	);
 
-	let includeCategories = $derived(categories.filter(c => c.mode === 'include'));
-	let excludeCategories = $derived(categories.filter(c => c.mode === 'exclude'));
+	let includeCategories = $derived(categories.filter((c) => c.mode === 'include'));
+	let excludeCategories = $derived(categories.filter((c) => c.mode === 'exclude'));
 
 	let parsedViewerMin = $derived(viewerMin ? parseInt(viewerMin, 10) : null);
 	let parsedViewerMax = $derived(viewerMax ? parseInt(viewerMax, 10) : null);
 
 	let hasViewerFilter = $derived(
-		(parsedViewerMin != null && !isNaN(parsedViewerMin)) ||
-		(parsedViewerMax != null && !isNaN(parsedViewerMax))
+		(parsedViewerMin != null && !isNaN(parsedViewerMin)) || (parsedViewerMax != null && !isNaN(parsedViewerMax))
 	);
 
 	let displayStreams = $derived.by(() => {
 		let result = allStreams;
 
 		// Filter out ignored and watchlisted channels
-		result = result.filter(s => {
+		result = result.filter((s) => {
 			const login = s.login.toLowerCase();
 			return !ignoredLogins.has(login) && !watchlistLogins.has(login);
 		});
 
 		if (excludeCategories.length > 0) {
-			const excludeNames = new Set(excludeCategories.map(c => c.name.toLowerCase()));
-			result = result.filter(s => !s.gameName || !excludeNames.has(s.gameName.toLowerCase()));
+			const excludeNames = new Set(excludeCategories.map((c) => c.name.toLowerCase()));
+			result = result.filter((s) => !s.gameName || !excludeNames.has(s.gameName.toLowerCase()));
 		}
 
 		const min = parsedViewerMin;
 		const max = parsedViewerMax;
 		if (min != null && !isNaN(min)) {
-			result = result.filter(s => (s.viewerCount ?? 0) >= min);
+			result = result.filter((s) => (s.viewerCount ?? 0) >= min);
 		}
 		if (max != null && !isNaN(max)) {
-			result = result.filter(s => (s.viewerCount ?? 0) <= max);
+			result = result.filter((s) => (s.viewerCount ?? 0) <= max);
 		}
 
 		result.sort((a, b) => (b.viewerCount ?? 0) - (a.viewerCount ?? 0));
@@ -112,14 +112,21 @@
 	});
 
 	$effect(() => {
-		const shouldBackfill = !loading && !loadingMore && !backfilling
-			&& hasViewerFilter && hasMore
-			&& allStreams.length > 0 && displayStreams.length < 5
-			&& backfillAttempts < MAX_BACKFILL;
+		const shouldBackfill =
+			!loading &&
+			!loadingMore &&
+			!backfilling &&
+			hasViewerFilter &&
+			hasMore &&
+			allStreams.length > 0 &&
+			displayStreams.length < 5 &&
+			backfillAttempts < MAX_BACKFILL;
 		if (shouldBackfill) {
 			backfilling = true;
 			backfillAttempts++;
-			loadMore().finally(() => { backfilling = false; });
+			loadMore().finally(() => {
+				backfilling = false;
+			});
 		}
 	});
 
@@ -132,7 +139,7 @@
 	}
 
 	function addCategoryFromSuggestion(suggestion: CategorySuggestion) {
-		if (categories.some(c => c.id === suggestion.id && c.mode === filterMode)) return;
+		if (categories.some((c) => c.id === suggestion.id && c.mode === filterMode)) return;
 		categories = [...categories, { name: suggestion.name, id: suggestion.id, mode: filterMode }];
 		categoryInput = '';
 		suggestions = [];
@@ -205,14 +212,19 @@
 
 	function handleInputBlur() {
 		// Delay to allow click on suggestion
-		setTimeout(() => { showSuggestions = false; }, 150);
+		setTimeout(() => {
+			showSuggestions = false;
+		}, 150);
 	}
 
 	function handleViewerChange() {
 		saveViewerRange();
 	}
 
-	async function fetchBrowse(gameId?: string, after?: string): Promise<{ streams: ChannelInfo[]; cursor: string | null; hasNextPage: boolean }> {
+	async function fetchBrowse(
+		gameId?: string,
+		after?: string
+	): Promise<{ streams: ChannelInfo[]; cursor: string | null; hasNextPage: boolean }> {
 		return browseStreams({ gameId, after });
 	}
 
@@ -227,9 +239,7 @@
 				hasMore = data.hasNextPage;
 				if (data.cursor) cursors.set('__all__', data.cursor);
 			} else {
-				const results = await Promise.all(
-					includeCategories.map(c => fetchBrowse(c.id))
-				);
+				const results = await Promise.all(includeCategories.map((c) => fetchBrowse(c.id)));
 				const seen = new Set<string>();
 				const merged: ChannelInfo[] = [];
 				const newCursors = new Map<string, string | null>();
@@ -266,16 +276,16 @@
 			if (includeCategories.length === 0) {
 				const after = cursors.get('__all__') ?? undefined;
 				const data = await fetchBrowse(undefined, after);
-				const seen = new Set(allStreams.map(s => s.login));
-				const newStreams = data.streams.filter(s => !seen.has(s.login));
+				const seen = new Set(allStreams.map((s) => s.login));
+				const newStreams = data.streams.filter((s) => !seen.has(s.login));
 				allStreams = [...allStreams, ...newStreams];
 				hasMore = data.hasNextPage;
 				if (data.cursor) cursors.set('__all__', data.cursor);
 			} else {
 				const results = await Promise.all(
-					includeCategories.map(c => fetchBrowse(c.id, cursors.get(c.id) ?? undefined))
+					includeCategories.map((c) => fetchBrowse(c.id, cursors.get(c.id) ?? undefined))
 				);
-				const seen = new Set(allStreams.map(s => s.login));
+				const seen = new Set(allStreams.map((s) => s.login));
 				const newStreams: ChannelInfo[] = [];
 				let anyHasMore = false;
 
@@ -316,27 +326,37 @@
 			await ignoreChannelCmd({ login });
 		} catch {
 			// Revert on failure
-			ignoredLogins = new Set([...ignoredLogins].filter(l => l !== login));
+			ignoredLogins = new Set([...ignoredLogins].filter((l) => l !== login));
 		}
 	}
 
 	onMount(() => {
 		try {
 			categories = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
-		} catch { categories = []; }
+		} catch {
+			categories = [];
+		}
 		try {
 			const saved = JSON.parse(localStorage.getItem(VIEWER_STORAGE_KEY) || '{}');
 			viewerMin = saved.min ?? '';
 			viewerMax = saved.max ?? '';
-		} catch { /* ignore */ }
-		getWatchlist().then(d => {
-			watchlistLogins = new Set((d.watchlist ?? []).map((e: { login: string }) => e.login));
-		}).catch(() => {});
-		getIgnoredChannels().then(d => {
-			ignoredLogins = new Set(d.channels ?? []);
-		}).catch(() => {});
+		} catch {
+			/* ignore */
+		}
+		getWatchlist()
+			.then((d) => {
+				watchlistLogins = new Set((d.watchlist ?? []).map((e: { login: string }) => e.login));
+			})
+			.catch(() => {});
+		getIgnoredChannels()
+			.then((d) => {
+				ignoredLogins = new Set(d.channels ?? []);
+			})
+			.catch(() => {});
 		fetchStreams();
-		tickTimer = setInterval(() => { now = Date.now(); }, 10_000);
+		tickTimer = setInterval(() => {
+			now = Date.now();
+		}, 10_000);
 	});
 
 	onDestroy(() => {
@@ -353,7 +373,7 @@
 					class="mode-toggle"
 					class:include={filterMode === 'include'}
 					class:exclude={filterMode === 'exclude'}
-					onclick={() => filterMode = filterMode === 'include' ? 'exclude' : 'include'}
+					onclick={() => (filterMode = filterMode === 'include' ? 'exclude' : 'include')}
 					title={filterMode === 'include' ? 'Include mode' : 'Exclude mode'}
 				>
 					{filterMode === 'include' ? '+' : '\u2212'}
@@ -372,13 +392,13 @@
 				/>
 				<button
 					onclick={async () => {
-					if (suggestions.length > 0) {
-						addCategoryFromSuggestion(suggestions[selectedSuggestionIdx >= 0 ? selectedSuggestionIdx : 0]);
-					} else if (categoryInput.trim()) {
-						await fetchSuggestions(categoryInput);
-						if (suggestions.length > 0) addCategoryFromSuggestion(suggestions[0]);
-					}
-				}}
+						if (suggestions.length > 0) {
+							addCategoryFromSuggestion(suggestions[selectedSuggestionIdx >= 0 ? selectedSuggestionIdx : 0]);
+						} else if (categoryInput.trim()) {
+							await fetchSuggestions(categoryInput);
+							if (suggestions.length > 0) addCategoryFromSuggestion(suggestions[0]);
+						}
+					}}
 					disabled={!categoryInput.trim()}
 					class="add-btn"
 				>
@@ -392,8 +412,11 @@
 						<button
 							class="suggestion-item"
 							class:selected={i === selectedSuggestionIdx}
-							onmousedown={(e) => { e.preventDefault(); addCategoryFromSuggestion(suggestion); }}
-							onmouseenter={() => selectedSuggestionIdx = i}
+							onmousedown={(e) => {
+								e.preventDefault();
+								addCategoryFromSuggestion(suggestion);
+							}}
+							onmouseenter={() => (selectedSuggestionIdx = i)}
 						>
 							{suggestion.name}
 						</button>
@@ -445,11 +468,7 @@
 	{/if}
 
 	{#if hasMore && !backfilling}
-		<button
-			class="load-more-btn"
-			onclick={loadMore}
-			disabled={loadingMore}
-		>
+		<button class="load-more-btn" onclick={loadMore} disabled={loadingMore}>
 			{loadingMore ? 'Loading...' : 'Load more'}
 		</button>
 	{/if}
@@ -463,10 +482,7 @@
 			{#each displayStreams as channel (channel.login)}
 				{@const isCapturing = capturingLogins.has(channel.login.toLowerCase())}
 				{@const inWatchlist = watchlistLogins.has(channel.login.toLowerCase())}
-				<div
-					class="channel-row"
-					class:capturing={isCapturing}
-				>
+				<div class="channel-row" class:capturing={isCapturing}>
 					<div class="channel-pfp">
 						{#if channel.profileImageUrl}
 							<img src={channel.profileImageUrl} alt="" class="pfp-img" />
@@ -509,25 +525,21 @@
 
 					<div class="row-actions">
 						{#if !inWatchlist}
-							<button
-								class="action-btn action-fav"
-								onclick={() => addToWatchlist(channel)}
-								title="Add to watchlist"
-							>+</button>
+							<button class="action-btn action-fav" onclick={() => addToWatchlist(channel)} title="Add to watchlist"
+								>+</button
+							>
 						{/if}
-						<button
-							class="action-btn action-ignore"
-							onclick={() => ignoreChannel(channel)}
-							title="Ignore channel"
-						>&times;</button>
+						<button class="action-btn action-ignore" onclick={() => ignoreChannel(channel)} title="Ignore channel"
+							>&times;</button
+						>
 						<a
 							class="action-btn action-link"
 							href="https://twitch.tv/{channel.login}"
 							target="_blank"
 							rel="noopener noreferrer"
 							title="Open on Twitch"
-							onclick={(e) => e.stopPropagation()}
-						>&#8599;</a>
+							onclick={(e) => e.stopPropagation()}>&#8599;</a
+						>
 					</div>
 				</div>
 			{/each}
@@ -571,7 +583,9 @@
 		font-size: 0.9rem;
 		font-weight: 700;
 		cursor: pointer;
-		transition: background 0.15s, color 0.15s;
+		transition:
+			background 0.15s,
+			color 0.15s;
 		width: 36px;
 		text-align: center;
 	}
@@ -921,7 +935,10 @@
 		color: #888;
 		font-size: 0.85rem;
 		cursor: pointer;
-		transition: background 0.15s, color 0.15s, border-color 0.15s;
+		transition:
+			background 0.15s,
+			color 0.15s,
+			border-color 0.15s;
 		text-decoration: none;
 		line-height: 1;
 		padding: 0;
@@ -953,7 +970,9 @@
 		font-size: 0.8rem;
 		padding: 8px;
 		cursor: pointer;
-		transition: background 0.15s, color 0.15s;
+		transition:
+			background 0.15s,
+			color 0.15s;
 		text-align: center;
 		margin-top: 4px;
 	}

@@ -4,7 +4,21 @@
 	import NLETimeline from '$lib/components/NLETimeline.svelte';
 	import TranscriptPanel from '$lib/components/TranscriptPanel.svelte';
 	import ChatPanel from '$lib/components/ChatPanel.svelte';
-	import { streams, focusedStreamId, soloStreamId, transcriptPanelOpen, chatPanelOpen, transcriptions, syncOffsets, streamPlaybackStates, masterTime, clipRegions, saveClipRegion, type ClipRegion, type TranscriptionEntry } from '$lib/stores/streams.js';
+	import {
+		streams,
+		focusedStreamId,
+		soloStreamId,
+		transcriptPanelOpen,
+		chatPanelOpen,
+		transcriptions,
+		syncOffsets,
+		streamPlaybackStates,
+		masterTime,
+		clipRegions,
+		saveClipRegion,
+		type ClipRegion,
+		type TranscriptionEntry
+	} from '$lib/stores/streams.js';
 	import { getMultiStreamTranscriptions } from '$lib/streams.remote';
 	import { trackKeyFor } from '$lib/utils.js';
 
@@ -49,9 +63,7 @@
 	);
 
 	const captionResults = $derived(
-		captionRanges.length > 0
-			? await getMultiStreamTranscriptions({ ranges: captionRanges })
-			: []
+		captionRanges.length > 0 ? await getMultiStreamTranscriptions({ ranges: captionRanges }) : []
 	);
 
 	$effect(() => {
