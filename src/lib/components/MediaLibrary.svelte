@@ -1,28 +1,48 @@
 <script lang="ts">
-	import { streams, removeStream, retranscribeStream, resumeVodStream, refetchVodChat, stopStream } from '$lib/stores/streams.js';
+	import {
+		streams,
+		clipRegions,
+		removeStream,
+		retranscribeStream,
+		resumeVodStream,
+		refetchVodChat,
+		stopStream
+	} from '$lib/stores/streams.js';
 	import { formatBytes } from '$lib/utils.js';
+
+	let clipCounts = $derived(
+		$clipRegions.reduce<Record<string, number>>((acc, clip) => {
+			acc[clip.streamId] = (acc[clip.streamId] || 0) + 1;
+			return acc;
+		}, {})
+	);
 
 	let confirmingId = $state<string | null>(null);
 	let confirmTimer: ReturnType<typeof setTimeout> | null = null;
 
-	let sorted = $derived(
-		[...$streams].sort((a, b) => b.startedAt - a.startedAt)
-	);
+	let sorted = $derived([...$streams].sort((a, b) => b.startedAt - a.startedAt));
 
 	function statusColor(status: string): string {
 		switch (status) {
-			case 'capturing': return '#22c55e';
-			case 'starting': return '#eab308';
-			case 'stopped': return '#666';
-			case 'error': return '#dc2626';
-			default: return '#666';
+			case 'capturing':
+				return '#22c55e';
+			case 'starting':
+				return '#eab308';
+			case 'stopped':
+				return '#666';
+			case 'error':
+				return '#dc2626';
+			default:
+				return '#666';
 		}
 	}
 
 	function formatDate(epochMs: number): string {
 		return new Date(epochMs).toLocaleString(undefined, {
-			month: 'short', day: 'numeric',
-			hour: '2-digit', minute: '2-digit'
+			month: 'short',
+			day: 'numeric',
+			hour: '2-digit',
+			minute: '2-digit'
 		});
 	}
 
@@ -75,20 +95,38 @@
 						<span class="meta transcript">{stream.transcriptionCount.toLocaleString()} transcripts</span>
 					{/if}
 
+					{#if clipCounts[stream.id]}
+						<span class="meta clips">{clipCounts[stream.id]} clip{clipCounts[stream.id] !== 1 ? 's' : ''}</span>
+					{/if}
+
 					<span class="meta date">{formatDate(stream.startedAt)}</span>
 
 					<span class="actions">
 						{#if stream.status === 'capturing' && stream.sourceType === 'vod'}
-							<button class="btn-action btn-stop" onclick={() => stopStream(stream.id)} title="Stop downloading">Stop</button>
+							<button class="btn-action btn-stop" onclick={() => stopStream(stream.id)} title="Stop downloading"
+								>Stop</button
+							>
 						{/if}
 						{#if stream.status === 'stopped'}
 							{#if stream.sourceType === 'vod' && stream.platform === 'twitch'}
-								<button class="btn-action btn-resume" onclick={() => resumeVodStream(stream.id)} title="Resume VOD download">Resume</button>
+								<button
+									class="btn-action btn-resume"
+									onclick={() => resumeVodStream(stream.id)}
+									title="Resume VOD download">Resume</button
+								>
 							{/if}
 							{#if stream.platform === 'twitch' && !stream.chatComplete}
-								<button class="btn-action btn-refetch" onclick={() => refetchVodChat(stream.id)} title="Refetch VOD chat from Twitch">Chat</button>
+								<button
+									class="btn-action btn-refetch"
+									onclick={() => refetchVodChat(stream.id)}
+									title="Refetch VOD chat from Twitch">Chat</button
+								>
 							{/if}
-							<button class="btn-action btn-retranscribe" onclick={() => retranscribeStream(stream.id)} title="Re-transcribe entire recording">Transcribe</button>
+							<button
+								class="btn-action btn-retranscribe"
+								onclick={() => retranscribeStream(stream.id)}
+								title="Re-transcribe entire recording">Transcribe</button
+							>
 						{/if}
 					</span>
 
@@ -211,6 +249,10 @@
 		color: #0891b2;
 	}
 
+	.meta.clips {
+		color: #e67e22;
+	}
+
 	.meta.date {
 		color: #555;
 	}
@@ -231,7 +273,9 @@
 		cursor: pointer;
 		text-transform: uppercase;
 		letter-spacing: 0.5px;
-		transition: background 0.15s, color 0.15s;
+		transition:
+			background 0.15s,
+			color 0.15s;
 		flex-shrink: 0;
 	}
 
@@ -286,7 +330,10 @@
 		cursor: pointer;
 		text-transform: uppercase;
 		letter-spacing: 0.5px;
-		transition: background 0.15s, color 0.15s, border-color 0.15s;
+		transition:
+			background 0.15s,
+			color 0.15s,
+			border-color 0.15s;
 		flex-shrink: 0;
 	}
 
