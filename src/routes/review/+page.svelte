@@ -24,6 +24,37 @@
 	let deleteConfirmId = $state<string | null>(null);
 	let deleteConfirmTimer: ReturnType<typeof setTimeout> | null = null;
 
+	// --- Undo stack ---
+	type ReviewUndoEntry =
+		| { type: 'update-region'; before: ClipRegion }
+		| { type: 'delete-region'; region: ClipRegion };
+
+	let undoStack = $state<ReviewUndoEntry[]>([]);
+	function pushUndo(entry: ReviewUndoEntry) {
+		undoStack = [...undoStack, entry];
+	}
+
+	function applyUndo() {
+		if (undoStack.length === 0) return;
+		const entry = undoStack[undoStack.length - 1];
+		undoStack = undoStack.slice(0, -1);
+
+		switch (entry.type) {
+			case 'delete-region':
+				// Undo deletion → re-add the clip
+				clipRegions.update((regions) => [...regions, entry.region]);
+				saveClipRegion(entry.region);
+				break;
+			case 'update-region':
+				// Undo edit/approve/boundary change → restore old snapshot
+				clipRegions.update((regions) =>
+					regions.map((r) => (r.id === entry.before.id ? { ...entry.before } : r))
+				);
+				saveClipRegion(entry.before);
+				break;
+		}
+	}
+
 	// --- Editing ---
 	let editingId = $state<string | null>(null);
 	let editTitle = $state('');
@@ -195,6 +226,7 @@
 
 	// --- Actions ---
 	function approveClip(clip: ClipRegion) {
+		pushUndo({ type: 'update-region', before: { ...clip } });
 		saveClipRegion({ ...clip, createdBy: 'human' as const });
 	}
 
@@ -203,6 +235,9 @@
 			if (deleteConfirmTimer) clearTimeout(deleteConfirmTimer);
 			deleteConfirmTimer = null;
 			deleteConfirmId = null;
+			// Snapshot the clip before deleting for undo
+			const clip = $clipRegions.find((c) => c.id === id);
+			if (clip) pushUndo({ type: 'delete-region', region: { ...clip } });
 			if (hls) { hls.destroy(); hls = null; }
 			loadedClipId = null;
 			playing = false;
@@ -235,6 +270,7 @@
 		if (!editingId) return;
 		const clip = $clipRegions.find((c) => c.id === editingId);
 		if (!clip) return;
+		pushUndo({ type: 'update-region', before: { ...clip } });
 		const updated = { ...clip, title: editTitle || undefined, notes: editNotes || undefined };
 		clipRegions.update((regions) => regions.map((r) => (r.id === updated.id ? updated : r)));
 		saveClipRegion(updated);
@@ -250,6 +286,7 @@
 	// --- Clip boundary adjustment ---
 	function updateClipBounds(clip: ClipRegion, newStart: number, newEnd: number) {
 		if (newEnd <= newStart) return;
+		pushUndo({ type: 'update-region', before: { ...clip } });
 		const updated = { ...clip, startTime: newStart, endTime: newEnd };
 		clipRegions.update((regions) => regions.map((r) => (r.id === updated.id ? updated : r)));
 		saveClipRegion(updated);
@@ -267,6 +304,14 @@
 	// --- Keyboard shortcuts ---
 	function handleKeydown(e: KeyboardEvent) {
 		if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+
+		// Ctrl/Cmd+Z: Undo (works even without a current clip)
+		if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
+			e.preventDefault();
+			applyUndo();
+			return;
+		}
+
 		if (!currentClip || editingId) return;
 
 		switch (e.key) {
@@ -343,6 +388,11 @@
 			<div class="empty-icon">&#10003;</div>
 			<p>No AI clips to review</p>
 			<p class="empty-hint">AI-created clips will appear here for your review</p>
+			{#if undoStack.length > 0}
+				<button class="btn-action btn-undo empty-undo" onclick={applyUndo} title="Undo (Ctrl+Z)">
+					&#8630; Undo<span class="undo-count">{undoStack.length}</span>
+				</button>
+			{/if}
 		</div>
 	{:else}
 		{@const clip = currentClip}
@@ -441,6 +491,11 @@
 					<button class="btn-action btn-edit" onclick={() => startEdit(clip)}>
 						<span class="action-icon">&#9998;</span> Edit
 					</button>
+					{#if undoStack.length > 0}
+						<button class="btn-action btn-undo" onclick={applyUndo} title="Undo (Ctrl+Z)">
+							&#8630; Undo<span class="undo-count">{undoStack.length}</span>
+						</button>
+					{/if}
 					<button class="btn-action btn-copy" onclick={() => copyClipId(clip.id)}>
 						ID
 					</button>
@@ -735,6 +790,33 @@
 	.btn-copy:hover {
 		background: #2a2a4a;
 		color: #fff;
+	}
+
+	.btn-undo {
+		color: #fbbf24;
+		border-color: #3a3a1a;
+	}
+	.btn-undo:hover {
+		background: #3a3a1a;
+	}
+
+	.undo-count {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		background: rgba(251, 191, 36, 0.2);
+		color: #fbbf24;
+		font-size: 0.6rem;
+		font-weight: 700;
+		min-width: 16px;
+		height: 16px;
+		border-radius: 8px;
+		margin-left: 6px;
+		padding: 0 4px;
+	}
+
+	.empty-undo {
+		margin-top: 16px;
 	}
 
 	/* Edit mode */
