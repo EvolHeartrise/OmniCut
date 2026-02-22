@@ -62,8 +62,9 @@
 		})
 	);
 
-	// Fetch chat messages via remote query — re-fetches when chatRanges changes
-	const rawMessages = $derived(await getMultiStreamChat({ ranges: chatRanges }));
+	// Fetch chat messages via remote query — re-fetches when chatRanges changes.
+	// Cap at 500 per stream to avoid freezing on high-volume VODs (we only display 100).
+	const rawMessages = $derived(await getMultiStreamChat({ ranges: chatRanges, limit: 500 }));
 
 	// Transform server data to ChatEntry format with master-time positioning
 	let fetchedEntries = $derived.by(() => {

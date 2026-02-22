@@ -100,8 +100,12 @@
 
 	function updateViewport() {
 		if (!scrollAreaEl) return;
-		viewportLeft = scrollAreaEl.scrollLeft;
-		viewportWidth = scrollAreaEl.clientWidth;
+		const newLeft = scrollAreaEl.scrollLeft;
+		const newWidth = scrollAreaEl.clientWidth;
+		if (newLeft === viewportLeft && newWidth === viewportWidth) return;
+		viewportLeft = newLeft;
+		viewportWidth = newWidth;
+		drawHeatmaps();
 	}
 
 	// Stable track ordering: preserve insertion order
@@ -156,7 +160,7 @@
 		const states = $streamPlaybackStates;
 		const allStreams = $streams;
 		let changed = false;
-		const next = { ...streamDurations };
+		const next = { ...untrack(() => streamDurations) };
 		// Server-provided durations (VODs)
 		for (const s of allStreams) {
 			if (s.durationSeconds != null && s.durationSeconds > 0 && next[s.id] !== s.durationSeconds) {
@@ -309,16 +313,28 @@
 		};
 	}
 
-	// Draw chat heatmap on canvas per-stream — reads chatHeatmapRaw directly,
-	// computes master-time positions inline during draw (no intermediate derived).
-	// No viewport culling needed: canvas is positioned/sized to match the bar,
-	// so the browser handles clipping via overflow. Only redraws on zoom/offset/data changes.
-	$effect(() => {
+	// Draw chat heatmap on canvas per-stream — viewport-culled.
+	// Only draws the visible portion of the heatmap using a viewport-sized canvas,
+	// preventing GPU memory exhaustion on long VODs (e.g. 41h = 3M px at 20px/s).
+	// Called imperatively from updateViewport() on scroll, and reactively via $effect
+	// on data/zoom changes (viewport reads are untracked to avoid effect ↔ viewport cycles).
+	function drawHeatmaps() {
 		const pps = pixelsPerSecond;
 		const tStart = effectiveTimelineStart;
 		const bucketSec = CHAT_BUCKET_SECONDS;
+		const vpLeft = viewportLeft;
+		const vpWidth = viewportWidth;
 
 		for (const track of tracksData) {
+			if (hiddenTracks.has(track.key)) {
+				// Clear canvases for hidden tracks
+				for (const bar of track.bars) {
+					const canvas = heatmapCanvases[bar.streamId];
+					if (canvas && canvas.width > 0) canvas.width = 0;
+				}
+				continue;
+			}
+
 			for (const bar of track.bars) {
 				const canvas = heatmapCanvases[bar.streamId];
 				const raw = chatHeatmapRaw[bar.streamId];
@@ -326,12 +342,23 @@
 
 				const barLeft = (bar.anchor - bar.offset - tStart) * pps;
 				const barWidth = bar.duration * pps;
-				const canvasW = Math.ceil(barWidth);
+
+				// Compute visible range with cull margin
+				const visLeft = Math.max(barLeft, vpLeft - CULL_MARGIN);
+				const visRight = Math.min(barLeft + barWidth, vpLeft + vpWidth + CULL_MARGIN);
+
+				if (visRight <= visLeft) {
+					// Bar not visible — zero out canvas
+					if (canvas.width > 0) canvas.width = 0;
+					continue;
+				}
+
+				const canvasW = Math.ceil(visRight - visLeft);
 				const canvasH = 24;
 
 				if (canvas.width !== canvasW) canvas.width = canvasW;
 				if (canvas.height !== canvasH) canvas.height = canvasH;
-				canvas.style.left = `${barLeft}px`;
+				canvas.style.left = `${visLeft}px`;
 				canvas.style.width = `${canvasW}px`;
 
 				const ctx = canvas.getContext('2d');
@@ -346,8 +373,12 @@
 					const intensity = b.count / raw.max;
 					if (intensity <= 0.05) continue;
 
-					// b.time is stream-local seconds; bar.anchor - bar.offset is the bar's master-time origin
-					const localX = b.time * pps;
+					// b.time is stream-local seconds; position relative to bar start
+					const absX = barLeft + b.time * pps;
+					// Skip buckets outside the visible canvas range
+					if (absX + heatWidth < visLeft || absX > visRight) continue;
+
+					const localX = absX - visLeft;
 					const alpha = 0.15 + intensity * 0.7;
 
 					const grad = ctx.createLinearGradient(0, canvasH, 0, 0);
@@ -360,6 +391,19 @@
 				}
 			}
 		}
+	}
+
+	// Reactive trigger: redraw heatmaps when data/zoom/canvas refs change.
+	// Viewport reads are untracked — scroll-triggered redraws are handled
+	// imperatively by updateViewport() to avoid an effect ↔ scroll cycle.
+	$effect(() => {
+		pixelsPerSecond;
+		effectiveTimelineStart;
+		tracksData;
+		chatHeatmapRaw;
+		heatmapCanvases;
+		hiddenTracks;
+		untrack(drawHeatmaps);
 	});
 
 	// Master time is a pure self-advancing clock in epoch seconds. Streams follow it, never the reverse.

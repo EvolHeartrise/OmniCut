@@ -63,7 +63,7 @@
 		exportLog.set([]);
 		try {
 			const data = await exportVideoCmd({ filename: filename.trim() });
-			result = { success: true, message: `Saved to ${data.outputPath}` };
+			result = { success: true, message: `Export queued (ID: ${data.exportId}). Encoding in background.` };
 		} catch (err) {
 			result = { success: false, message: err instanceof Error ? err.message : 'Export failed' };
 		} finally {

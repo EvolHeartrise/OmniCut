@@ -134,3 +134,11 @@ export function broadcastTranscriptionCleared(streamId: string) {
 export function broadcastClipRegionsChanged(clipRegions: Array<{ id: string; streamId: string; startTime: number; endTime: number; createdBy?: string; title?: string; notes?: string }>) {
 	broadcast(JSON.stringify({ type: 'clip-regions-changed', clipRegions }));
 }
+
+export function broadcastClipEncodeStatus(clipId: string, status: 'pending' | 'encoding' | 'ready' | 'error', error?: string) {
+	broadcast(JSON.stringify({ type: 'clip-encode-status', clipId, status, ...(error && { error }) }));
+}
+
+export function broadcastExportStatus(exportId: string, status: string, outputPath?: string, error?: string) {
+	broadcast(JSON.stringify({ type: 'export-status', exportId, status, ...(outputPath && { outputPath }), ...(error && { error }) }));
+}

@@ -37,9 +37,6 @@ export interface StreamState {
 	durationSeconds: number | null;
 }
 
-export type AppMode = 'sources' | 'clipping' | 'cleaning' | 'export';
-export const appMode = writable<AppMode>('sources');
-
 export const streams = writable<StreamState[]>([]);
 export const focusedStreamId = writable<string | null>(null);
 export const soloStreamId = writable<string | null>(null);
@@ -84,6 +81,19 @@ export interface ExportLogEntry {
 	timestamp: number;
 }
 export const exportLog = writable<ExportLogEntry[]>([]);
+
+// Per-clip encoding status (fed by SSE clip-encode-status events)
+export type ClipEncodeStatus = 'pending' | 'encoding' | 'ready' | 'error';
+export const clipEncodeStatuses = writable<Record<string, ClipEncodeStatus>>({});
+
+// Export records status updates (fed by SSE export-status events)
+export interface ExportStatusEvent {
+	exportId: string;
+	status: string;
+	outputPath?: string;
+	error?: string;
+}
+export const exportStatusEvents = writable<ExportStatusEvent[]>([]);
 
 // Master timeline control: streams react to seq changes
 export const masterControl = writable<{
@@ -311,6 +321,15 @@ export function connectSSE(): () => void {
 					...log,
 					{ message: data.message, step: data.step, totalSteps: data.totalSteps, timestamp: Date.now() }
 				]);
+			} else if (data.type === 'clip-encode-status') {
+				clipEncodeStatuses.update((current) => ({ ...current, [data.clipId]: data.status }));
+			} else if (data.type === 'export-status') {
+				exportStatusEvents.update((events) => [...events, {
+					exportId: data.exportId,
+					status: data.status,
+					outputPath: data.outputPath,
+					error: data.error
+				}]);
 			}
 		} catch {
 			// Ignore parse errors (keepalive pings etc)

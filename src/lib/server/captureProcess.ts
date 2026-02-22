@@ -256,6 +256,9 @@ export function startCapture(
 		onStatusChange(info);
 	};
 
+	// Collect last stderr line containing "error" for better error messages
+	const lastErrors: Record<string, string> = {};
+
 	function logStderr(proc: ReturnType<typeof Bun.spawn>, label: string) {
 		(async () => {
 			const reader = (proc.stderr as ReadableStream<Uint8Array>).getReader();
@@ -267,6 +270,10 @@ export function startCapture(
 					const msg = decoder.decode(value);
 					if (msg.includes('error') || msg.includes('Error')) {
 						console.error(`[${label}:${channel}] ${msg.trim()}`);
+						// Keep last meaningful error line for process exit messages
+						const lines = msg.trim().split('\n');
+						const errLine = lines.findLast((l: string) => /error/i.test(l));
+						if (errLine) lastErrors[label] = errLine.trim().slice(0, 200);
 					}
 				}
 			} catch { /* stream closed */ }
@@ -300,9 +307,16 @@ export function startCapture(
 
 				ffmpegProc.exited.then((code) => {
 					console.log(`[ffmpeg:${channel}] exited with code ${code}`);
-					if (info.status !== 'stopped') {
+					if (info.status !== 'stopped' && info.status !== 'error') {
 						clearPolling();
-						info.status = 'stopped';
+						if (code !== 0) {
+							info.status = 'error';
+							info.error = lastErrors['ffmpeg']
+								? `FFmpeg error: ${lastErrors['ffmpeg']}`
+								: `ffmpeg exited with code ${code}`;
+						} else {
+							info.status = 'stopped';
+						}
 						onStatusChange(info);
 					}
 				});
@@ -354,21 +368,43 @@ export function startCapture(
 
 		logStderr(ffmpegProc, 'ffmpeg');
 
-		sourceProc.exited.then((code) => {
-			console.log(`[streamlink:${channel}] exited with code ${code}`);
-			if (info.status !== 'stopped') {
+		// Wait for both processes; use stderr to surface real errors.
+		// FFmpeg dying first breaks the pipe → streamlink gets a write error.
+		// We want to report the FFmpeg error, not the generic pipe break.
+		const ffmpegRef = ffmpegProc;
+		const sourceRef = sourceProc;
+
+		ffmpegRef.exited.then((code) => {
+			console.log(`[ffmpeg:${channel}] exited with code ${code}`);
+			if (info.status !== 'stopped' && info.status !== 'error') {
 				clearPolling();
-				info.status = code === 0 ? 'stopped' : 'error';
-				info.error = code !== 0 ? `streamlink exited with code ${code}` : undefined;
+				if (code !== 0) {
+					info.status = 'error';
+					info.error = lastErrors['ffmpeg']
+						? `FFmpeg error: ${lastErrors['ffmpeg']}`
+						: `ffmpeg exited with code ${code}`;
+				} else {
+					info.status = 'stopped';
+				}
 				onStatusChange(info);
 			}
 		});
 
-		ffmpegProc.exited.then((code) => {
-			console.log(`[ffmpeg:${channel}] exited with code ${code}`);
+		sourceRef.exited.then((code) => {
+			console.log(`[streamlink:${channel}] exited with code ${code}`);
 			if (info.status !== 'stopped' && info.status !== 'error') {
 				clearPolling();
-				info.status = 'stopped';
+				if (code !== 0) {
+					info.status = 'error';
+					// Prefer FFmpeg's error if available (pipe break in streamlink is a symptom, not the cause)
+					info.error = lastErrors['ffmpeg']
+						? `FFmpeg error: ${lastErrors['ffmpeg']}`
+						: lastErrors['streamlink']
+							? `streamlink: ${lastErrors['streamlink']}`
+							: `streamlink exited with code ${code}`;
+				} else {
+					info.status = 'stopped';
+				}
 				onStatusChange(info);
 			}
 		});

@@ -81,8 +81,7 @@ export async function initDatabase(): Promise<void> {
 			id TEXT PRIMARY KEY,
 			stream_id TEXT NOT NULL,
 			start_time REAL NOT NULL,
-			end_time REAL NOT NULL,
-			FOREIGN KEY (stream_id) REFERENCES streams(id) ON DELETE CASCADE
+			end_time REAL NOT NULL
 		);
 
 		CREATE INDEX IF NOT EXISTS idx_clip_stream ON clip_regions(stream_id);
@@ -194,6 +193,45 @@ export async function initDatabase(): Promise<void> {
 		CREATE INDEX IF NOT EXISTS idx_twords_transcription ON transcription_words(transcription_id);
 	`);
 
+	// Migration: remove ON DELETE CASCADE from clip_regions so clips survive stream deletion.
+	// SQLite doesn't support ALTER FOREIGN KEY, so we recreate the table.
+	const hasClipCascade = db.query(
+		"SELECT sql FROM sqlite_master WHERE type='table' AND name='clip_regions'"
+	).get() as { sql: string } | null;
+	if (hasClipCascade?.sql?.includes('ON DELETE CASCADE')) {
+		db.exec(`
+			CREATE TABLE clip_regions_new (
+				id TEXT PRIMARY KEY,
+				stream_id TEXT NOT NULL,
+				start_time REAL NOT NULL,
+				end_time REAL NOT NULL,
+				created_by TEXT DEFAULT 'human',
+				title TEXT,
+				notes TEXT
+			);
+			INSERT INTO clip_regions_new SELECT id, stream_id, start_time, end_time, created_by, title, notes FROM clip_regions;
+			DROP TABLE clip_regions;
+			ALTER TABLE clip_regions_new RENAME TO clip_regions;
+			CREATE INDEX idx_clip_stream ON clip_regions(stream_id);
+		`);
+		console.log('[migration] Removed CASCADE from clip_regions — clips now survive stream deletion');
+	}
+
+	// Migration: add exports table
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS exports (
+			id TEXT PRIMARY KEY,
+			title TEXT NOT NULL,
+			description TEXT,
+			clip_ids TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'pending',
+			output_path TEXT,
+			error TEXT,
+			created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+			completed_at INTEGER
+		);
+	`);
+
 	// Prepare hot-path statements for better performance
 	stmtSaveChatMessage = db.prepare(
 		'INSERT OR IGNORE INTO chat_messages (stream_id, username, text, timestamp, color) VALUES (?, ?, ?, ?, ?)'
@@ -254,6 +292,30 @@ interface ClipRow {
 	created_by: string | null;
 	title: string | null;
 	notes: string | null;
+}
+
+interface ExportRow {
+	id: string;
+	title: string;
+	description: string | null;
+	clip_ids: string;
+	status: string;
+	output_path: string | null;
+	error: string | null;
+	created_at: number;
+	completed_at: number | null;
+}
+
+export interface ExportRecord {
+	id: string;
+	title: string;
+	description?: string;
+	clipIds: string[];
+	status: 'pending' | 'exporting' | 'ready' | 'error';
+	outputPath?: string;
+	error?: string;
+	createdAt: number;
+	completedAt?: number;
 }
 
 interface HeatmapRow {
@@ -356,13 +418,21 @@ export function updateStreamOffset(id: string, offset: number): void {
 
 export function saveTranscription(streamId: string, text: string, startTime: number, endTime: number, words?: WordTimestamp[]): void {
 	const d = getDb();
-	if (stmtSaveTranscription) {
-		stmtSaveTranscription.run(streamId, text, startTime, endTime);
-	} else {
-		d.run(
-			'INSERT INTO transcriptions (stream_id, text, start_time, end_time) VALUES (?, ?, ?, ?)',
-			[streamId, text, startTime, endTime]
-		);
+	try {
+		if (stmtSaveTranscription) {
+			stmtSaveTranscription.run(streamId, text, startTime, endTime);
+		} else {
+			d.run(
+				'INSERT INTO transcriptions (stream_id, text, start_time, end_time) VALUES (?, ?, ?, ?)',
+				[streamId, text, startTime, endTime]
+			);
+		}
+	} catch (err: any) {
+		if (err?.code === 'SQLITE_CONSTRAINT_FOREIGNKEY') {
+			// Stream was deleted while transcription was still in-flight — silently discard
+			return;
+		}
+		throw err;
 	}
 
 	if (words && words.length > 0) {
@@ -448,18 +518,27 @@ export function countChatMessages(streamId: string): number {
 	return row?.cnt ?? 0;
 }
 
-export function loadChatMessagesInRange(streamId: string, fromTime: number, toTime: number, query?: string): (ChatMessage & { id: number })[] {
+export function loadChatMessagesInRange(streamId: string, fromTime: number, toTime: number, query?: string, limit?: number): (ChatMessage & { id: number })[] {
 	const d = getDb();
+	const cap = limit ?? 0;
+	const mapRow = (r: ChatRow) => ({ id: r.id, username: r.username, text: r.text, timestamp: r.timestamp, color: r.color ?? null });
 	if (query) {
-		const rows = d.query(
-			'SELECT id, username, text, timestamp, color FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? AND text LIKE ? ORDER BY timestamp'
-		).all(streamId, fromTime, toTime, `%${query}%`) as ChatRow[];
-		return rows.map((r) => ({ id: r.id, username: r.username, text: r.text, timestamp: r.timestamp, color: r.color ?? null }));
+		// When limited, fetch the LAST N messages in the range (most recent, near the playhead)
+		const sql = cap > 0
+			? 'SELECT * FROM (SELECT id, username, text, timestamp, color FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? AND text LIKE ? ORDER BY timestamp DESC LIMIT ?) ORDER BY timestamp'
+			: 'SELECT id, username, text, timestamp, color FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? AND text LIKE ? ORDER BY timestamp';
+		const params = cap > 0
+			? [streamId, fromTime, toTime, `%${query}%`, cap]
+			: [streamId, fromTime, toTime, `%${query}%`];
+		return (d.query(sql).all(...params) as ChatRow[]).map(mapRow);
 	}
-	const rows = d.query(
-		'SELECT id, username, text, timestamp, color FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp'
-	).all(streamId, fromTime, toTime) as ChatRow[];
-	return rows.map((r) => ({ id: r.id, username: r.username, text: r.text, timestamp: r.timestamp, color: r.color ?? null }));
+	const sql = cap > 0
+		? 'SELECT * FROM (SELECT id, username, text, timestamp, color FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp DESC LIMIT ?) ORDER BY timestamp'
+		: 'SELECT id, username, text, timestamp, color FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp';
+	const params = cap > 0
+		? [streamId, fromTime, toTime, cap]
+		: [streamId, fromTime, toTime];
+	return (d.query(sql).all(...params) as ChatRow[]).map(mapRow);
 }
 
 export function loadChatHeatmap(streamId: string, bucketSeconds: number): Array<{ bucket: number; count: number }> {
@@ -482,7 +561,7 @@ export function saveClipRegion(region: ClipRegion): void {
 	const d = getDb();
 	d.run(
 		`INSERT INTO clip_regions (id, stream_id, start_time, end_time, created_by, title, notes) VALUES (?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET start_time = excluded.start_time, end_time = excluded.end_time, title = excluded.title, notes = excluded.notes`,
+		ON CONFLICT(id) DO UPDATE SET start_time = excluded.start_time, end_time = excluded.end_time, created_by = excluded.created_by, title = excluded.title, notes = excluded.notes`,
 		[region.id, region.streamId, region.startTime, region.endTime, region.createdBy ?? 'human', region.title ?? null, region.notes ?? null]
 	);
 }
@@ -563,6 +642,73 @@ export function addToWatchlist(login: string, platform: string): void {
 export function removeFromWatchlist(login: string, platform: string): void {
 	const d = getDb();
 	d.run('DELETE FROM watchlist WHERE login = ? AND platform = ?', [login, platform]);
+}
+
+// --- Exports ---
+
+export function saveExport(record: ExportRecord): void {
+	const d = getDb();
+	d.run(
+		`INSERT INTO exports (id, title, description, clip_ids, status, output_path, error, created_at, completed_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		[
+			record.id,
+			record.title,
+			record.description ?? null,
+			JSON.stringify(record.clipIds),
+			record.status,
+			record.outputPath ?? null,
+			record.error ?? null,
+			record.createdAt,
+			record.completedAt ?? null
+		]
+	);
+}
+
+export function updateExportStatus(
+	id: string,
+	status: ExportRecord['status'],
+	outputPath?: string,
+	error?: string
+): void {
+	const d = getDb();
+	const completedAt = (status === 'ready' || status === 'error') ? Math.floor(Date.now() / 1000) : null;
+	d.run(
+		`UPDATE exports SET status = ?, output_path = COALESCE(?, output_path), error = ?, completed_at = COALESCE(?, completed_at) WHERE id = ?`,
+		[status, outputPath ?? null, error ?? null, completedAt, id]
+	);
+}
+
+export function loadExport(id: string): ExportRecord | null {
+	const d = getDb();
+	const row = d.query('SELECT * FROM exports WHERE id = ?').get(id) as ExportRow | null;
+	if (!row) return null;
+	return mapExportRow(row);
+}
+
+export function loadAllExports(): ExportRecord[] {
+	const d = getDb();
+	const rows = d.query('SELECT * FROM exports ORDER BY created_at DESC').all() as ExportRow[];
+	return rows.map(mapExportRow);
+}
+
+export function deleteExport(id: string): void {
+	const d = getDb();
+	d.run('DELETE FROM exports WHERE id = ?', [id]);
+}
+
+function mapExportRow(r: ExportRow): ExportRecord {
+	return {
+		id: r.id,
+		title: r.title,
+		...(r.description && { description: r.description }),
+		clipIds: JSON.parse(r.clip_ids) as string[],
+		status: r.status as ExportRecord['status'],
+		...(r.output_path && { outputPath: r.output_path }),
+		...(r.error && { error: r.error }),
+		createdAt: r.created_at,
+		...(r.completed_at != null && { completedAt: r.completed_at })
+	};
 }
 
 /**

@@ -17,7 +17,10 @@ import {
 	getChatHeatmap as smGetChatHeatmap,
 	getChatMessagesInRange as smGetChatMessagesInRange,
 	getTranscriptionsInRange as smGetTranscriptionsInRange,
-	exportVideo
+	createAndQueueExport,
+	loadAllExports as smLoadAllExports,
+	loadExport as smLoadExport,
+	getClipEncodeStatuses as smGetClipEncodeStatuses
 } from '$lib/server/streamManager.js';
 import {
 	addIgnoredChannel,
@@ -61,13 +64,14 @@ export const getChatHeatmap = query('unchecked', async (args: { streamId: string
 	return smGetChatHeatmap(args.streamId, args.bucket ?? 5);
 });
 
-/** Chat messages in a time range for multiple streams (merged & sorted). */
+/** Chat messages in a time range for multiple streams (merged & sorted).
+ *  Optional `limit` caps total results per stream (returns the most recent N). */
 export const getMultiStreamChat = query(
 	'unchecked',
-	async (args: { ranges: Array<{ streamId: string; from: number; to: number }> }) => {
+	async (args: { ranges: Array<{ streamId: string; from: number; to: number }>; limit?: number }) => {
 		const results: Array<ChatMessage & { id: number; streamId: string }> = [];
 		for (const range of args.ranges) {
-			const messages = smGetChatMessagesInRange(range.streamId, range.from, range.to);
+			const messages = smGetChatMessagesInRange(range.streamId, range.from, range.to, undefined, args.limit);
 			for (const m of messages) {
 				results.push({ ...m, streamId: range.streamId });
 			}
@@ -311,7 +315,7 @@ export const updateOffsetCmd = command('unchecked', async (args: { id: string; o
 /** Save (upsert) a clip region. */
 export const saveClipCmd = command(
 	'unchecked',
-	async (region: { id: string; streamId: string; startTime: number; endTime: number }) => {
+	async (region: { id: string; streamId: string; startTime: number; endTime: number; createdBy?: 'human' | 'ai'; title?: string; notes?: string }) => {
 		addClipRegion(region);
 	}
 );
@@ -355,11 +359,49 @@ export const removeFromWatchlistCmd = command('unchecked', async (args: { login:
 	dbRemoveFromWatchlist(args.login.toLowerCase().trim(), args.platform || 'twitch');
 });
 
-/** Export all clip regions into a single video file. */
+/** Export all clip regions into a single video file (via export queue). */
 export const exportVideoCmd = command('unchecked', async (args: { filename: string }) => {
 	if (!args.filename || typeof args.filename !== 'string' || args.filename.trim().length === 0) {
 		throw new Error('Filename is required');
 	}
-	const result = await exportVideo(args.filename.trim());
-	return { success: true, outputPath: result.outputPath };
+	const { getAllClipRegions } = await import('$lib/server/streamManager.js');
+	const clips = getAllClipRegions();
+	if (clips.length === 0) {
+		throw new Error('No clip regions to export');
+	}
+	// Sort by startTime for the UI export path
+	const sortedIds = [...clips]
+		.sort((a, b) => a.startTime - b.startTime)
+		.map((c) => c.id);
+	const record = createAndQueueExport(sortedIds, args.filename.trim());
+	return { success: true, exportId: record.id };
+});
+
+/** List all video exports. */
+export const listExportsCmd = query(async () => {
+	return { exports: smLoadAllExports() };
+});
+
+/** Get a specific export by ID. */
+export const getExportCmd = query('unchecked', async (args: { id: string }) => {
+	const record = smLoadExport(args.id);
+	if (!record) throw new Error('Export not found');
+	return record;
+});
+
+/** Get encode statuses for a list of clip IDs. */
+export const getClipEncodeStatuses = query('unchecked', async (args: { clipIds: string[] }) => {
+	return smGetClipEncodeStatuses(args.clipIds);
+});
+
+/** Export selected clips by IDs (in order). */
+export const exportSelectedClipsCmd = command('unchecked', async (args: { clipIds: string[]; title: string }) => {
+	if (!args.clipIds || args.clipIds.length === 0) {
+		throw new Error('No clips selected');
+	}
+	if (!args.title?.trim()) {
+		throw new Error('Title is required');
+	}
+	const record = createAndQueueExport(args.clipIds, args.title.trim());
+	return { success: true, exportId: record.id };
 });

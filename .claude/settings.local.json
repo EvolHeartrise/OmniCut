@@ -1,1 +1,20 @@
-{}
+{
+  "permissions": {
+    "allow": [
+      "mcp__omnicut__list_clips",
+      "mcp__omnicut__get_chat_hotspots",
+      "mcp__omnicut__search_transcriptions",
+      "mcp__omnicut__query_at_time",
+      "mcp__omnicut__get_word_timestamps",
+      "mcp__omnicut__create_clip",
+      "mcp__omnicut__export_video",
+      "Bash(xxd:*)",
+      "Bash(cd:*)"
+    ]
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "omnicut",
+    "svelte"
+  ]
+}

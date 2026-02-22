@@ -5,7 +5,7 @@ import { startCapture, fetchStreamMeta, fetchVodMeta, type CaptureHandle } from 
 import { startTranscription, stopTranscription, transcribeFullRecording, shutdownTranscriber } from './transcriber.js';
 import { startChatCollection } from './chatCollector.js';
 import { startVodChatFetch, extractVideoId } from './vodChatFetcher.js';
-import { exportVideo as exportVideoImpl } from './exporter.js';
+import { detectNvenc } from './exporter.js';
 import type { StreamInfo, ChatMessage } from './types.js';
 import * as db from './persistence.js';
 import {
@@ -14,7 +14,6 @@ import {
 	broadcastTranscription,
 	persistChatMessage,
 	persistChatMessagesBatch,
-	broadcastExportProgress,
 	broadcastTranscriptionCleared,
 	serializeStreamInfo,
 	initCounts,
@@ -27,9 +26,23 @@ import {
 	addClipRegion,
 	removeClipRegion,
 	getAllClipRegions,
-	removeClipRegionsForStream,
+	getClipRegion,
 	getClipRegionCount
 } from './clipManager.js';
+import {
+	setLookups,
+	restoreEncodeState,
+	shutdownEncoder,
+	getClipEncodeStatus as clipEncodeStatusLookup
+} from './clipEncoder.js';
+import type { ClipEncodeStatus } from './clipEncoder.js';
+import {
+	createAndQueueExport,
+	restoreExportQueue,
+	shutdownExportQueue,
+	loadExport,
+	loadAllExports
+} from './exportQueue.js';
 
 const RECORDINGS_DIR = path.resolve(process.env.RECORDINGS_DIR || path.join(process.cwd(), 'recordings'));
 
@@ -77,13 +90,30 @@ export async function initStreamManager(): Promise<void> {
 		captures.set(info.id, stubHandle);
 	}
 
-	// Restore clip regions (filter to known stream IDs)
-	restoreClipRegions(new Set(captures.keys()));
+	// Restore clip regions (all clips, including orphans from deleted streams)
+	restoreClipRegions();
 
 	// Initialize chat message counts and transcription counts
 	for (const [, handle] of captures) {
 		initCounts(handle.info.id);
 	}
+
+	// Wire up clip encoder lookups (avoids circular imports)
+	setLookups(
+		(clipId) => getClipRegion(clipId),
+		(streamId) => {
+			const handle = captures.get(streamId);
+			return handle ? handle.info : null;
+		},
+		detectNvenc
+	);
+
+	// Restore pre-encoded clip state from disk
+	const allClipIds = getAllClipRegions().map((c) => c.id);
+	restoreEncodeState(allClipIds);
+
+	// Mark any incomplete exports from a previous session as error
+	restoreExportQueue();
 
 	const streamCount = captures.size;
 	console.log(`[init] Restored ${streamCount} streams, ${getClipRegionCount()} clip regions`);
@@ -536,11 +566,10 @@ export function removeStream(id: string): boolean {
 	handle.kill();
 	captures.delete(id);
 
-	// Remove from in-memory caches
-	removeClipRegionsForStream(id);
+	// Remove from in-memory caches (but keep clip regions — they survive stream deletion)
 	deleteCounts(id);
 
-	// Remove from SQLite (cascades to transcriptions, chat, clips)
+	// Remove from SQLite (cascades to transcriptions and chat, but NOT clip regions)
 	db.deleteStream(id);
 
 	// Delete recording files from disk (async with error logging)
@@ -591,6 +620,22 @@ export function updateStreamOffset(id: string, offset: number): boolean {
 // --- Clip regions (delegated to clipManager.ts) ---
 export { addClipRegion, removeClipRegion, getAllClipRegions } from './clipManager.js';
 
+// --- Clip encoding status (delegated to clipEncoder.ts) ---
+export { getClipEncodeStatus, getEncodedClipPath } from './clipEncoder.js';
+export type { ClipEncodeStatus } from './clipEncoder.js';
+
+/**
+ * Get encode statuses for multiple clip IDs at once.
+ */
+export function getClipEncodeStatuses(clipIds: string[]): Record<string, ClipEncodeStatus> {
+	const result: Record<string, ClipEncodeStatus> = {};
+	for (const id of clipIds) {
+		const status = clipEncodeStatusLookup(id);
+		if (status) result[id] = status;
+	}
+	return result;
+}
+
 export function getTranscriptionsInRange(id: string, fromTime: number, toTime: number, query?: string): Array<{ id: number; text: string; startTime: number; endTime: number }> {
 	return db.loadTranscriptionsInRange(id, fromTime, toTime, query);
 }
@@ -598,8 +643,8 @@ export function getTranscriptionsInRange(id: string, fromTime: number, toTime: n
 /**
  * Get chat messages for a stream within a time range (stream-local seconds).
  */
-export function getChatMessagesInRange(id: string, fromTime: number, toTime: number, query?: string): (ChatMessage & { id: number })[] {
-	return db.loadChatMessagesInRange(id, fromTime, toTime, query);
+export function getChatMessagesInRange(id: string, fromTime: number, toTime: number, query?: string, limit?: number): (ChatMessage & { id: number })[] {
+	return db.loadChatMessagesInRange(id, fromTime, toTime, query, limit);
 }
 
 /**
@@ -627,19 +672,10 @@ export function getStreamRecordingDir(id: string): string | null {
 // --- Video export ---
 
 /**
- * Export all clip regions as a single stitched video file.
+ * Export all clip regions as a single stitched video file (UI path).
+ * Sorts clips by startTime and goes through the export queue for consistency.
  */
-export async function exportVideo(filename: string): Promise<{ outputPath: string }> {
-	return exportVideoImpl(
-		getAllClipRegions(),
-		filename,
-		(streamId) => {
-			const handle = captures.get(streamId);
-			return handle ? handle.info : null;
-		},
-		broadcastExportProgress
-	);
-}
+export { createAndQueueExport, loadExport, loadAllExports } from './exportQueue.js';
 
 // --- Shutdown ---
 
@@ -647,6 +683,8 @@ export async function exportVideo(filename: string): Promise<{ outputPath: strin
  * Clean up all captures on shutdown.
  */
 export function shutdownAll() {
+	shutdownExportQueue();
+	shutdownEncoder();
 	shutdownTranscriber();
 	for (const [, handle] of captures) {
 		handle.stopChat?.();

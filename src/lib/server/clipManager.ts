@@ -1,49 +1,72 @@
 /**
  * Clip region management module.
  * In-memory store of clip regions backed by SQLite persistence.
+ * Triggers clip encoding on add/update and cancellation on remove.
  */
 
 import type { ClipRegion } from './types.js';
 import * as db from './persistence.js';
 import { broadcastClipRegionsChanged } from './sseBroadcaster.js';
+import { enqueueClipEncode, cancelClipEncode } from './clipEncoder.js';
 
 // In-memory store of clip regions keyed by ID (hot cache; persisted to SQLite)
 const clipRegionsStore = new Map<string, ClipRegion>();
 
 /**
- * Restore clip regions from the database, filtering to only those
- * belonging to known stream IDs.
+ * Restore clip regions from the database.
+ * Loads all clips, including those whose streams have been deleted
+ * (clips survive stream deletion).
  */
-export function restoreClipRegions(knownStreamIds: Set<string>): void {
+export function restoreClipRegions(): void {
 	const savedClips = db.loadAllClipRegions();
 	for (const region of savedClips) {
-		if (knownStreamIds.has(region.streamId)) {
-			clipRegionsStore.set(region.id, region);
-		}
+		clipRegionsStore.set(region.id, region);
 	}
 }
 
 /**
  * Add or update a clip region (upsert by ID).
  * Validates that startTime < endTime.
+ * Triggers clip encoding (or re-encoding if times changed).
  */
 export function addClipRegion(region: ClipRegion): void {
 	if (region.startTime >= region.endTime) {
 		throw new Error(`Invalid clip region: startTime (${region.startTime}) must be less than endTime (${region.endTime})`);
 	}
+
+	// Check if this is an update with changed times — invalidate and re-encode
+	const existing = clipRegionsStore.get(region.id);
+	const timesChanged = !existing
+		|| existing.startTime !== region.startTime
+		|| existing.endTime !== region.endTime
+		|| existing.streamId !== region.streamId;
+
 	clipRegionsStore.set(region.id, region);
 	db.saveClipRegion(region);
 	broadcastClipRegionsChanged(getAllClipRegions());
+
+	if (timesChanged) {
+		enqueueClipEncode(region.id);
+	}
 }
 
 /**
  * Remove a clip region by ID.
+ * Cancels any pending/active encode and deletes the encoded file.
  */
 export function removeClipRegion(id: string): boolean {
 	if (!clipRegionsStore.delete(id)) return false;
 	db.deleteClipRegion(id);
+	cancelClipEncode(id);
 	broadcastClipRegionsChanged(getAllClipRegions());
 	return true;
+}
+
+/**
+ * Get a clip region by ID.
+ */
+export function getClipRegion(id: string): ClipRegion | undefined {
+	return clipRegionsStore.get(id);
 }
 
 /**
@@ -55,11 +78,13 @@ export function getAllClipRegions(): ClipRegion[] {
 
 /**
  * Remove all clip regions for a given stream.
+ * Cancels encoding for each removed clip.
  */
 export function removeClipRegionsForStream(streamId: string): void {
 	for (const [clipId, region] of clipRegionsStore) {
 		if (region.streamId === streamId) {
 			clipRegionsStore.delete(clipId);
+			cancelClipEncode(clipId);
 		}
 	}
 }

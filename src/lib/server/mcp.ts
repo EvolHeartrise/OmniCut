@@ -18,7 +18,10 @@ import {
 	getChatMessagesInRange,
 	getTranscriptionsInRange,
 	getChatHeatmap,
-	retranscribeStream
+	retranscribeStream,
+	createAndQueueExport,
+	loadAllExports as smLoadAllExports,
+	loadExport as smLoadExport
 } from './streamManager.js';
 
 import {
@@ -62,16 +65,21 @@ const mcpServer = new McpServer(
 
 mcpServer.tool(
 	'list_streams',
-	'List all active and stopped streams with their status, metadata, and clip regions.',
+	'List all active and stopped streams with their status and metadata. Includes a count of clip regions per stream (use list_clips to see full clip details).',
 	{},
 	async () => {
 		const streams = listStreams();
 		const clipRegions = getAllClipRegions();
+		// Count clips per stream instead of returning full clip data
+		const clipCountsByStream: Record<string, number> = {};
+		for (const r of clipRegions) {
+			clipCountsByStream[r.streamId] = (clipCountsByStream[r.streamId] || 0) + 1;
+		}
 		return {
 			content: [
 				{
 					type: 'text' as const,
-					text: JSON.stringify({ streams, clipRegions })
+					text: JSON.stringify({ streams, clipCounts: clipCountsByStream, totalClips: clipRegions.length })
 				}
 			]
 		};
@@ -79,7 +87,76 @@ mcpServer.tool(
 );
 
 // ---------------------------------------------------------------------------
-// Tool 2 — search_chat
+// Tool 2 — list_clips
+// ---------------------------------------------------------------------------
+
+mcpServer.tool(
+	'list_clips',
+	'List clip regions, optionally filtered by stream ID, channel name, and/or a datetime range. Times are ISO 8601 datetime strings (e.g. "2026-02-20T14:30:00Z").',
+	{
+		streamId: z.string().optional().describe('Filter clips to a specific stream ID'),
+		channel: z.string().optional().describe('Filter clips to a specific channel name (case-insensitive)'),
+		after: z.string().optional().describe('Only include clips that end after this datetime (ISO 8601, e.g. "2026-02-20T14:30:00Z")'),
+		before: z.string().optional().describe('Only include clips that start before this datetime (ISO 8601, e.g. "2026-02-21T02:00:00Z")')
+	},
+	async ({ streamId, channel, after, before }) => {
+		let clips = getAllClipRegions();
+
+		if (streamId) {
+			clips = clips.filter((c) => c.streamId === streamId);
+		}
+		if (channel) {
+			const lowerChannel = channel.toLowerCase();
+			clips = clips.filter((c) => {
+				const stream = getStream(c.streamId);
+				return stream?.channel.toLowerCase() === lowerChannel;
+			});
+		}
+
+		// Parse datetime filters to epoch seconds for comparison against master time
+		let afterEpoch: number | null = null;
+		let beforeEpoch: number | null = null;
+		if (after) {
+			afterEpoch = new Date(after).getTime() / 1000;
+			if (isNaN(afterEpoch)) {
+				return { isError: true, content: [{ type: 'text' as const, text: `Invalid "after" datetime: "${after}". Use ISO 8601 format.` }] };
+			}
+		}
+		if (before) {
+			beforeEpoch = new Date(before).getTime() / 1000;
+			if (isNaN(beforeEpoch)) {
+				return { isError: true, content: [{ type: 'text' as const, text: `Invalid "before" datetime: "${before}". Use ISO 8601 format.` }] };
+			}
+		}
+		if (afterEpoch !== null) clips = clips.filter((c) => c.endTime > afterEpoch);
+		if (beforeEpoch !== null) clips = clips.filter((c) => c.startTime < beforeEpoch);
+
+		// Sort by start time ascending
+		clips.sort((a, b) => a.startTime - b.startTime);
+
+		// Enrich with channel name and readable times
+		const enriched = clips.map((c) => {
+			const stream = getStream(c.streamId);
+			return {
+				...c,
+				channel: stream?.channel ?? null,
+				startTimeISO: new Date(c.startTime * 1000).toISOString(),
+				endTimeISO: new Date(c.endTime * 1000).toISOString(),
+				durationSeconds: Math.round(c.endTime - c.startTime)
+			};
+		});
+
+		return {
+			content: [{
+				type: 'text' as const,
+				text: JSON.stringify({ count: enriched.length, clips: enriched })
+			}]
+		};
+	}
+);
+
+// ---------------------------------------------------------------------------
+// Tool 3 — search_chat
 // ---------------------------------------------------------------------------
 
 mcpServer.tool(
@@ -390,11 +467,40 @@ mcpServer.tool(
 		const chat = getChatMessagesInRange(streamId, windowStart, windowEnd);
 		const transcriptions = getTranscriptionsInRange(streamId, windowStart, windowEnd);
 
-		const chatLines = chat.map((m) => `[${m.timestamp}] ${m.username}: ${m.text}`);
+		// Sample chat: at most 10 messages per 1-second bucket
+		const MAX_PER_SECOND = 10;
+		const totalChat = chat.length;
+		const buckets = new Map<number, typeof chat>();
+		for (const m of chat) {
+			const key = Math.floor(m.timestamp);
+			let bucket = buckets.get(key);
+			if (!bucket) { bucket = []; buckets.set(key, bucket); }
+			bucket.push(m);
+		}
+		const sampled: typeof chat = [];
+		for (const [, bucket] of buckets) {
+			if (bucket.length <= MAX_PER_SECOND) {
+				sampled.push(...bucket);
+			} else {
+				// Fisher-Yates partial shuffle to pick MAX_PER_SECOND random items
+				for (let i = bucket.length - 1; i > bucket.length - 1 - MAX_PER_SECOND; i--) {
+					const j = Math.floor(Math.random() * (i + 1));
+					[bucket[i], bucket[j]] = [bucket[j], bucket[i]];
+				}
+				sampled.push(...bucket.slice(bucket.length - MAX_PER_SECOND));
+			}
+		}
+		sampled.sort((a, b) => a.timestamp - b.timestamp);
+
+		const chatLines = sampled.map((m) => `[${m.timestamp}] ${m.username}: ${m.text}`);
 		const transcriptLines = transcriptions.map((t) => `[${t.startTime}-${t.endTime}] ${stream.channel}: ${t.text}`);
 
+		const note = sampled.length < totalChat
+			? `Too many messages to display. Showing ${sampled.length}/${totalChat} randomly sampled messages.`
+			: undefined;
+
 		const parts = [
-			JSON.stringify({ stream, timestamp, windowStart, windowEnd }),
+			JSON.stringify({ stream, timestamp, windowStart, windowEnd, ...(note && { note }) }),
 			'',
 			'--- chat ---',
 			...chatLines,
@@ -473,7 +579,119 @@ mcpServer.tool(
 );
 
 // ---------------------------------------------------------------------------
-// Tool 10 — get_chat_hotspots
+// Tool 10 — update_clip  (mutating)
+// ---------------------------------------------------------------------------
+
+mcpServer.tool(
+	'update_clip',
+	'Update an existing clip region. Can change start/end times, title, and/or notes. Only provided fields are updated; omitted fields keep their current values.',
+	{
+		id: z.string().describe('The clip ID to update'),
+		startTime: z.number().optional().describe('New start time (epoch seconds by default, or stream-local if timeFormat is "local")'),
+		endTime: z.number().optional().describe('New end time (epoch seconds by default, or stream-local if timeFormat is "local")'),
+		timeFormat: z.enum(['master', 'local']).optional().default('master').describe('Time format: "master" for epoch seconds (default), "local" for stream-local seconds since capture start'),
+		title: z.string().optional().describe('New clip title'),
+		notes: z.string().optional().describe('New clip notes')
+	},
+	async ({ id, startTime, endTime, timeFormat, title, notes }) => {
+		const existing = getAllClipRegions().find((c) => c.id === id);
+		if (!existing) {
+			return {
+				isError: true,
+				content: [{ type: 'text' as const, text: `Clip "${id}" not found.` }]
+			};
+		}
+
+		let newStart = startTime ?? existing.startTime;
+		let newEnd = endTime ?? existing.endTime;
+
+		if (timeFormat === 'local' && (startTime !== undefined || endTime !== undefined)) {
+			const stream = getStream(existing.streamId);
+			if (!stream) {
+				return {
+					isError: true,
+					content: [{ type: 'text' as const, text: `Stream "${existing.streamId}" not found.` }]
+				};
+			}
+			const anchor = stream.startedAt / 1000;
+			if (startTime !== undefined) newStart = anchor + startTime;
+			if (endTime !== undefined) newEnd = anchor + endTime;
+		}
+
+		try {
+			addClipRegion({
+				...existing,
+				startTime: newStart,
+				endTime: newEnd,
+				...(title !== undefined && { title }),
+				...(notes !== undefined && { notes })
+			});
+			return {
+				content: [{
+					type: 'text' as const,
+					text: JSON.stringify({
+						success: true,
+						clip: { id, streamId: existing.streamId, startTime: newStart, endTime: newEnd, title: title ?? existing.title, notes: notes ?? existing.notes },
+						message: `Clip updated: ${newEnd - newStart}s region.`
+					})
+				}]
+			};
+		} catch (err) {
+			return {
+				isError: true,
+				content: [{ type: 'text' as const, text: `Failed to update clip: ${err instanceof Error ? err.message : String(err)}` }]
+			};
+		}
+	}
+);
+
+// ---------------------------------------------------------------------------
+// Tool 11 — get_clips
+// ---------------------------------------------------------------------------
+
+mcpServer.tool(
+	'get_clips',
+	'Get the full details of one or more clips by ID. Accepts a single clip ID string or an array of clip ID strings.',
+	{
+		id: z.union([z.string(), z.array(z.string())]).describe('A single clip ID or an array of clip IDs to look up')
+	},
+	async ({ id }) => {
+		const ids = Array.isArray(id) ? id : [id];
+		const allClips = getAllClipRegions();
+		const found = [];
+		const notFound = [];
+
+		for (const clipId of ids) {
+			const clip = allClips.find((c) => c.id === clipId);
+			if (clip) {
+				const stream = getStream(clip.streamId);
+				found.push({
+					...clip,
+					channel: stream?.channel ?? null,
+					startTimeISO: new Date(clip.startTime * 1000).toISOString(),
+					endTimeISO: new Date(clip.endTime * 1000).toISOString(),
+					durationSeconds: Math.round(clip.endTime - clip.startTime)
+				});
+			} else {
+				notFound.push(clipId);
+			}
+		}
+
+		return {
+			content: [{
+				type: 'text' as const,
+				text: JSON.stringify({
+					count: found.length,
+					clips: found,
+					...(notFound.length > 0 && { notFound })
+				})
+			}]
+		};
+	}
+);
+
+// ---------------------------------------------------------------------------
+// Tool 12 — get_chat_hotspots
 // ---------------------------------------------------------------------------
 
 mcpServer.tool(
@@ -593,6 +811,109 @@ mcpServer.tool(
 				{
 					type: 'text' as const,
 					text: JSON.stringify({ transcriptionId, wordCount: words.length, words })
+				}
+			]
+		};
+	}
+);
+
+// ---------------------------------------------------------------------------
+// Tool 13 — export_video  (mutating)
+// ---------------------------------------------------------------------------
+
+mcpServer.tool(
+	'export_video',
+	'Export a video from one or more clips, stitched in the specified order. Returns immediately with an export ID — the encode runs in the background. Use list_exports to check status.',
+	{
+		clipIds: z.array(z.string()).min(1).describe('Ordered list of clip IDs to include in the export'),
+		title: z.string().describe('Title for the exported video (used as filename)'),
+		description: z.string().optional().describe('Optional description of the export'),
+		chronological: z.boolean().optional().default(false).describe('If true, automatically sort clips by start time instead of using the provided order')
+	},
+	async ({ clipIds, title, description, chronological }) => {
+		try {
+			let finalClipIds = clipIds;
+			if (chronological) {
+				const allClips = getAllClipRegions();
+				const clipMap = new Map(allClips.map((c) => [c.id, c]));
+				finalClipIds = [...clipIds].sort((a, b) => {
+					const ca = clipMap.get(a);
+					const cb = clipMap.get(b);
+					if (!ca || !cb) return 0;
+					return ca.startTime - cb.startTime;
+				});
+			}
+			const record = createAndQueueExport(finalClipIds, title, description);
+			return {
+				content: [
+					{
+						type: 'text' as const,
+						text: JSON.stringify({
+							success: true,
+							exportId: record.id,
+							message: `Export "${title}" queued with ${finalClipIds.length} clip(s)${chronological ? ' (sorted chronologically)' : ''}. Use list_exports to check status.`
+						})
+					}
+				]
+			};
+		} catch (err) {
+			return {
+				isError: true,
+				content: [
+					{
+						type: 'text' as const,
+						text: `Failed to queue export: ${err instanceof Error ? err.message : String(err)}`
+					}
+				]
+			};
+		}
+	}
+);
+
+// ---------------------------------------------------------------------------
+// Tool 14 — list_exports
+// ---------------------------------------------------------------------------
+
+mcpServer.tool(
+	'list_exports',
+	'List all video exports with their status (pending, exporting, ready, error). Most recent first.',
+	{},
+	async () => {
+		const exports = smLoadAllExports();
+		return {
+			content: [
+				{
+					type: 'text' as const,
+					text: JSON.stringify({ count: exports.length, exports })
+				}
+			]
+		};
+	}
+);
+
+// ---------------------------------------------------------------------------
+// Tool 15 — get_export
+// ---------------------------------------------------------------------------
+
+mcpServer.tool(
+	'get_export',
+	'Get the status and details of a specific video export by ID.',
+	{
+		exportId: z.string().describe('The export ID to look up')
+	},
+	async ({ exportId }) => {
+		const record = smLoadExport(exportId);
+		if (!record) {
+			return {
+				isError: true,
+				content: [{ type: 'text' as const, text: `Export "${exportId}" not found.` }]
+			};
+		}
+		return {
+			content: [
+				{
+					type: 'text' as const,
+					text: JSON.stringify(record)
 				}
 			]
 		};
