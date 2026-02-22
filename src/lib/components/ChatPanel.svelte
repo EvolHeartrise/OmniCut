@@ -1,20 +1,12 @@
 <script lang="ts">
 	import {
-		streams,
-		syncOffsets,
-		focusedStreamId,
-		soloStreamId,
 		masterTime,
 		masterPlaying,
-		seekRequest,
-		deriveVisibleStreams
+		seekRequest
 	} from '$lib/stores/streams.js';
-	import { TRACK_COLORS as COLORS } from '$lib/constants.js';
+	import { createPanelQueryState } from '$lib/panelQueryRanges.svelte.js';
 	import { usernameColor } from '$lib/utils.js';
 	import { getMultiStreamChat } from '$lib/streams.remote';
-
-	const FETCH_WINDOW = 120; // ±120 seconds around playhead
-	const REFETCH_THRESHOLD = 30; // re-fetch when playhead drifts 30s from last center
 
 	let searchQuery = $state('');
 	let listEl = $state<HTMLDivElement | null>(null);
@@ -32,44 +24,17 @@
 		userColor: string; // resolved chat color (real or fallback)
 	}
 
-	// Debounced center for query args — only updates when playhead drifts far enough.
-	let debouncedCenter = $state($masterTime);
-	let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+	// Shared debounced query state (visible streams + windowed ranges)
+	const queryState = createPanelQueryState();
 
-	$effect(() => {
-		const now = $masterTime;
-		if (Math.abs(now - debouncedCenter) >= REFETCH_THRESHOLD && !debounceTimer) {
-			const snapshotTime = now;
-			debounceTimer = setTimeout(() => {
-				debounceTimer = null;
-				debouncedCenter = snapshotTime;
-			}, 300);
-		}
-	});
-
-	// Build stream lookup for visible streams
-	let visibleStreams = $derived(deriveVisibleStreams($streams, $syncOffsets, $focusedStreamId || $soloStreamId, COLORS));
-
-	// Derive query ranges from debounced center + visible streams
-	let chatRanges = $derived(
-		visibleStreams.map((s) => {
-			const localCenter = debouncedCenter - s.anchor + s.offset;
-			return {
-				streamId: s.id,
-				from: Math.max(0, localCenter - FETCH_WINDOW),
-				to: localCenter + FETCH_WINDOW
-			};
-		})
-	);
-
-	// Fetch chat messages via remote query — re-fetches when chatRanges changes.
+	// Fetch chat messages via remote query — re-fetches when queryState.ranges changes.
 	// Cap at 500 per stream to avoid freezing on high-volume VODs (we only display 100).
-	const rawMessages = $derived(await getMultiStreamChat({ ranges: chatRanges, limit: 500 }));
+	const rawMessages = $derived(await getMultiStreamChat({ ranges: queryState.ranges, limit: 500 }));
 
 	// Transform server data to ChatEntry format with master-time positioning
 	let fetchedEntries = $derived.by(() => {
 		if (!rawMessages || rawMessages.length === 0) return [] as ChatEntry[];
-		const streamLookup = new Map(visibleStreams.map((s) => [s.id, s]));
+		const streamLookup = new Map(queryState.visibleStreams.map((s) => [s.id, s]));
 		return rawMessages.map((m) => {
 			const s = streamLookup.get(m.streamId);
 			return {
@@ -129,11 +94,10 @@
 		scrollTimeout = setTimeout(() => { userScrolled = false; }, 5000);
 	}
 
-	// Clean up scroll timeout and debounce timer on unmount
+	// Clean up scroll timeout on unmount
 	$effect(() => {
 		return () => {
 			if (scrollTimeout) clearTimeout(scrollTimeout);
-			if (debounceTimer) clearTimeout(debounceTimer);
 		};
 	});
 

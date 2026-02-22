@@ -45,7 +45,6 @@ import {
 	type BrowseStreamEdge,
 	type VideoEdge
 } from '$lib/server/twitchApi.js';
-import type { ChatMessage } from '$lib/server/types.js';
 import type { ChannelInfo, VodInfo } from '$lib/types.js';
 
 // ---------------------------------------------------------------------------
@@ -69,7 +68,7 @@ export const getChatHeatmap = query('unchecked', async (args: { streamId: string
 export const getMultiStreamChat = query(
 	'unchecked',
 	async (args: { ranges: Array<{ streamId: string; from: number; to: number }>; limit?: number }) => {
-		const results: Array<ChatMessage & { id: number; streamId: string }> = [];
+		const results: Array<ReturnType<typeof smGetChatMessagesInRange>[number] & { streamId: string }> = [];
 		for (const range of args.ranges) {
 			const messages = smGetChatMessagesInRange(range.streamId, range.from, range.to, undefined, args.limit);
 			for (const m of messages) {

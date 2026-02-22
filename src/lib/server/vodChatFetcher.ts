@@ -29,7 +29,15 @@ const VOD_COMMENTS_QUERY = `query($videoID: ID!, $cursor: Cursor) {
  * or a bare numeric string.
  */
 export function extractVideoId(sourceUrl: string): string | null {
-	const match = sourceUrl.match(/(?:twitch\.tv\/videos\/|^)(\d+)$/);
+	const match = sourceUrl.match(/(?:twitch\.tv\/videos\/|^)(\d+)/);
+	return match ? match[1] : null;
+}
+
+/**
+ * Extract a Douyu room ID from a URL like https://douyu.com/12345
+ */
+export function extractDouyuRoomId(sourceUrl: string): string | null {
+	const match = sourceUrl.match(/douyu\.com\/(\d+)/);
 	return match ? match[1] : null;
 }
 

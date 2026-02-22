@@ -20,6 +20,7 @@ type Statement = import('bun:sqlite').Statement;
 let stmtSaveChatMessage: Statement | null = null;
 let stmtSaveTranscription: Statement | null = null;
 let stmtSaveWord: Statement | null = null;
+let stmtSaveStream: Statement | null = null;
 
 /**
  * Initialize the SQLite database, creating tables if they don't exist.
@@ -242,6 +243,29 @@ export async function initDatabase(): Promise<void> {
 	stmtSaveWord = db.prepare(
 		'INSERT INTO transcription_words (transcription_id, word, start_time, end_time) VALUES (?, ?, ?, ?)'
 	);
+	stmtSaveStream = db.prepare(
+		`INSERT INTO streams
+		(id, channel, status, started_at, error, segment_count, disk_usage_bytes,
+		 viewer_count, stream_title, game_name, recording_dir, offset, source_type, parent_stream_id, platform, source_url, chat_complete, duration_seconds)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			status = excluded.status,
+			started_at = excluded.started_at,
+			error = excluded.error,
+			segment_count = excluded.segment_count,
+			disk_usage_bytes = excluded.disk_usage_bytes,
+			viewer_count = excluded.viewer_count,
+			stream_title = excluded.stream_title,
+			game_name = excluded.game_name,
+			recording_dir = excluded.recording_dir,
+			offset = excluded.offset,
+			source_type = excluded.source_type,
+			parent_stream_id = excluded.parent_stream_id,
+			platform = excluded.platform,
+			source_url = excluded.source_url,
+			chat_complete = excluded.chat_complete,
+			duration_seconds = excluded.duration_seconds`
+	);
 }
 
 // --- Row types for query results ---
@@ -333,50 +357,55 @@ function getDb(): Database {
 // --- Streams ---
 
 export function saveStream(info: StreamInfo): void {
-	const d = getDb();
-	d.run(
-		`INSERT INTO streams
-		(id, channel, status, started_at, error, segment_count, disk_usage_bytes,
-		 viewer_count, stream_title, game_name, recording_dir, offset, source_type, parent_stream_id, platform, source_url, chat_complete, duration_seconds)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
-			status = excluded.status,
-			started_at = excluded.started_at,
-			error = excluded.error,
-			segment_count = excluded.segment_count,
-			disk_usage_bytes = excluded.disk_usage_bytes,
-			viewer_count = excluded.viewer_count,
-			stream_title = excluded.stream_title,
-			game_name = excluded.game_name,
-			recording_dir = excluded.recording_dir,
-			offset = excluded.offset,
-			source_type = excluded.source_type,
-			parent_stream_id = excluded.parent_stream_id,
-			platform = excluded.platform,
-			source_url = excluded.source_url,
-			chat_complete = excluded.chat_complete,
-			duration_seconds = excluded.duration_seconds`,
-		[
-			info.id,
-			info.channel,
-			info.status,
-			info.startedAt,
-			info.error || null,
-			info.segmentCount,
-			info.diskUsageBytes,
-			info.viewerCount,
-			info.streamTitle,
-			info.gameName,
-			info.recordingDir,
-			info.offset,
-			info.sourceType,
-			info.parentStreamId,
-			info.platform,
-			info.sourceUrl,
-			info.chatComplete ? 1 : 0,
-			info.durationSeconds
-		]
-	);
+	const params = [
+		info.id,
+		info.channel,
+		info.status,
+		info.startedAt,
+		info.error || null,
+		info.segmentCount,
+		info.diskUsageBytes,
+		info.viewerCount,
+		info.streamTitle,
+		info.gameName,
+		info.recordingDir,
+		info.offset,
+		info.sourceType,
+		info.parentStreamId,
+		info.platform,
+		info.sourceUrl,
+		info.chatComplete ? 1 : 0,
+		info.durationSeconds
+	];
+	if (stmtSaveStream) {
+		stmtSaveStream.run(...params);
+	} else {
+		const d = getDb();
+		d.run(
+			`INSERT INTO streams
+			(id, channel, status, started_at, error, segment_count, disk_usage_bytes,
+			 viewer_count, stream_title, game_name, recording_dir, offset, source_type, parent_stream_id, platform, source_url, chat_complete, duration_seconds)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(id) DO UPDATE SET
+				status = excluded.status,
+				started_at = excluded.started_at,
+				error = excluded.error,
+				segment_count = excluded.segment_count,
+				disk_usage_bytes = excluded.disk_usage_bytes,
+				viewer_count = excluded.viewer_count,
+				stream_title = excluded.stream_title,
+				game_name = excluded.game_name,
+				recording_dir = excluded.recording_dir,
+				offset = excluded.offset,
+				source_type = excluded.source_type,
+				parent_stream_id = excluded.parent_stream_id,
+				platform = excluded.platform,
+				source_url = excluded.source_url,
+				chat_complete = excluded.chat_complete,
+				duration_seconds = excluded.duration_seconds`,
+			params
+		);
+	}
 }
 
 export function deleteStream(id: string): void {

@@ -255,7 +255,6 @@
 
 	let chatHeatmapRaw = $state<Record<string, { buckets: Array<{ time: number; count: number }>; max: number }>>({});
 	let heatmapFetchedIds = new Set<string>();
-	let heatmapRefreshTimer: ReturnType<typeof setInterval> | null = null;
 
 	function fetchHeatmapForStream(sid: string) {
 		getChatHeatmap({ streamId: sid, bucket: CHAT_BUCKET_SECONDS })
@@ -265,6 +264,7 @@
 			.catch(() => {});
 	}
 
+	// Fetch heatmap for newly-added streams; clean up stale entries
 	$effect(() => {
 		const allStreamIds = new Set(tracksData.flatMap((t) => t.bars.map((b) => b.streamId)));
 
@@ -283,21 +283,29 @@
 			heatmapFetchedIds.add(sid);
 			fetchHeatmapForStream(sid);
 		}
+	});
 
-		// Set up periodic refresh for active (non-stopped) streams
-		if (heatmapRefreshTimer) clearInterval(heatmapRefreshTimer);
-		const activeIds = $streams
-			.filter((s) => s.status !== 'stopped' && allStreamIds.has(s.id))
-			.map((s) => s.id);
-		if (activeIds.length > 0) {
-			heatmapRefreshTimer = setInterval(() => {
-				for (const sid of activeIds) fetchHeatmapForStream(sid);
-			}, HEATMAP_REFRESH_MS);
-		}
+	// Derive the sorted key of active (non-stopped) stream IDs for interval stability.
+	// This only changes when streams are added/removed/stopped — not on every SSE update.
+	let activeHeatmapKey = $derived(
+		$streams
+			.filter((s) => s.status !== 'stopped')
+			.map((s) => s.id)
+			.sort()
+			.join(',')
+	);
 
-		return () => {
-			if (heatmapRefreshTimer) clearInterval(heatmapRefreshTimer);
-		};
+	// Periodic refresh interval — only recreated when activeHeatmapKey changes
+	$effect(() => {
+		const key = activeHeatmapKey;
+		const activeIds = key ? key.split(',') : [];
+		if (activeIds.length === 0) return;
+
+		const timer = setInterval(() => {
+			for (const sid of activeIds) fetchHeatmapForStream(sid);
+		}, HEATMAP_REFRESH_MS);
+
+		return () => clearInterval(timer);
 	});
 
 	// Canvas refs for chat heatmap — keyed by stream ID

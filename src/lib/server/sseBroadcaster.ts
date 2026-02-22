@@ -46,14 +46,6 @@ export function deleteCounts(streamId: string): void {
 	lastBroadcast.delete(streamId);
 }
 
-export function getChatMessageCount(streamId: string): number {
-	return chatMessageCounts.get(streamId) ?? 0;
-}
-
-export function getTranscriptionCount(streamId: string): number {
-	return transcriptionCounts.get(streamId) ?? 0;
-}
-
 export function resetTranscriptionCount(streamId: string): void {
 	transcriptionCounts.set(streamId, 0);
 }
@@ -92,10 +84,6 @@ export function broadcastUpdate(info: StreamInfo) {
 	if (lastBroadcast.get(info.id) === payload) return;
 	lastBroadcast.set(info.id, payload);
 	broadcast(payload);
-}
-
-export function clearBroadcastCache(streamId: string) {
-	lastBroadcast.delete(streamId);
 }
 
 export function broadcastTranscription(streamId: string, text: string, startTime: number, endTime: number, words?: WordTimestamp[]) {

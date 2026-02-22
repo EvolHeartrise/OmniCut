@@ -1,21 +1,13 @@
 <script lang="ts">
 	import {
-		streams,
-		syncOffsets,
-		focusedStreamId,
-		soloStreamId,
 		masterTime,
 		seekRequest,
 		transcriptions,
-		deriveVisibleStreams,
 		type TranscriptionEntry
 	} from '$lib/stores/streams.js';
-	import { TRACK_COLORS as COLORS } from '$lib/constants.js';
+	import { createPanelQueryState } from '$lib/panelQueryRanges.svelte.js';
 	import { getMultiStreamTranscriptions } from '$lib/streams.remote';
 	import { formatTime } from '$lib/utils.js';
-
-	const FETCH_WINDOW = 120; // ±120 seconds around playhead
-	const REFETCH_THRESHOLD = 30; // re-fetch when playhead drifts 30s from last center
 
 	let searchQuery = $state('');
 	let listEl = $state<HTMLDivElement | null>(null);
@@ -32,38 +24,11 @@
 		masterEnd: number;
 	}
 
-	// Debounced center for query args — only updates when playhead drifts far enough.
-	let debouncedCenter = $state($masterTime);
-	let debounceTimer: ReturnType<typeof setTimeout> | null = null;
-
-	$effect(() => {
-		const now = $masterTime;
-		if (Math.abs(now - debouncedCenter) >= REFETCH_THRESHOLD && !debounceTimer) {
-			const snapshotTime = now;
-			debounceTimer = setTimeout(() => {
-				debounceTimer = null;
-				debouncedCenter = snapshotTime;
-			}, 300);
-		}
-	});
-
-	// Build stream lookup for visible streams
-	let visibleStreams = $derived(deriveVisibleStreams($streams, $syncOffsets, $focusedStreamId || $soloStreamId, COLORS));
-
-	// Derive query ranges from debounced center + visible streams
-	let transcriptRanges = $derived(
-		visibleStreams.map((s) => {
-			const localCenter = debouncedCenter - s.anchor + s.offset;
-			return {
-				streamId: s.id,
-				from: Math.max(0, localCenter - FETCH_WINDOW),
-				to: localCenter + FETCH_WINDOW
-			};
-		})
-	);
+	// Shared debounced query state (visible streams + windowed ranges)
+	const queryState = createPanelQueryState();
 
 	// Fetch transcriptions via remote query — re-fetches when ranges change
-	const rawEntries = $derived(await getMultiStreamTranscriptions({ ranges: transcriptRanges }));
+	const rawEntries = $derived(await getMultiStreamTranscriptions({ ranges: queryState.ranges }));
 
 	// Feed StreamTile captions from the wider ±120s window (superset of ±60s caption window)
 	$effect(() => {
@@ -80,7 +45,7 @@
 	// Transform server data to TaggedEntry format with master-time positioning
 	let fetchedEntries = $derived.by(() => {
 		if (!rawEntries || rawEntries.length === 0) return [] as TaggedEntry[];
-		const streamLookup = new Map(visibleStreams.map((s) => [s.id, s]));
+		const streamLookup = new Map(queryState.visibleStreams.map((s) => [s.id, s]));
 		return rawEntries.map((e) => {
 			const s = streamLookup.get(e.streamId);
 			return {
@@ -143,11 +108,10 @@
 		}, 3000);
 	}
 
-	// Clean up scroll timeout and debounce timer on unmount
+	// Clean up scroll timeout on unmount
 	$effect(() => {
 		return () => {
 			if (scrollTimeout) clearTimeout(scrollTimeout);
-			if (debounceTimer) clearTimeout(debounceTimer);
 		};
 	});
 

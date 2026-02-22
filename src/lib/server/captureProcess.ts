@@ -182,39 +182,30 @@ export function startCapture(
 	let sourceProc: ReturnType<typeof Bun.spawn> | null = null;
 	let ffmpegProc: ReturnType<typeof Bun.spawn> | null = null;
 
-	// Common setup: segment watcher, metadata polling, kill function
-	let lastKnownSegCount = 0;
+	// Segment watcher: probes for the next expected sequential file (seg%06d.ts)
+	// instead of readdir-ing the whole directory every second.
+	let nextSegIndex = 0;
 	let cumulativeDiskUsage = 0;
-	const knownFiles = new Set<string>();
 	const segmentWatchInterval = setInterval(async () => {
 		if (info.status === 'stopped' || info.status === 'error') return;
 		try {
-			const allFiles = await fs.promises.readdir(recordingDir);
-			const tsFiles = allFiles.filter((f) => f.endsWith('.ts'));
-			const newSegCount = tsFiles.length;
-
-			if (newSegCount !== lastKnownSegCount) {
-				// Only stat NEW files incrementally instead of re-statting everything
-				const newFiles = allFiles.filter((f) => !knownFiles.has(f));
-				if (newFiles.length > 0) {
-					const newSizes = await Promise.all(
-						newFiles.map(async (f) => {
-							try {
-								const stat = await fs.promises.stat(path.join(recordingDir, f));
-								return stat.size;
-							} catch { return 0; }
-						})
-					);
-					cumulativeDiskUsage += newSizes.reduce((a, b) => a + b, 0);
-					for (const f of newFiles) knownFiles.add(f);
+			// Probe sequentially for new segments
+			while (true) {
+				const segName = `seg${String(nextSegIndex).padStart(6, '0')}.ts`;
+				const segPath = path.join(recordingDir, segName);
+				try {
+					const stat = await fs.promises.stat(segPath);
+					cumulativeDiskUsage += stat.size;
+					nextSegIndex++;
+				} catch {
+					break; // File doesn't exist yet — stop probing
 				}
-				lastKnownSegCount = newSegCount;
 			}
 
-			info.segmentCount = newSegCount;
+			info.segmentCount = nextSegIndex;
 			info.diskUsageBytes = cumulativeDiskUsage;
 
-			if (newSegCount > 0 && info.status === 'starting') {
+			if (nextSegIndex > 0 && info.status === 'starting') {
 				info.status = 'capturing';
 			}
 			onStatusChange(info);

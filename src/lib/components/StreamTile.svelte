@@ -226,10 +226,10 @@
 		const now = performance.now();
 		if (now - lastStateUpdate >= STATE_UPDATE_INTERVAL) {
 			lastStateUpdate = now;
-			streamPlaybackStates.update((s) => ({
-				...s,
-				[stream.id]: { currentTime, duration, paused: videoEl.paused }
-			}));
+			streamPlaybackStates.update((s) => {
+				s[stream.id] = { currentTime, duration, paused: videoEl.paused };
+				return s;
+			});
 		}
 	}
 
