@@ -13,7 +13,7 @@
 
 import type { RequestHandler } from '@sveltejs/kit';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
-import { mcpServer } from '$lib/server/mcp.js';
+import { createMcpServer } from '$lib/server/mcp.js';
 
 /**
  * Session management: we keep one transport per session so that stateful
@@ -36,8 +36,10 @@ function getOrCreateTransport(sessionId?: string): WebStandardStreamableHTTPServ
 		}
 	});
 
-	// Connect the transport to the shared MCP server
-	mcpServer.connect(transport);
+	// Each session gets its own McpServer instance (the SDK only allows
+	// one transport per Protocol instance).
+	const server = createMcpServer();
+	server.connect(transport);
 
 	return transport;
 }

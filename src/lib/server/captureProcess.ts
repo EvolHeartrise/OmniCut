@@ -174,7 +174,8 @@ export function startCapture(
 		parentStreamId: null,
 		platform,
 		sourceUrl: vodUrl || null,
-		chatComplete: false
+		chatComplete: false,
+		durationSeconds: null
 	};
 
 	// Processes to track (populated differently per platform)

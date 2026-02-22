@@ -59,6 +59,16 @@ export async function initStreamManager(): Promise<void> {
 		// Mark all restored streams as stopped (processes are gone after restart)
 		info.status = 'stopped';
 
+		// Backfill VOD duration from HLS playlist if not stored yet
+		if (info.sourceType === 'vod' && info.durationSeconds == null) {
+			const playlistPath = path.join(info.recordingDir, 'playlist.m3u8');
+			const dur = parsePlaylistDuration(playlistPath);
+			if (dur > 0) {
+				info.durationSeconds = dur;
+				db.saveStream(info);
+			}
+		}
+
 		const stubHandle: CaptureHandle = {
 			info,
 			kill: () => {},
@@ -132,8 +142,8 @@ export async function addStream(channel: string, language?: string | null, platf
 		// Start transcription once segments begin appearing (guarded — only once per capture)
 		if (info.status === 'capturing' && !handle.transcriptionStarted) {
 			handle.transcriptionStarted = true;
-			startTranscription(id, info.recordingDir, (_streamId, text, startTime, endTime) => {
-				broadcastTranscription(id, text, startTime, endTime);
+			startTranscription(id, info.recordingDir, (_streamId, text, startTime, endTime, words) => {
+				broadcastTranscription(id, text, startTime, endTime, words);
 			}, transcriptionLanguage);
 
 			// Start chat collection for live streams (Twitch only — guarded)
@@ -184,8 +194,8 @@ export async function addVodStream(channel: string, language?: string | null): P
 
 		if (info.status === 'capturing' && !vodHandle.transcriptionStarted) {
 			vodHandle.transcriptionStarted = true;
-			startTranscription(vodId, info.recordingDir, (_streamId, text, startTime, endTime) => {
-				broadcastTranscription(vodId, text, startTime, endTime);
+			startTranscription(vodId, info.recordingDir, (_streamId, text, startTime, endTime, words) => {
+				broadcastTranscription(vodId, text, startTime, endTime, words);
 			}, transcriptionLanguage);
 
 			// Start VOD chat download (guarded — only once per capture)
@@ -272,8 +282,8 @@ export async function addVodByUrl(vodUrl: string, language?: string | null): Pro
 			// Full-file transcription once VOD download completes
 			if (info.status === 'stopped' && !vodHandle.transcriptionStarted) {
 				vodHandle.transcriptionStarted = true;
-				transcribeFullRecording(id, info.recordingDir, (_streamId, text, startTime, endTime) => {
-					broadcastTranscription(id, text, startTime, endTime);
+				transcribeFullRecording(id, info.recordingDir, (_streamId, text, startTime, endTime, words) => {
+					broadcastTranscription(id, text, startTime, endTime, words);
 				}, transcriptionLanguage).catch((err) => {
 					console.error(`[vod:douyu:${roomId}] Full transcription failed:`, err);
 				});
@@ -330,8 +340,8 @@ export async function addVodByUrl(vodUrl: string, language?: string | null): Pro
 		// Full-file transcription once VOD download completes
 		if (info.status === 'stopped' && !vodHandle.transcriptionStarted) {
 			vodHandle.transcriptionStarted = true;
-			transcribeFullRecording(id, info.recordingDir, (_streamId, text, startTime, endTime) => {
-				broadcastTranscription(id, text, startTime, endTime);
+			transcribeFullRecording(id, info.recordingDir, (_streamId, text, startTime, endTime, words) => {
+				broadcastTranscription(id, text, startTime, endTime, words);
 			}, transcriptionLanguage).catch((err) => {
 				console.error(`[vod:${channel}] Full transcription failed:`, err);
 			});
@@ -342,6 +352,7 @@ export async function addVodByUrl(vodUrl: string, language?: string | null): Pro
 		vodHandle.info.startedAt = Date.parse(meta.createdAt);
 	}
 	vodHandle.info.streamTitle = meta.title;
+	vodHandle.info.durationSeconds = meta.durationSeconds;
 
 	captures.set(id, vodHandle);
 	db.saveStream(vodHandle.info);
@@ -430,8 +441,8 @@ export function resumeVodStream(id: string): boolean {
 		// Full-file transcription when download completes
 		if (info.status === 'stopped' && !newHandle.transcriptionStarted) {
 			newHandle.transcriptionStarted = true;
-			transcribeFullRecording(id, info.recordingDir, (_streamId, text, startTime, endTime) => {
-				broadcastTranscription(id, text, startTime, endTime);
+			transcribeFullRecording(id, info.recordingDir, (_streamId, text, startTime, endTime, words) => {
+				broadcastTranscription(id, text, startTime, endTime, words);
 			}, language).catch((err) => {
 				console.error(`[vod:${channel}] Full transcription failed on resume:`, err);
 			});
@@ -503,8 +514,8 @@ export function retranscribeStream(id: string): boolean {
 	const language = db.getChannelSettings(handle.info.channel)?.language ?? null;
 
 	// Full transcription with error logging
-	transcribeFullRecording(id, handle.info.recordingDir, (_streamId, text, startTime, endTime) => {
-		broadcastTranscription(id, text, startTime, endTime);
+	transcribeFullRecording(id, handle.info.recordingDir, (_streamId, text, startTime, endTime, words) => {
+		broadcastTranscription(id, text, startTime, endTime, words);
 	}, language).catch((err) => {
 		console.error(`[retranscribe:${handle.info.channel}] Full transcription failed:`, err);
 	});
@@ -580,15 +591,15 @@ export function updateStreamOffset(id: string, offset: number): boolean {
 // --- Clip regions (delegated to clipManager.ts) ---
 export { addClipRegion, removeClipRegion, getAllClipRegions } from './clipManager.js';
 
-export function getTranscriptionsInRange(id: string, fromTime: number, toTime: number): Array<{ id: number; text: string; startTime: number; endTime: number }> {
-	return db.loadTranscriptionsInRange(id, fromTime, toTime);
+export function getTranscriptionsInRange(id: string, fromTime: number, toTime: number, query?: string): Array<{ id: number; text: string; startTime: number; endTime: number }> {
+	return db.loadTranscriptionsInRange(id, fromTime, toTime, query);
 }
 
 /**
  * Get chat messages for a stream within a time range (stream-local seconds).
  */
-export function getChatMessagesInRange(id: string, fromTime: number, toTime: number): (ChatMessage & { id: number })[] {
-	return db.loadChatMessagesInRange(id, fromTime, toTime);
+export function getChatMessagesInRange(id: string, fromTime: number, toTime: number, query?: string): (ChatMessage & { id: number })[] {
+	return db.loadChatMessagesInRange(id, fromTime, toTime, query);
 }
 
 /**

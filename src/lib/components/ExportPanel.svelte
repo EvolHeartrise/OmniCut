@@ -18,7 +18,8 @@
 			const dur = clip.endTime - clip.startTime;
 			return {
 				channel: stream?.channel || 'unknown',
-				duration: dur
+				duration: dur,
+				title: clip.title || 'Untitled'
 			};
 		})
 	);
@@ -26,6 +27,27 @@
 	let totalDuration = $derived(
 		clipSummary.reduce((sum, c) => sum + c.duration, 0)
 	);
+
+	let chaptersText = $derived.by(() => {
+		let offset = 0;
+		return clipSummary.map((clip) => {
+			const mins = Math.floor(offset / 60);
+			const secs = Math.floor(offset % 60);
+			const ts = `${mins}:${secs.toString().padStart(2, '0')}`;
+			const line = `${ts} ${clip.title}`;
+			offset += clip.duration;
+			return line;
+		}).join('\n');
+	});
+
+	let chaptersCopied = $state(false);
+
+	function copyChapters() {
+		navigator.clipboard.writeText(chaptersText).then(() => {
+			chaptersCopied = true;
+			setTimeout(() => chaptersCopied = false, 2000);
+		});
+	}
 
 	// Auto-scroll log when new entries arrive
 	$effect(() => {
@@ -64,10 +86,20 @@
 				{#each clipSummary as clip, i}
 					<div class="clip-row">
 						<span class="clip-index">{i + 1}</span>
-						<span class="clip-channel">{clip.channel}</span>
+						<span class="clip-title">{clip.title}</span>
 						<span class="clip-duration">{formatDuration(clip.duration)}</span>
 					</div>
 				{/each}
+			</div>
+
+			<div class="chapters-section">
+				<div class="chapters-header">
+					<span class="chapters-label">YouTube Chapters</span>
+					<button class="btn-copy" onclick={copyChapters}>
+						{chaptersCopied ? 'Copied!' : 'Copy'}
+					</button>
+				</div>
+				<textarea class="chapters-text" readonly rows="6">{chaptersText}</textarea>
 			</div>
 
 			<div class="export-form">
@@ -181,7 +213,7 @@
 		flex-shrink: 0;
 	}
 
-	.clip-channel {
+	.clip-title {
 		color: #ccc;
 		flex: 1;
 		overflow: hidden;
@@ -194,6 +226,57 @@
 		font-variant-numeric: tabular-nums;
 		font-family: monospace;
 		flex-shrink: 0;
+	}
+
+	.chapters-section {
+		margin-bottom: 20px;
+	}
+
+	.chapters-header {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		margin-bottom: 6px;
+	}
+
+	.chapters-label {
+		font-size: 0.75rem;
+		color: #aaa;
+		font-weight: 600;
+	}
+
+	.btn-copy {
+		background: #2a2a4a;
+		border: 1px solid #3a3a5a;
+		color: #ccc;
+		font-size: 0.7rem;
+		padding: 3px 10px;
+		border-radius: 4px;
+		cursor: pointer;
+		transition: background 0.15s;
+	}
+
+	.btn-copy:hover {
+		background: #3a3a5a;
+	}
+
+	.chapters-text {
+		width: 100%;
+		background: #0f0f23;
+		border: 1px solid #2a2a4a;
+		border-radius: 6px;
+		color: #e0e0ff;
+		font-size: 0.72rem;
+		font-family: monospace;
+		padding: 8px 10px;
+		resize: vertical;
+		outline: none;
+		line-height: 1.5;
+		box-sizing: border-box;
+	}
+
+	.chapters-text:focus {
+		border-color: #7c3aed;
 	}
 
 	.export-form {

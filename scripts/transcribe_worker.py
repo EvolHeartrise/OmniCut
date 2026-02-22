@@ -112,13 +112,24 @@ def main():
                 if w.word.rstrip().endswith((".", "!", "?")):
                     text = "".join(bw.word for bw in buf).strip()
                     if text:
-                        sentences.append({"text": text, "start": buf[0].start, "end": buf[-1].end})
+                        sentences.append({
+                            "text": text,
+                            "start": buf[0].start,
+                            "end": buf[-1].end,
+                            "words": [{"word": bw.word, "start": bw.start, "end": bw.end} for bw in buf],
+                        })
                     buf = []
             # Flush remaining words as a partial (incomplete) sentence
             if buf:
                 text = "".join(bw.word for bw in buf).strip()
                 if text:
-                    sentences.append({"text": text, "start": buf[0].start, "end": buf[-1].end, "partial": True})
+                    sentences.append({
+                        "text": text,
+                        "start": buf[0].start,
+                        "end": buf[-1].end,
+                        "partial": True,
+                        "words": [{"word": bw.word, "start": bw.start, "end": bw.end} for bw in buf],
+                    })
             print(json.dumps({"sentences": sentences}), flush=True)
         except Exception as e:
             print(json.dumps({"sentences": [], "error": str(e)}), flush=True)

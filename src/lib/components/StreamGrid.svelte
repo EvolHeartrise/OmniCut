@@ -19,21 +19,34 @@
 		return keys;
 	});
 
-	// Only show streams whose track bar intersects the master playhead
+	/** Get the known duration for a stream: prefer server-side durationSeconds, fall back to HLS-reported duration. */
+	function getDuration(s: (typeof activeStreams)[number]): number {
+		if (s.durationSeconds != null && s.durationSeconds > 0) return s.durationSeconds;
+		const pb = $streamPlaybackStates[s.id];
+		return pb?.duration ?? 0;
+	}
+
+	/** Check whether the master playhead is inside a stream's time range. */
+	function containsPlayhead(s: (typeof activeStreams)[number], dur: number): boolean {
+		const off = $syncOffsets[s.id] || 0;
+		const anchor = s.startedAt / 1000;
+		return $masterTime >= anchor - off && $masterTime <= anchor + dur - off;
+	}
+
+	// Only show streams whose track bar intersects the master playhead.
+	// VODs with known duration that don't intersect are filtered out.
+	// Live streams or VODs without any duration info are kept visible.
 	let visibleStreams = $derived(
 		activeStreams.filter((s) => {
-			const pb = $streamPlaybackStates[s.id];
-			if (!pb || pb.duration === 0) return true;
-			const offset = $syncOffsets[s.id] || 0;
-			const anchor = s.startedAt / 1000;
-			const trackStart = anchor - offset;
-			const trackEnd = anchor + pb.duration - offset;
-			return $masterTime >= trackStart && $masterTime <= trackEnd;
+			const dur = getDuration(s);
+			if (dur === 0) return true; // No duration known yet — keep visible
+			return containsPlayhead(s, dur);
 		})
 	);
 
 	// One video player per track: VODs from the same channel share a track,
 	// so keep only the best candidate (the one the playhead is actually over).
+	// If no VOD on the track contains the playhead, the track gets no player.
 	let onePerTrack = $derived.by(() => {
 		const best = new Map<string, (typeof visibleStreams)[number]>();
 		for (const s of visibleStreams) {
@@ -48,29 +61,27 @@
 				continue;
 			}
 			// Both are VODs on the same track — prefer the one containing the playhead
-			const sPb = $streamPlaybackStates[s.id];
-			const ePb = $streamPlaybackStates[existing.id];
-			const sOff = $syncOffsets[s.id] || 0;
-			const eOff = $syncOffsets[existing.id] || 0;
-			const sHas = sPb && sPb.duration > 0;
-			const eHas = ePb && ePb.duration > 0;
-
-			const sContains =
-				sHas &&
-				$masterTime >= s.startedAt / 1000 - sOff &&
-				$masterTime <= s.startedAt / 1000 + sPb!.duration - sOff;
-			const eContains =
-				eHas &&
-				$masterTime >= existing.startedAt / 1000 - eOff &&
-				$masterTime <= existing.startedAt / 1000 + ePb!.duration - eOff;
+			const sDur = getDuration(s);
+			const eDur = getDuration(existing);
+			const sContains = sDur > 0 && containsPlayhead(s, sDur);
+			const eContains = eDur > 0 && containsPlayhead(existing, eDur);
 
 			if (sContains && !eContains) {
 				best.set(trackKey, s);
-			} else if (!sContains && !eContains && sHas && !eHas) {
-				// Neither contains playhead but this one has loaded data — prefer it
+			} else if (!sContains && !eContains && sDur > 0 && eDur === 0) {
+				// Neither contains playhead but this one has known duration — prefer it
 				best.set(trackKey, s);
 			}
 		}
+
+		// Remove VOD entries where the selected stream doesn't actually contain the playhead
+		// and has a known duration (i.e. we know for sure the playhead is in a gap).
+		for (const [key, s] of best) {
+			if (s.sourceType === 'live') continue;
+			const dur = getDuration(s);
+			if (dur > 0 && !containsPlayhead(s, dur)) best.delete(key);
+		}
+
 		return [...best.values()];
 	});
 

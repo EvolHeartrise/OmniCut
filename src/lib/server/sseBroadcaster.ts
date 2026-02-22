@@ -4,6 +4,7 @@
  */
 
 import type { StreamInfo, ChatMessage } from './types.js';
+import type { WordTimestamp } from './transcriber.js';
 import * as db from './persistence.js';
 
 // SSE clients for real-time updates
@@ -78,7 +79,8 @@ export function serializeStreamInfo(info: StreamInfo) {
 		sourceUrl: info.sourceUrl,
 		chatMessageCount: chatMessageCounts.get(info.id) ?? 0,
 		transcriptionCount: transcriptionCounts.get(info.id) ?? 0,
-		chatComplete: info.chatComplete
+		chatComplete: info.chatComplete,
+		durationSeconds: info.durationSeconds
 	};
 }
 
@@ -96,8 +98,8 @@ export function clearBroadcastCache(streamId: string) {
 	lastBroadcast.delete(streamId);
 }
 
-export function broadcastTranscription(streamId: string, text: string, startTime: number, endTime: number) {
-	db.saveTranscription(streamId, text, startTime, endTime);
+export function broadcastTranscription(streamId: string, text: string, startTime: number, endTime: number, words?: WordTimestamp[]) {
+	db.saveTranscription(streamId, text, startTime, endTime, words);
 	transcriptionCounts.set(streamId, (transcriptionCounts.get(streamId) ?? 0) + 1);
 	broadcast(JSON.stringify({ type: 'transcription', streamId, text, startTime, endTime }));
 }
@@ -127,4 +129,8 @@ export function broadcastExportProgress(message: string, step: number, totalStep
 
 export function broadcastTranscriptionCleared(streamId: string) {
 	broadcast(JSON.stringify({ type: 'transcription-cleared', streamId }));
+}
+
+export function broadcastClipRegionsChanged(clipRegions: Array<{ id: string; streamId: string; startTime: number; endTime: number; createdBy?: string; title?: string; notes?: string }>) {
+	broadcast(JSON.stringify({ type: 'clip-regions-changed', clipRegions }));
 }

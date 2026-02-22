@@ -218,18 +218,20 @@ export async function fetchDouyuChannel(roomId: string): Promise<ChannelInfo> {
 /** Map browse stream edges into ChannelInfo array with cursor. */
 export function mapBrowseEdges(edges: BrowseStreamEdge[]): { streams: ChannelInfo[]; cursor: string | null } {
 	const cursor = edges.length > 0 ? edges[edges.length - 1].cursor : null;
-	const streams: ChannelInfo[] = edges.map((edge) => ({
-		login: edge.node.broadcaster.login,
-		displayName: edge.node.broadcaster.displayName ?? null,
-		profileImageUrl: edge.node.broadcaster.profileImageURL ?? null,
-		isLive: true,
-		title: edge.node.title ?? null,
-		gameName: edge.node.game?.name ?? null,
-		viewerCount: edge.node.viewersCount ?? null,
-		startedAt: edge.node.createdAt ?? null,
-		hasVod: false,
-		platform: 'twitch' as const
-	}));
+	const streams: ChannelInfo[] = edges
+		.filter((edge) => edge.node?.broadcaster)
+		.map((edge) => ({
+			login: edge.node.broadcaster.login,
+			displayName: edge.node.broadcaster.displayName ?? null,
+			profileImageUrl: edge.node.broadcaster.profileImageURL ?? null,
+			isLive: true,
+			title: edge.node.title ?? null,
+			gameName: edge.node.game?.name ?? null,
+			viewerCount: edge.node.viewersCount ?? null,
+			startedAt: edge.node.createdAt ?? null,
+			hasVod: false,
+			platform: 'twitch' as const
+		}));
 	return { streams, cursor };
 }
 

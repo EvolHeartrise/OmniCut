@@ -20,6 +20,7 @@ export interface StreamInfo {
 	platform: 'twitch' | 'douyu';
 	sourceUrl: string | null;
 	chatComplete: boolean;
+	durationSeconds: number | null;
 }
 
 export interface ChatMessage {

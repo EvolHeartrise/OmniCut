@@ -580,7 +580,18 @@
 			{#if currentSeg}
 				<span class="clip-info">
 					Clip {currentSegIndex + 1}/{segments.length} — {currentSeg.channel}
+					{#if currentSeg.clip.title}
+						<span class="clip-title">"{currentSeg.clip.title}"</span>
+					{/if}
+					{#if currentSeg.clip.createdBy === 'ai'}
+						<span class="clip-badge ai">AI</span>
+					{:else}
+						<span class="clip-badge human">You</span>
+					{/if}
 				</span>
+				{#if currentSeg.clip.notes}
+					<span class="clip-notes">{currentSeg.clip.notes}</span>
+				{/if}
 			{/if}
 			<div class="toolbar-spacer"></div>
 			<button class="btn-ctl btn-small" onclick={zoomOut} title="Zoom out">−</button>
@@ -606,8 +617,9 @@
 					<div
 						class="clip-block"
 						class:active={i === currentSegIndex}
+						class:ai-clip={seg.clip.createdBy === 'ai'}
 						style="left: {left}px; width: {width}px"
-						title="{seg.channel}: {formatDuration(seg.duration)}"
+						title="{seg.channel}: {formatDuration(seg.duration)}{seg.clip.title ? ` — ${seg.clip.title}` : ''}{seg.clip.notes ? `\n${seg.clip.notes}` : ''}{seg.clip.createdBy === 'ai' ? ' (AI)' : ''}"
 					>
 						<span class="clip-block-label">{seg.channel}</span>
 					</div>
@@ -724,6 +736,43 @@
 	.clip-info {
 		font-size: 0.75rem;
 		color: #aaa;
+		display: flex;
+		align-items: center;
+		gap: 6px;
+	}
+
+	.clip-title {
+		color: #ccc;
+		font-style: italic;
+	}
+
+	.clip-badge {
+		font-size: 0.6rem;
+		font-weight: 600;
+		padding: 1px 5px;
+		border-radius: 3px;
+		line-height: 1.2;
+		text-transform: uppercase;
+		letter-spacing: 0.03em;
+	}
+
+	.clip-badge.ai {
+		background: #1e3a5f;
+		color: #60a5fa;
+	}
+
+	.clip-badge.human {
+		background: #2d1f4e;
+		color: #a78bfa;
+	}
+
+	.clip-notes {
+		font-size: 0.7rem;
+		color: #777;
+		max-width: 30em;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 
 	.toolbar-spacer {
@@ -790,6 +839,14 @@
 	.clip-block.active {
 		opacity: 1;
 		box-shadow: 0 0 6px rgba(124, 58, 237, 0.5);
+	}
+
+	.clip-block.ai-clip {
+		background: #2563eb;
+	}
+
+	.clip-block.ai-clip.active {
+		box-shadow: 0 0 6px rgba(37, 99, 235, 0.5);
 	}
 
 	.clip-block-label {

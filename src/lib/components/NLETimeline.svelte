@@ -48,6 +48,18 @@
 		}
 	}
 
+	// Hidden tracks (by track key) — hides content and excludes from timeline range
+	let hiddenTracks = $state<Set<string>>(new Set());
+
+	function toggleTrackVisibility(trackKey: string) {
+		hiddenTracks = new Set(hiddenTracks);
+		if (hiddenTracks.has(trackKey)) {
+			hiddenTracks.delete(trackKey);
+		} else {
+			hiddenTracks.add(trackKey);
+		}
+	}
+
 	// Undo stack
 	type UndoEntry =
 		| { type: 'add-region'; region: ClipRegion }
@@ -137,12 +149,22 @@
 	});
 
 	// Extract stable durations — only changes when a stream finishes loading, not every tick.
-	// Keyed by stream ID, updated via $effect to avoid re-deriving tracksData on every tick.
+	// Prefers server-provided durationSeconds (from Twitch API / HLS playlist) over
+	// the video player's reported duration (which requires mounting a StreamTile).
 	let streamDurations = $state<Record<string, number>>({});
 	$effect.pre(() => {
 		const states = $streamPlaybackStates;
+		const allStreams = $streams;
 		let changed = false;
 		const next = { ...streamDurations };
+		// Server-provided durations (VODs)
+		for (const s of allStreams) {
+			if (s.durationSeconds != null && s.durationSeconds > 0 && next[s.id] !== s.durationSeconds) {
+				next[s.id] = s.durationSeconds;
+				changed = true;
+			}
+		}
+		// HLS-reported durations (live streams and fallback)
 		for (const id in states) {
 			const dur = states[id]?.duration || 0;
 			if (dur > 0 && next[id] !== dur) {
@@ -179,6 +201,11 @@
 				isGrouped: trackStreams.length > 1 && trackStreams[0]?.sourceType === 'vod'
 			};
 		})
+	);
+
+	// Visible tracks (excludes hidden) — used for timeline range calculation
+	let visibleTracksData = $derived(
+		tracksData.filter((t) => !hiddenTracks.has(t.key))
 	);
 
 	// Pre-compute clip regions grouped by stream ID for O(1) lookup in template
@@ -366,17 +393,20 @@
 	let masterPaused = $derived(!$masterPlaying);
 
 	// Timeline range
+	// Use visible tracks for range; fall back to all tracks if everything is hidden
+	let rangeTracksData = $derived(visibleTracksData.length > 0 ? visibleTracksData : tracksData);
+
 	let effectiveTimelineStart = $derived(
 		frozenTimelineStart !== null
 			? frozenTimelineStart
-			: tracksData.length > 0
-				? Math.min(...tracksData.flatMap((t) => t.bars.map((b) => b.anchor - b.offset)))
+			: rangeTracksData.length > 0
+				? Math.min(...rangeTracksData.flatMap((t) => t.bars.map((b) => b.anchor - b.offset)))
 				: Date.now() / 1000
 	);
 
 	let timelineEnd = $derived(
-		tracksData.length > 0
-			? Math.max(...tracksData.flatMap((t) => t.bars.map((b) => b.anchor + b.duration - b.offset)))
+		rangeTracksData.length > 0
+			? Math.max(...rangeTracksData.flatMap((t) => t.bars.map((b) => b.anchor + b.duration - b.offset)))
 			: Date.now() / 1000 + 60
 	);
 
@@ -839,7 +869,7 @@
 			<div class="track-labels" bind:this={labelsEl}>
 				<div class="ruler-spacer"></div>
 				{#each tracksData as track}
-					<div class="label-row">
+					<div class="label-row" class:hidden-track={hiddenTracks.has(track.key)}>
 						<span class="color-dot" style="background: {track.color}"></span>
 						<span class="label-text">
 							{track.channel}
@@ -849,6 +879,12 @@
 								<span class="vod-suffix">(VOD)</span>
 							{/if}
 						</span>
+						<button
+							class="btn-visibility-track"
+							class:track-hidden={hiddenTracks.has(track.key)}
+							onclick={() => toggleTrackVisibility(track.key)}
+							title={hiddenTracks.has(track.key) ? 'Show track' : 'Hide track'}
+						>{hiddenTracks.has(track.key) ? '👁‍🗨' : '👁'}</button>
 						<button
 							class="btn-lock-track"
 							class:locked={lockedTracks.has(track.key)}
@@ -878,7 +914,8 @@
 
 					{#each tracksData as track}
 						<!-- svelte-ignore a11y_no_static_element_interactions -->
-						<div class="track-row">
+						<div class="track-row" class:hidden-track={hiddenTracks.has(track.key)}>
+							{#if !hiddenTracks.has(track.key)}
 							{#each track.bars as bar}
 								{@const barLeft = (bar.anchor - bar.offset - effectiveTimelineStart) * pixelsPerSecond}
 								{@const barWidth = bar.duration * pixelsPerSecond}
@@ -921,6 +958,7 @@
 									<div class="clip-edge clip-edge-start"></div>
 									<div class="clip-edge clip-edge-end"></div>
 								</div>
+							{/if}
 							{/if}
 						</div>
 					{/each}
@@ -1010,7 +1048,7 @@
 	}
 
 	.track-labels {
-		width: 120px;
+		width: 160px;
 		flex-shrink: 0;
 		background: #0f0f23;
 		border-right: 1px solid #1a1a2e;
@@ -1043,7 +1081,6 @@
 	}
 
 	.btn-lock-track {
-		margin-left: auto;
 		background: none;
 		border: none;
 		color: #555;
@@ -1069,6 +1106,46 @@
 		color: #f59e0b;
 	}
 
+	.btn-visibility-track {
+		background: none;
+		border: none;
+		color: #555;
+		cursor: pointer;
+		font-size: 0.6rem;
+		padding: 2px 3px;
+		line-height: 1;
+		flex-shrink: 0;
+		opacity: 0;
+		transition: opacity 0.15s, color 0.15s;
+		margin-left: auto;
+	}
+
+	.btn-visibility-track.track-hidden {
+		opacity: 1;
+		color: #666;
+	}
+
+	.label-row:hover .btn-visibility-track {
+		opacity: 1;
+	}
+
+	.btn-visibility-track:hover {
+		color: #8b5cf6;
+	}
+
+	.label-row.hidden-track {
+		opacity: 0.4;
+	}
+
+	.track-row.hidden-track {
+		background: repeating-linear-gradient(
+			90deg,
+			transparent,
+			transparent 8px,
+			rgba(255, 255, 255, 0.02) 8px,
+			rgba(255, 255, 255, 0.02) 16px
+		);
+	}
 
 	.color-dot {
 		width: 8px;

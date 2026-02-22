@@ -5,6 +5,7 @@
 
 import type { ClipRegion } from './types.js';
 import * as db from './persistence.js';
+import { broadcastClipRegionsChanged } from './sseBroadcaster.js';
 
 // In-memory store of clip regions keyed by ID (hot cache; persisted to SQLite)
 const clipRegionsStore = new Map<string, ClipRegion>();
@@ -32,6 +33,7 @@ export function addClipRegion(region: ClipRegion): void {
 	}
 	clipRegionsStore.set(region.id, region);
 	db.saveClipRegion(region);
+	broadcastClipRegionsChanged(getAllClipRegions());
 }
 
 /**
@@ -40,6 +42,7 @@ export function addClipRegion(region: ClipRegion): void {
 export function removeClipRegion(id: string): boolean {
 	if (!clipRegionsStore.delete(id)) return false;
 	db.deleteClipRegion(id);
+	broadcastClipRegionsChanged(getAllClipRegions());
 	return true;
 }
 

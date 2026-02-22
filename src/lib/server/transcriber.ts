@@ -8,7 +8,8 @@ const LIVE_POOL_SIZE = 2; // number of concurrent live transcription workers
 const VOD_POOL_SIZE = 1; // number of concurrent VOD transcription workers
 const MAX_RESPAWN_ATTEMPTS = 3; // max consecutive respawn attempts per worker slot
 const RESPAWN_BACKOFF_MS = 5000; // delay between respawn attempts
-const QUEUE_ITEM_TIMEOUT_MS = 120_000; // 2 minutes max wait per transcription request
+const QUEUE_ITEM_TIMEOUT_MS = 120_000; // 2 minutes max wait per live transcription request
+const VOD_QUEUE_ITEM_TIMEOUT_MS = 0; // no timeout for VOD (full recordings can take hours)
 const POOL_READY_TIMEOUT_MS = 60_000; // 1 minute max wait for pool readiness
 
 // --- Worker pool ---
@@ -28,11 +29,18 @@ interface PoolWorker {
 	id: number;
 }
 
+export interface WordTimestamp {
+	word: string;
+	start: number;
+	end: number;
+}
+
 interface Sentence {
 	text: string;
 	start: number;
 	end: number;
 	partial?: boolean;
+	words?: WordTimestamp[];
 }
 
 /** Remove consecutive duplicate/near-duplicate sentences (Whisper hallucination loops). */
@@ -293,7 +301,7 @@ function processQueue(pool: Pool) {
 	}
 }
 
-function transcribeAudio(pool: Pool, wavPath: string, language: string | null, beamSize: number = 1): Promise<Sentence[]> {
+function transcribeAudio(pool: Pool, wavPath: string, language: string | null, beamSize: number = 1, timeoutMs: number = QUEUE_ITEM_TIMEOUT_MS): Promise<Sentence[]> {
 	const task = language && language !== 'en' ? 'translate' : 'transcribe';
 	return new Promise((resolve, reject) => {
 		if (!ensurePool(pool) && pool.workers.length === 0) {
@@ -302,26 +310,27 @@ function transcribeAudio(pool: Pool, wavPath: string, language: string | null, b
 		}
 
 		// Timeout: reject if the request sits in the queue or is processing too long
+		// A timeout of 0 means no timeout (for long-running VOD transcriptions)
 		let settled = false;
-		const timer = setTimeout(() => {
+		const timer = timeoutMs > 0 ? setTimeout(() => {
 			if (settled) return;
 			settled = true;
 			// Remove from queue if still pending
 			const idx = pool.queue.findIndex((q) => q.resolve === wrappedResolve);
 			if (idx !== -1) pool.queue.splice(idx, 1);
-			reject(new Error(`Transcription timed out after ${QUEUE_ITEM_TIMEOUT_MS / 1000}s`));
-		}, QUEUE_ITEM_TIMEOUT_MS);
+			reject(new Error(`Transcription timed out after ${timeoutMs / 1000}s`));
+		}, timeoutMs) : null;
 
 		const wrappedResolve = (sentences: Sentence[]) => {
 			if (settled) return;
 			settled = true;
-			clearTimeout(timer);
+			if (timer) clearTimeout(timer);
 			resolve(sentences);
 		};
 		const wrappedReject = (err: Error) => {
 			if (settled) return;
 			settled = true;
-			clearTimeout(timer);
+			if (timer) clearTimeout(timer);
 			reject(err);
 		};
 
@@ -374,7 +383,8 @@ export type TranscriptionCallback = (
 	streamId: string,
 	text: string,
 	startTime: number,
-	endTime: number
+	endTime: number,
+	words?: WordTimestamp[]
 ) => void;
 
 interface StreamTracker {
@@ -384,7 +394,7 @@ interface StreamTracker {
 	interval: ReturnType<typeof setInterval>;
 	callback: TranscriptionCallback;
 	active: boolean;
-	pendingPartial: { text: string; startTime: number; endTime: number } | null;
+	pendingPartial: { text: string; startTime: number; endTime: number; words?: WordTimestamp[] } | null;
 }
 
 const streamTrackers = new Map<string, StreamTracker>();
@@ -430,7 +440,13 @@ async function checkForNewSegments(streamId: string) {
 	if (!wavPath) return;
 
 	try {
-		const sentences = deduplicateSentences(await transcribeAudio(livePool, wavPath, tracker.language));
+		let sentences: Sentence[];
+		try {
+			sentences = deduplicateSentences(await transcribeAudio(livePool, wavPath, tracker.language));
+		} catch (err) {
+			console.warn(`[transcriber:live] Transcription failed for stream ${streamId} batch at index ${startIdx}: ${err instanceof Error ? err.message : err}`);
+			return;
+		}
 		const batchOffset = startIdx * SEGMENT_DURATION;
 
 		for (let i = 0; i < sentences.length; i++) {
@@ -438,25 +454,27 @@ async function checkForNewSegments(streamId: string) {
 			let text = s.text;
 			let startTime = batchOffset + s.start;
 			const endTime = batchOffset + s.end;
+			let words = s.words?.map((w) => ({ ...w, start: batchOffset + w.start, end: batchOffset + w.end }));
 
 			// Merge pending partial from previous batch into the first sentence
 			if (i === 0 && tracker.pendingPartial) {
 				text = tracker.pendingPartial.text + ' ' + text;
 				startTime = tracker.pendingPartial.startTime;
+				words = [...(tracker.pendingPartial.words ?? []), ...(words ?? [])];
 				tracker.pendingPartial = null;
 			}
 
 			// Hold back partial (incomplete) sentences for merging with next batch
 			if (s.partial) {
-				tracker.pendingPartial = { text, startTime, endTime };
+				tracker.pendingPartial = { text, startTime, endTime, words };
 			} else {
-				tracker.callback(streamId, text, startTime, endTime);
+				tracker.callback(streamId, text, startTime, endTime, words);
 			}
 		}
 
 		// If no sentences came back, clear any stale partial
 		if (sentences.length === 0 && tracker.pendingPartial) {
-			tracker.callback(streamId, tracker.pendingPartial.text, tracker.pendingPartial.startTime, tracker.pendingPartial.endTime);
+			tracker.callback(streamId, tracker.pendingPartial.text, tracker.pendingPartial.startTime, tracker.pendingPartial.endTime, tracker.pendingPartial.words);
 			tracker.pendingPartial = null;
 		}
 	} finally {
@@ -505,7 +523,7 @@ export function stopTranscription(streamId: string): void {
 	if (!tracker) return;
 	// Flush any pending partial sentence before stopping
 	if (tracker.pendingPartial) {
-		tracker.callback(streamId, tracker.pendingPartial.text, tracker.pendingPartial.startTime, tracker.pendingPartial.endTime);
+		tracker.callback(streamId, tracker.pendingPartial.text, tracker.pendingPartial.startTime, tracker.pendingPartial.endTime, tracker.pendingPartial.words);
 		tracker.pendingPartial = null;
 	}
 	tracker.active = false;
@@ -579,11 +597,11 @@ async function doFullTranscription(job: VodJob): Promise<void> {
 	if (!wavPath) return;
 
 	try {
-		const raw = await transcribeAudio(vodPool, wavPath, language, 5);
+		const raw = await transcribeAudio(vodPool, wavPath, language, 5, VOD_QUEUE_ITEM_TIMEOUT_MS);
 		const sentences = deduplicateSentences(raw);
 		const skipped = raw.length - sentences.length;
 		for (const s of sentences) {
-			onResult(streamId, s.text, s.start, s.end);
+			onResult(streamId, s.text, s.start, s.end, s.words);
 		}
 		console.log(`[transcriber:vod] Full transcription complete for stream ${streamId}: ${sentences.length} sentences${skipped > 0 ? ` (${skipped} duplicates removed)` : ''}`);
 	} finally {

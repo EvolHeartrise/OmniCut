@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "omnicut": {
+      "command": "bun",
+      "args": ["run", "D:/git/OmniCut/scripts/mcp-stdio.ts"],
+      "env": { "OMNICUT_URL": "http://localhost:5173" }
+    },
+    "svelte": {
+      "command": "npx",
+      "args": ["-y", "@sveltejs/mcp"]
+    }
+  }
+}

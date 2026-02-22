@@ -34,6 +34,7 @@ export interface StreamState {
 	chatMessageCount: number;
 	transcriptionCount: number;
 	chatComplete: boolean;
+	durationSeconds: number | null;
 }
 
 export type AppMode = 'sources' | 'clipping' | 'cleaning' | 'export';
@@ -303,6 +304,8 @@ export function connectSSE(): () => void {
 					const { [data.streamId]: _, ...rest } = current;
 					return rest;
 				});
+			} else if (data.type === 'clip-regions-changed') {
+				clipRegions.set(data.clipRegions);
 			} else if (data.type === 'export-progress') {
 				exportLog.update((log) => [
 					...log,
