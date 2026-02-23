@@ -359,7 +359,7 @@
 		}
 	}
 
-	// React to clip bounds changing while previewing (e.g. MCP update_clip via SSE)
+	// React to clip bounds changing while previewing (e.g. MCP upsert_clip via SSE)
 	$effect(() => {
 		const clip = previewClip;
 		if (!clip || !previewVideoEl) return;

@@ -566,121 +566,56 @@ export function createMcpServer(): McpServer {
 	);
 
 	// ---------------------------------------------------------------------------
-	// Tool 9 — create_clip  (mutating)
+	// Tool — upsert_clip  (mutating)
 	// ---------------------------------------------------------------------------
 
 	mcpServer.tool(
-		'create_clip',
-		'Create a clip region on a stream for later export.',
+		'upsert_clip',
+		'Create or update a clip. Provide streamId+startTime+endTime to create; omit to update existing fields.',
 		{
-			id: z.string().describe('Unique clip ID (UUID)'),
-			streamId: z.string().describe('Stream ID'),
-			startTime: z.number().describe('Clip start time'),
-			endTime: z.number().describe('Clip end time'),
+			id: z.string().describe('Clip ID (UUID)'),
+			streamId: z.string().optional().describe('Stream ID (required for new clips)'),
+			startTime: z.number().optional().describe('Start time'),
+			endTime: z.number().optional().describe('End time'),
 			timeFormat: z
 				.enum(['master', 'local'])
 				.optional()
 				.default('master')
-				.describe(
-					'"master" (epoch) or "local" (stream-relative)'
-				),
+				.describe('"master" (epoch) or "local" (stream-relative)'),
 			title: z.string().optional().describe('Clip title'),
-			notes: z.string().optional().describe('Notes about this clip')
+			notes: z.string().optional().describe('Clip notes')
 		},
 		async ({ id, streamId, startTime, endTime, timeFormat, title, notes }) => {
-			// Verify stream exists
-			const stream = getStream(streamId);
+			const existing = getAllClipRegions().find((c) => c.id === id);
+
+			// --- Resolve stream & times ---
+			const resolvedStreamId = streamId ?? existing?.streamId;
+			if (!resolvedStreamId) {
+				return {
+					isError: true,
+					content: [{ type: 'text' as const, text: 'streamId is required when creating a new clip.' }]
+				};
+			}
+
+			const stream = getStream(resolvedStreamId);
 			if (!stream) {
 				return {
 					isError: true,
-					content: [{ type: 'text' as const, text: `Stream "${streamId}" not found.` }]
+					content: [{ type: 'text' as const, text: `Stream "${resolvedStreamId}" not found.` }]
 				};
 			}
 
-			// Convert local time to master time if needed
-			let masterStart = startTime;
-			let masterEnd = endTime;
-			if (timeFormat === 'local') {
-				const anchor = stream.startedAt / 1000;
-				masterStart = anchor + startTime;
-				masterEnd = anchor + endTime;
-			}
-
-			try {
-				addClipRegion({ id, streamId, startTime: masterStart, endTime: masterEnd, createdBy: 'ai', title, notes });
-				return {
-					content: [
-						{
-							type: 'text' as const,
-							text: JSON.stringify({
-								success: true,
-								clip: { id, streamId, startTime: masterStart, endTime: masterEnd, createdBy: 'ai', title, notes },
-								message: `Clip created: ${masterEnd - masterStart}s region on stream "${stream.channel}".`
-							})
-						}
-					]
-				};
-			} catch (err) {
+			if (!existing && (startTime === undefined || endTime === undefined)) {
 				return {
 					isError: true,
-					content: [
-						{
-							type: 'text' as const,
-							text: `Failed to create clip: ${err instanceof Error ? err.message : String(err)}`
-						}
-					]
-				};
-			}
-		}
-	);
-
-	// ---------------------------------------------------------------------------
-	// Tool 10 — update_clip  (mutating)
-	// ---------------------------------------------------------------------------
-
-	mcpServer.tool(
-		'update_clip',
-		'Update a clip region. Only provided fields change.',
-		{
-			id: z.string().describe('Clip ID'),
-			startTime: z
-				.number()
-				.optional()
-				.describe('New start time'),
-			endTime: z
-				.number()
-				.optional()
-				.describe('New end time'),
-			timeFormat: z
-				.enum(['master', 'local'])
-				.optional()
-				.default('master')
-				.describe(
-					'"master" (epoch) or "local" (stream-relative)'
-				),
-			title: z.string().optional().describe('New title'),
-			notes: z.string().optional().describe('New notes')
-		},
-		async ({ id, startTime, endTime, timeFormat, title, notes }) => {
-			const existing = getAllClipRegions().find((c) => c.id === id);
-			if (!existing) {
-				return {
-					isError: true,
-					content: [{ type: 'text' as const, text: `Clip "${id}" not found.` }]
+					content: [{ type: 'text' as const, text: 'startTime and endTime are required when creating a new clip.' }]
 				};
 			}
 
-			let newStart = startTime ?? existing.startTime;
-			let newEnd = endTime ?? existing.endTime;
+			let newStart = startTime ?? existing!.startTime;
+			let newEnd = endTime ?? existing!.endTime;
 
 			if (timeFormat === 'local' && (startTime !== undefined || endTime !== undefined)) {
-				const stream = getStream(existing.streamId);
-				if (!stream) {
-					return {
-						isError: true,
-						content: [{ type: 'text' as const, text: `Stream "${existing.streamId}" not found.` }]
-					};
-				}
 				const anchor = stream.startedAt / 1000;
 				if (startTime !== undefined) newStart = anchor + startTime;
 				if (endTime !== undefined) newEnd = anchor + endTime;
@@ -688,28 +623,21 @@ export function createMcpServer(): McpServer {
 
 			try {
 				addClipRegion({
-					...existing,
+					...(existing ?? {}),
+					id,
+					streamId: resolvedStreamId,
 					startTime: newStart,
 					endTime: newEnd,
+					createdBy: existing?.createdBy ?? 'ai',
 					...(title !== undefined && { title }),
 					...(notes !== undefined && { notes })
 				});
+				const action = existing ? 'updated' : 'created';
 				return {
 					content: [
 						{
 							type: 'text' as const,
-							text: JSON.stringify({
-								success: true,
-								clip: {
-									id,
-									streamId: existing.streamId,
-									startTime: newStart,
-									endTime: newEnd,
-									title: title ?? existing.title,
-									notes: notes ?? existing.notes
-								},
-								message: `Clip updated: ${newEnd - newStart}s region.`
-							})
+							text: `Clip ${action}: ${id} (${Math.round(newEnd - newStart)}s on "${stream.channel}")`
 						}
 					]
 				};
@@ -719,7 +647,7 @@ export function createMcpServer(): McpServer {
 					content: [
 						{
 							type: 'text' as const,
-							text: `Failed to update clip: ${err instanceof Error ? err.message : String(err)}`
+							text: `Failed to upsert clip: ${err instanceof Error ? err.message : String(err)}`
 						}
 					]
 				};

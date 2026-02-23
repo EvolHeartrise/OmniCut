@@ -6,7 +6,7 @@
       "mcp__omnicut__search_transcriptions",
       "mcp__omnicut__query_at_time",
       "mcp__omnicut__get_word_timestamps",
-      "mcp__omnicut__create_clip",
+      "mcp__omnicut__upsert_clip",
       "mcp__omnicut__export_video",
       "Bash(xxd:*)",
       "Bash(cd:*)"
