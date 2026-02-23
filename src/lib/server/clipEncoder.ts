@@ -429,3 +429,180 @@ export function ffmpegConcatEscape(filePath: string): string {
 	const escaped = filePath.replace(/\\/g, '\\\\').replace(/'/g, "'\\''");
 	return `file '${escaped}'`;
 }
+
+/**
+ * Extract a single JPEG frame from an HLS recording at a given local timestamp.
+ * Returns the raw JPEG bytes as a Buffer.
+ */
+export async function extractFrame(recordingDir: string, localTimestamp: number): Promise<Buffer> {
+	const playlistPath = path.join(recordingDir, 'playlist.m3u8');
+	const segments = parseRelevantSegments(playlistPath, recordingDir, localTimestamp, localTimestamp + 0.1);
+	if (segments.length === 0) {
+		throw new Error(`No segments found at timestamp ${localTimestamp}`);
+	}
+
+	const concatPath = path.join(recordingDir, `.frame-${Date.now()}.concat.txt`);
+	try {
+		const concatContent = segments.map((s) => ffmpegConcatEscape(s.file)).join('\n');
+		fs.writeFileSync(concatPath, concatContent);
+
+		const seekPos = Math.max(0, localTimestamp - segments[0].startTime);
+		const proc = Bun.spawn(
+			[
+				'ffmpeg',
+				'-f',
+				'concat',
+				'-safe',
+				'0',
+				'-i',
+				concatPath,
+				'-ss',
+				seekPos.toFixed(3),
+				'-frames:v',
+				'1',
+				'-f',
+				'image2pipe',
+				'-c:v',
+				'mjpeg',
+				'-q:v',
+				'3',
+				'pipe:1'
+			],
+			{ stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' }
+		);
+
+		const [stdoutBuf, stderrText, exitCode] = await Promise.all([
+			new Response(proc.stdout).arrayBuffer(),
+			new Response(proc.stderr).text(),
+			proc.exited
+		]);
+
+		if (exitCode !== 0) {
+			throw new Error(`ffmpeg failed (code ${exitCode}): ${stderrText.slice(-500)}`);
+		}
+
+		const buffer = Buffer.from(stdoutBuf);
+		if (buffer.length === 0) {
+			throw new Error('ffmpeg produced no output — timestamp may be beyond recording duration');
+		}
+
+		return buffer;
+	} finally {
+		try {
+			fs.unlinkSync(concatPath);
+		} catch {
+			/* ok */
+		}
+	}
+}
+
+// --- Audio loudness analysis ---
+
+export interface AudioBucket {
+	timeLocal: number; // stream-local seconds (bucket start)
+	rmsDb: number; // RMS level in dBFS
+	peakDb: number; // peak level in dBFS
+}
+
+export interface AudioLoudnessResult {
+	buckets: AudioBucket[];
+	analyzedFrom: number;
+	analyzedTo: number;
+}
+
+const SAMPLE_RATE = 8000;
+
+/**
+ * Analyze audio loudness from HLS segments over a time range.
+ * Decodes to 8kHz mono s16le, computes RMS and peak dBFS per bucket.
+ */
+export async function analyzeAudioLoudness(
+	recordingDir: string,
+	from: number,
+	to: number,
+	bucketSeconds: number
+): Promise<AudioLoudnessResult> {
+	const playlistPath = path.join(recordingDir, 'playlist.m3u8');
+	const segments = parseRelevantSegments(playlistPath, recordingDir, from, to);
+	if (segments.length === 0) {
+		throw new Error(`No segments found in range [${from}, ${to}]`);
+	}
+
+	const concatPath = path.join(recordingDir, `.audio-${Date.now()}.concat.txt`);
+	try {
+		const concatContent = segments.map((s) => ffmpegConcatEscape(s.file)).join('\n');
+		fs.writeFileSync(concatPath, concatContent);
+
+		const trimStart = Math.max(0, from - segments[0].startTime);
+		const segGroupEnd = segments[segments.length - 1].startTime + segments[segments.length - 1].duration;
+		const decodeDuration = Math.min(to, segGroupEnd) - (segments[0].startTime + trimStart);
+
+		const proc = Bun.spawn(
+			[
+				'ffmpeg',
+				'-f', 'concat',
+				'-safe', '0',
+				'-i', concatPath,
+				'-ss', trimStart.toFixed(3),
+				'-t', decodeDuration.toFixed(3),
+				'-vn',
+				'-ar', String(SAMPLE_RATE),
+				'-ac', '1',
+				'-f', 's16le',
+				'pipe:1'
+			],
+			{ stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' }
+		);
+
+		const [stdoutBuf, stderrText, exitCode] = await Promise.all([
+			new Response(proc.stdout).arrayBuffer(),
+			new Response(proc.stderr).text(),
+			proc.exited
+		]);
+
+		if (exitCode !== 0) {
+			throw new Error(`ffmpeg failed (code ${exitCode}): ${stderrText.slice(-500)}`);
+		}
+
+		const samples = new Int16Array(stdoutBuf);
+		const samplesPerBucket = Math.floor(bucketSeconds * SAMPLE_RATE);
+		const buckets: AudioBucket[] = [];
+
+		for (let offset = 0; offset < samples.length; offset += samplesPerBucket) {
+			const end = Math.min(offset + samplesPerBucket, samples.length);
+			const count = end - offset;
+			if (count === 0) break;
+
+			let sumSquares = 0;
+			let maxAbs = 0;
+			for (let i = offset; i < end; i++) {
+				const normalized = samples[i] / 32768;
+				sumSquares += normalized * normalized;
+				const abs = Math.abs(normalized);
+				if (abs > maxAbs) maxAbs = abs;
+			}
+
+			const rms = Math.sqrt(sumSquares / count);
+			const rmsDb = rms > 0 ? Math.round(20 * Math.log10(rms) * 10) / 10 : -100;
+			const peakDb = maxAbs > 0 ? Math.round(20 * Math.log10(maxAbs) * 10) / 10 : -100;
+
+			buckets.push({
+				timeLocal: from + offset / SAMPLE_RATE,
+				rmsDb,
+				peakDb
+			});
+		}
+
+		return {
+			buckets,
+			analyzedFrom: from,
+			analyzedTo: from + samples.length / SAMPLE_RATE
+		};
+	} finally {
+		try {
+			fs.unlinkSync(concatPath);
+		} catch {
+			/* ok */
+		}
+	}
+}

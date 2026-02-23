@@ -21,10 +21,13 @@ import {
 	retranscribeStream,
 	createAndQueueExport,
 	loadAllExports as smLoadAllExports,
-	loadExport as smLoadExport
+	loadExport as smLoadExport,
+	getStreamRecordingDir
 } from './streamManager.js';
 
-import { loadAllChannelSettings, loadWatchlist, loadWordTimestamps } from './persistence.js';
+import { extractFrame, analyzeAudioLoudness } from './clipEncoder.js';
+
+import { loadWatchlist, loadWordTimestamps } from './persistence.js';
 
 import {
 	fetchTwitchChannel,
@@ -50,7 +53,7 @@ export function createMcpServer(): McpServer {
 				tools: {}
 			},
 			instructions:
-				'OmniCut is a live-stream capture and clipping tool. Use these tools to observe active captures, search chat and transcription data, look up channels, and create clip regions for export.'
+				'OmniCut — live-stream capture and clipping tool. Observe streams, search chat/transcriptions, look up channels, create clips, and export video.'
 		}
 	);
 
@@ -60,10 +63,22 @@ export function createMcpServer(): McpServer {
 
 	mcpServer.tool(
 		'list_streams',
-		'List all active and stopped streams with their status and metadata. Includes a count of clip regions per stream (use list_clips to see full clip details).',
+		'List all streams with status, metadata, and clip counts.',
 		{},
 		async () => {
-			const streams = listStreams();
+			const streams = listStreams().map((s) => ({
+				id: s.id,
+				channel: s.channel,
+				status: s.status,
+				startedAt: s.startedAt,
+				streamTitle: s.streamTitle,
+				gameName: s.gameName,
+				platform: s.platform,
+				sourceType: s.sourceType,
+				viewerCount: s.viewerCount,
+				durationSeconds: s.durationSeconds,
+				...(s.error && { error: s.error })
+			}));
 			const clipRegions = getAllClipRegions();
 			// Count clips per stream instead of returning full clip data
 			const clipCountsByStream: Record<string, number> = {};
@@ -82,26 +97,67 @@ export function createMcpServer(): McpServer {
 	);
 
 	// ---------------------------------------------------------------------------
-	// Tool 2 — list_clips
+	// Tool 2 — get_clips
 	// ---------------------------------------------------------------------------
 
 	mcpServer.tool(
-		'list_clips',
-		'List clip regions, optionally filtered by stream ID, channel name, and/or a datetime range. Times are ISO 8601 datetime strings (e.g. "2026-02-20T14:30:00Z").',
+		'get_clips',
+		'Get clips by ID or filter. No arguments returns all.',
 		{
-			streamId: z.string().optional().describe('Filter clips to a specific stream ID'),
-			channel: z.string().optional().describe('Filter clips to a specific channel name (case-insensitive)'),
+			ids: z
+				.union([z.string(), z.array(z.string())])
+				.optional()
+				.describe('Clip ID or array of IDs'),
+			streamId: z.string().optional().describe('Filter by stream ID'),
+			channel: z.string().optional().describe('Filter by channel (case-insensitive)'),
 			after: z
 				.string()
 				.optional()
-				.describe('Only include clips that end after this datetime (ISO 8601, e.g. "2026-02-20T14:30:00Z")'),
+				.describe('Clips ending after this ISO 8601 datetime'),
 			before: z
 				.string()
 				.optional()
-				.describe('Only include clips that start before this datetime (ISO 8601, e.g. "2026-02-21T02:00:00Z")')
+				.describe('Clips starting before this ISO 8601 datetime')
 		},
-		async ({ streamId, channel, after, before }) => {
-			let clips = getAllClipRegions();
+		async ({ ids, streamId, channel, after, before }) => {
+			const allClips = getAllClipRegions();
+
+			// --- ID lookup mode ---
+			if (ids !== undefined) {
+				const idList = Array.isArray(ids) ? ids : [ids];
+				const found = [];
+				const notFound = [];
+				for (const clipId of idList) {
+					const clip = allClips.find((c) => c.id === clipId);
+					if (clip) {
+						const stream = getStream(clip.streamId);
+						found.push({
+							...clip,
+							channel: stream?.channel ?? null,
+							startTimeISO: new Date(clip.startTime * 1000).toISOString(),
+							endTimeISO: new Date(clip.endTime * 1000).toISOString(),
+							durationSeconds: Math.round(clip.endTime - clip.startTime)
+						});
+					} else {
+						notFound.push(clipId);
+					}
+				}
+				return {
+					content: [
+						{
+							type: 'text' as const,
+							text: JSON.stringify({
+								count: found.length,
+								clips: found,
+								...(notFound.length > 0 && { notFound })
+							})
+						}
+					]
+				};
+			}
+
+			// --- Filter mode ---
+			let clips = allClips;
 
 			if (streamId) {
 				clips = clips.filter((c) => c.streamId === streamId);
@@ -114,7 +170,6 @@ export function createMcpServer(): McpServer {
 				});
 			}
 
-			// Parse datetime filters to epoch seconds for comparison against master time
 			let afterEpoch: number | null = null;
 			let beforeEpoch: number | null = null;
 			if (after) {
@@ -138,10 +193,8 @@ export function createMcpServer(): McpServer {
 			if (afterEpoch !== null) clips = clips.filter((c) => c.endTime > afterEpoch);
 			if (beforeEpoch !== null) clips = clips.filter((c) => c.startTime < beforeEpoch);
 
-			// Sort by start time ascending
 			clips.sort((a, b) => a.startTime - b.startTime);
 
-			// Enrich with channel name and readable times
 			const enriched = clips.map((c) => {
 				const stream = getStream(c.streamId);
 				return {
@@ -165,40 +218,42 @@ export function createMcpServer(): McpServer {
 	);
 
 	// ---------------------------------------------------------------------------
-	// Tool 3 — search_chat
+	// Tool 3 — search_stream
 	// ---------------------------------------------------------------------------
 
 	mcpServer.tool(
-		'search_chat',
-		'Search chat messages in a time range across one or multiple streams. Times are in stream-local seconds (seconds since capture started). Supports optional text filtering (substring or regex) and pagination.',
+		'search_stream',
+		'Search chat and/or transcription in a time range. Supports regex, badge filter, and pagination.',
 		{
+			type: z
+				.enum(['chat', 'transcript', 'both'])
+				.describe('What to search'),
 			ranges: z
 				.array(
 					z.object({
-						streamId: z.string().describe('The stream ID to search'),
-						from: z.number().describe('Start of range in stream-local seconds'),
-						to: z.number().describe('End of range in stream-local seconds')
+						streamId: z.string().describe('Stream ID'),
+						from: z.number().describe('Start (stream-local seconds)'),
+						to: z.number().describe('End (stream-local seconds)')
 					})
 				)
 				.min(1)
-				.describe('Time ranges to query (one per stream)'),
+				.describe('Time ranges to query'),
 			query: z
 				.string()
 				.optional()
-				.describe(
-					'Text filter — only return messages matching this string. Substring match by default, or regex if useRegex is true.'
-				),
-			useRegex: z
-				.boolean()
+				.describe('Case-insensitive regex filter'),
+			badges: z
+				.array(z.string())
 				.optional()
-				.default(false)
-				.describe('Treat query as a regular expression (case-insensitive)'),
-			limit: z.number().optional().describe('Maximum number of results to return'),
-			offset: z.number().optional().default(0).describe('Number of results to skip (for pagination)')
+				.describe(
+					'Filter by badges (chat only)'
+				),
+			limit: z.number().optional().describe('Max results to return'),
+			offset: z.number().optional().default(0).describe('Results to skip (pagination)')
 		},
-		async ({ ranges, query, useRegex, limit, offset }) => {
+		async ({ type, ranges, query, badges, limit, offset }) => {
 			let regex: RegExp | null = null;
-			if (query && useRegex) {
+			if (query) {
 				try {
 					regex = new RegExp(query, 'i');
 				} catch (err) {
@@ -212,108 +267,75 @@ export function createMcpServer(): McpServer {
 			}
 
 			const singleStream = new Set(ranges.map((r) => r.streamId)).size === 1;
-			const results: Array<{ streamId: string; username: string; text: string; timestamp: number }> = [];
-			for (const range of ranges) {
-				const messages = getChatMessagesInRange(range.streamId, range.from, range.to, regex ? undefined : query);
-				for (const m of messages) {
-					if (regex && !regex.test(m.text)) continue;
-					results.push({ streamId: range.streamId, username: m.username, text: m.text, timestamp: m.timestamp });
-				}
-			}
-			results.sort((a, b) => a.timestamp - b.timestamp);
-			const sliced =
-				limit !== undefined ? results.slice(offset ?? 0, (offset ?? 0) + limit) : results.slice(offset ?? 0);
+			const sections: string[] = [];
 
-			const header = singleStream
-				? `${ranges[0].streamId} | ${results.length} messages, returning ${sliced.length}`
-				: `${results.length} messages, returning ${sliced.length}`;
-			const lines = sliced.map((m) =>
-				singleStream
-					? `[${m.timestamp}] ${m.username}: ${m.text}`
-					: `[${m.streamId}|${m.timestamp}] ${m.username}: ${m.text}`
-			);
+			// --- Chat ---
+			if (type === 'chat' || type === 'both') {
+				const badgeSet = badges && badges.length > 0 ? new Set(badges) : null;
+				const results: Array<{ streamId: string; username: string; text: string; timestamp: number; badges?: string | null }> = [];
+				for (const range of ranges) {
+					const messages = getChatMessagesInRange(range.streamId, range.from, range.to);
+					for (const m of messages) {
+						if (regex && !regex.test(m.text)) continue;
+						if (badgeSet) {
+							const msgBadges = m.badges ? m.badges.split(',') : [];
+							if (!msgBadges.some((b) => badgeSet.has(b))) continue;
+						}
+						results.push({ streamId: range.streamId, username: m.username, text: m.text, timestamp: m.timestamp, badges: m.badges });
+					}
+				}
+				results.sort((a, b) => a.timestamp - b.timestamp);
+				const sliced =
+					limit !== undefined ? results.slice(offset ?? 0, (offset ?? 0) + limit) : results.slice(offset ?? 0);
+
+				const header = singleStream
+					? `${ranges[0].streamId} | ${results.length} messages, returning ${sliced.length}`
+					: `${results.length} messages, returning ${sliced.length}`;
+				const lines = sliced.map((m) => {
+					const t = +m.timestamp.toFixed(1);
+					const badgePrefix = m.badges ? `[${m.badges}] ` : '';
+					return singleStream
+						? `[${t}] ${badgePrefix}${m.username}: ${m.text}`
+						: `[${m.streamId}|${t}] ${badgePrefix}${m.username}: ${m.text}`;
+				});
+				sections.push('--- chat ---\n' + header + '\n' + lines.join('\n'));
+			}
+
+			// --- Transcript ---
+			if (type === 'transcript' || type === 'both') {
+				const streamChannels = new Map<string, string>();
+				const results: Array<{ streamId: string; text: string; startTime: number; endTime: number }> = [];
+				for (const range of ranges) {
+					if (!streamChannels.has(range.streamId)) {
+						const s = getStream(range.streamId);
+						if (s) streamChannels.set(range.streamId, s.channel);
+					}
+					const entries = getTranscriptionsInRange(range.streamId, range.from, range.to);
+					for (const e of entries) {
+						if (regex && !regex.test(e.text)) continue;
+						results.push({ streamId: range.streamId, text: e.text, startTime: e.startTime, endTime: e.endTime });
+					}
+				}
+				results.sort((a, b) => a.startTime - b.startTime);
+				const sliced =
+					limit !== undefined ? results.slice(offset ?? 0, (offset ?? 0) + limit) : results.slice(offset ?? 0);
+
+				const header = singleStream
+					? `${ranges[0].streamId} | ${results.length} segments, returning ${sliced.length}`
+					: `${results.length} segments, returning ${sliced.length}`;
+				const lines = sliced.map((e) => {
+					const s = +e.startTime.toFixed(1);
+					const end = +e.endTime.toFixed(1);
+					const channel = streamChannels.get(e.streamId) ?? e.streamId;
+					return singleStream
+						? `[${s}-${end}] ${channel}: ${e.text}`
+						: `[${e.streamId}|${s}-${end}] ${channel}: ${e.text}`;
+				});
+				sections.push('--- transcript ---\n' + header + '\n' + lines.join('\n'));
+			}
+
 			return {
-				content: [{ type: 'text' as const, text: header + '\n' + lines.join('\n') }]
-			};
-		}
-	);
-
-	// ---------------------------------------------------------------------------
-	// Tool 3 — search_transcriptions
-	// ---------------------------------------------------------------------------
-
-	mcpServer.tool(
-		'search_transcriptions',
-		'Search transcription segments in a time range across one or multiple streams. Times are in stream-local seconds. Supports optional text filtering (substring or regex) and pagination.',
-		{
-			ranges: z
-				.array(
-					z.object({
-						streamId: z.string().describe('The stream ID to search'),
-						from: z.number().describe('Start of range in stream-local seconds'),
-						to: z.number().describe('End of range in stream-local seconds')
-					})
-				)
-				.min(1)
-				.describe('Time ranges to query (one per stream)'),
-			query: z
-				.string()
-				.optional()
-				.describe(
-					'Text filter — only return segments matching this string. Substring match by default, or regex if useRegex is true.'
-				),
-			useRegex: z
-				.boolean()
-				.optional()
-				.default(false)
-				.describe('Treat query as a regular expression (case-insensitive)'),
-			limit: z.number().optional().describe('Maximum number of results to return'),
-			offset: z.number().optional().default(0).describe('Number of results to skip (for pagination)')
-		},
-		async ({ ranges, query, useRegex, limit, offset }) => {
-			let regex: RegExp | null = null;
-			if (query && useRegex) {
-				try {
-					regex = new RegExp(query, 'i');
-				} catch (err) {
-					return {
-						isError: true,
-						content: [
-							{ type: 'text' as const, text: `Invalid regex: ${err instanceof Error ? err.message : String(err)}` }
-						]
-					};
-				}
-			}
-
-			const singleStream = new Set(ranges.map((r) => r.streamId)).size === 1;
-			const streamChannels = new Map<string, string>();
-			const results: Array<{ streamId: string; text: string; startTime: number; endTime: number }> = [];
-			for (const range of ranges) {
-				if (!streamChannels.has(range.streamId)) {
-					const s = getStream(range.streamId);
-					if (s) streamChannels.set(range.streamId, s.channel);
-				}
-				const entries = getTranscriptionsInRange(range.streamId, range.from, range.to, regex ? undefined : query);
-				for (const e of entries) {
-					if (regex && !regex.test(e.text)) continue;
-					results.push({ streamId: range.streamId, text: e.text, startTime: e.startTime, endTime: e.endTime });
-				}
-			}
-			results.sort((a, b) => a.startTime - b.startTime);
-			const sliced =
-				limit !== undefined ? results.slice(offset ?? 0, (offset ?? 0) + limit) : results.slice(offset ?? 0);
-
-			const header = singleStream
-				? `${ranges[0].streamId} | ${results.length} segments, returning ${sliced.length}`
-				: `${results.length} segments, returning ${sliced.length}`;
-			const lines = sliced.map((e) => {
-				const channel = streamChannels.get(e.streamId) ?? e.streamId;
-				return singleStream
-					? `[${e.startTime}-${e.endTime}] ${channel}: ${e.text}`
-					: `[${e.streamId}|${e.startTime}-${e.endTime}] ${channel}: ${e.text}`;
-			});
-			return {
-				content: [{ type: 'text' as const, text: header + '\n' + lines.join('\n') }]
+				content: [{ type: 'text' as const, text: sections.join('\n\n') }]
 			};
 		}
 	);
@@ -324,10 +346,10 @@ export function createMcpServer(): McpServer {
 
 	mcpServer.tool(
 		'lookup_channel',
-		'Look up a channel to check if it is live, get its title, game, viewer count, and VOD availability.',
+		'Look up a channel\'s live status, title, game, and viewer count.',
 		{
-			channel: z.string().describe('Channel login name or room ID'),
-			platform: z.enum(['twitch', 'douyu']).optional().default('twitch').describe('Platform (default: twitch)')
+			channel: z.string().describe('Channel login or room ID'),
+			platform: z.enum(['twitch', 'douyu']).optional().default('twitch').describe('Platform')
 		},
 		async ({ channel, platform }) => {
 			try {
@@ -363,9 +385,9 @@ export function createMcpServer(): McpServer {
 		'get_channel_vods',
 		'List past VODs (archives) for a Twitch channel.',
 		{
-			login: z.string().describe('Twitch channel login name'),
-			first: z.number().optional().default(20).describe('Number of VODs to return (max 100)'),
-			after: z.string().optional().describe('Pagination cursor from a previous response')
+			login: z.string().describe('Twitch channel login'),
+			first: z.number().optional().default(20).describe('Number of VODs (max 100)'),
+			after: z.string().optional().describe('Pagination cursor')
 		},
 		async ({ login, first, after }) => {
 			const clampedFirst = Math.min(Math.max(first, 1), 100);
@@ -443,36 +465,20 @@ export function createMcpServer(): McpServer {
 	});
 
 	// ---------------------------------------------------------------------------
-	// Tool 7 — get_channel_settings
-	// ---------------------------------------------------------------------------
-
-	mcpServer.tool('get_channel_settings', 'Get per-channel transcription language settings.', {}, async () => {
-		const settings = loadAllChannelSettings();
-		return {
-			content: [
-				{
-					type: 'text' as const,
-					text: JSON.stringify({ settings })
-				}
-			]
-		};
-	});
-
-	// ---------------------------------------------------------------------------
-	// Tool 8 — query_at_time
+	// Tool — query_at_time
 	// ---------------------------------------------------------------------------
 
 	mcpServer.tool(
 		'query_at_time',
-		'Query a stream at a specific timestamp. Returns stream details and a window of all chat messages and transcription segments centered on the given timestamp.',
+		'Get chat and transcription in a window centered on a timestamp.',
 		{
-			streamId: z.string().describe('The stream ID to query'),
-			timestamp: z.number().describe('The timestamp in stream-local seconds to center the window on'),
+			streamId: z.string().describe('Stream ID'),
+			timestamp: z.number().describe('Center timestamp (stream-local seconds)'),
 			windowSeconds: z
 				.number()
 				.optional()
 				.default(30)
-				.describe('Total window size in seconds (default 30, centered on timestamp)')
+				.describe('Window size in seconds (default 30)')
 		},
 		async ({ streamId, timestamp, windowSeconds }) => {
 			const stream = getStream(streamId);
@@ -490,8 +496,8 @@ export function createMcpServer(): McpServer {
 			const chat = getChatMessagesInRange(streamId, windowStart, windowEnd);
 			const transcriptions = getTranscriptionsInRange(streamId, windowStart, windowEnd);
 
-			// Sample chat: at most 10 messages per 1-second bucket
-			const MAX_PER_SECOND = 10;
+			// Sample chat: at most 8 messages per 1-second bucket
+			const MAX_PER_SECOND = 8;
 			const totalChat = chat.length;
 			const buckets = new Map<number, typeof chat>();
 			for (const m of chat) {
@@ -508,18 +514,36 @@ export function createMcpServer(): McpServer {
 				if (bucket.length <= MAX_PER_SECOND) {
 					sampled.push(...bucket);
 				} else {
-					// Fisher-Yates partial shuffle to pick MAX_PER_SECOND random items
-					for (let i = bucket.length - 1; i > bucket.length - 1 - MAX_PER_SECOND; i--) {
-						const j = Math.floor(Math.random() * (i + 1));
-						[bucket[i], bucket[j]] = [bucket[j], bucket[i]];
+					// Always keep badged messages, fill remaining slots randomly
+					const badged = bucket.filter((m) => m.badges);
+					const unbadged = bucket.filter((m) => !m.badges);
+					if (badged.length >= MAX_PER_SECOND) {
+						// More badged than slots — shuffle and take MAX_PER_SECOND
+						for (let i = badged.length - 1; i > 0; i--) {
+							const j = Math.floor(Math.random() * (i + 1));
+							[badged[i], badged[j]] = [badged[j], badged[i]];
+						}
+						sampled.push(...badged.slice(0, MAX_PER_SECOND));
+					} else {
+						sampled.push(...badged);
+						const remaining = MAX_PER_SECOND - badged.length;
+						// Fisher-Yates partial shuffle on unbadged to pick remaining random items
+						for (let i = unbadged.length - 1; i > unbadged.length - 1 - remaining; i--) {
+							const j = Math.floor(Math.random() * (i + 1));
+							[unbadged[i], unbadged[j]] = [unbadged[j], unbadged[i]];
+						}
+						sampled.push(...unbadged.slice(unbadged.length - remaining));
 					}
-					sampled.push(...bucket.slice(bucket.length - MAX_PER_SECOND));
 				}
 			}
 			sampled.sort((a, b) => a.timestamp - b.timestamp);
 
-			const chatLines = sampled.map((m) => `[${m.timestamp}] ${m.username}: ${m.text}`);
-			const transcriptLines = transcriptions.map((t) => `[${t.startTime}-${t.endTime}] ${stream.channel}: ${t.text}`);
+			const chatLines = sampled.map((m) => {
+				const t = +m.timestamp.toFixed(1);
+				const badgePrefix = m.badges ? `[${m.badges}] ` : '';
+				return `[${t}] ${badgePrefix}${m.username}: ${m.text}`;
+			});
+			const transcriptLines = transcriptions.map((t) => `[${+t.startTime.toFixed(1)}-${+t.endTime.toFixed(1)}] ${stream.channel}: ${t.text}`);
 
 			const note =
 				sampled.length < totalChat
@@ -527,7 +551,7 @@ export function createMcpServer(): McpServer {
 					: undefined;
 
 			const parts = [
-				JSON.stringify({ stream, timestamp, windowStart, windowEnd, ...(note && { note }) }),
+				JSON.stringify({ channel: stream.channel, status: stream.status, durationSeconds: stream.durationSeconds, timestamp, windowStart, windowEnd, ...(note && { note }) }),
 				'',
 				'--- chat ---',
 				...chatLines,
@@ -547,10 +571,10 @@ export function createMcpServer(): McpServer {
 
 	mcpServer.tool(
 		'create_clip',
-		'Create a clip region on a stream. Defines a time range that can later be exported as video. Times default to master time (epoch seconds) but can be stream-local seconds if timeFormat is set to "local".',
+		'Create a clip region on a stream for later export.',
 		{
-			id: z.string().describe('Unique clip ID (use a UUID)'),
-			streamId: z.string().describe('The stream ID this clip belongs to'),
+			id: z.string().describe('Unique clip ID (UUID)'),
+			streamId: z.string().describe('Stream ID'),
 			startTime: z.number().describe('Clip start time'),
 			endTime: z.number().describe('Clip end time'),
 			timeFormat: z
@@ -558,10 +582,10 @@ export function createMcpServer(): McpServer {
 				.optional()
 				.default('master')
 				.describe(
-					'Time format: "master" for epoch seconds (default), "local" for stream-local seconds since capture start'
+					'"master" (epoch) or "local" (stream-relative)'
 				),
-			title: z.string().optional().describe('Short clip title/label'),
-			notes: z.string().optional().describe('Longer notes explaining why this was clipped')
+			title: z.string().optional().describe('Clip title'),
+			notes: z.string().optional().describe('Notes about this clip')
 		},
 		async ({ id, streamId, startTime, endTime, timeFormat, title, notes }) => {
 			// Verify stream exists
@@ -616,26 +640,26 @@ export function createMcpServer(): McpServer {
 
 	mcpServer.tool(
 		'update_clip',
-		'Update an existing clip region. Can change start/end times, title, and/or notes. Only provided fields are updated; omitted fields keep their current values.',
+		'Update a clip region. Only provided fields change.',
 		{
-			id: z.string().describe('The clip ID to update'),
+			id: z.string().describe('Clip ID'),
 			startTime: z
 				.number()
 				.optional()
-				.describe('New start time (epoch seconds by default, or stream-local if timeFormat is "local")'),
+				.describe('New start time'),
 			endTime: z
 				.number()
 				.optional()
-				.describe('New end time (epoch seconds by default, or stream-local if timeFormat is "local")'),
+				.describe('New end time'),
 			timeFormat: z
 				.enum(['master', 'local'])
 				.optional()
 				.default('master')
 				.describe(
-					'Time format: "master" for epoch seconds (default), "local" for stream-local seconds since capture start'
+					'"master" (epoch) or "local" (stream-relative)'
 				),
-			title: z.string().optional().describe('New clip title'),
-			notes: z.string().optional().describe('New clip notes')
+			title: z.string().optional().describe('New title'),
+			notes: z.string().optional().describe('New notes')
 		},
 		async ({ id, startTime, endTime, timeFormat, title, notes }) => {
 			const existing = getAllClipRegions().find((c) => c.id === id);
@@ -704,65 +728,24 @@ export function createMcpServer(): McpServer {
 	);
 
 	// ---------------------------------------------------------------------------
-	// Tool 11 — get_clips
+	// Tool — get_hotspots  (chat, audio, or both)
 	// ---------------------------------------------------------------------------
 
 	mcpServer.tool(
-		'get_clips',
-		'Get the full details of one or more clips by ID. Accepts a single clip ID string or an array of clip ID strings.',
+		'get_hotspots',
+		'Find peak moments by chat density, audio loudness, or both.',
 		{
-			id: z.union([z.string(), z.array(z.string())]).describe('A single clip ID or an array of clip IDs to look up')
+			streamId: z.string().describe('Stream ID'),
+			type: z.enum(['chat', 'audio', 'both']).describe('Analysis type'),
+			bucketSeconds: z
+				.number()
+				.optional()
+				.describe('Bucket size in seconds (default: 30 chat, 5 audio)'),
+			topN: z.number().optional().default(10).describe('Number of hotspots (default 10)'),
+			from: z.number().optional().describe('Range start (stream-local seconds)'),
+			to: z.number().optional().describe('Range end (stream-local seconds)')
 		},
-		async ({ id }) => {
-			const ids = Array.isArray(id) ? id : [id];
-			const allClips = getAllClipRegions();
-			const found = [];
-			const notFound = [];
-
-			for (const clipId of ids) {
-				const clip = allClips.find((c) => c.id === clipId);
-				if (clip) {
-					const stream = getStream(clip.streamId);
-					found.push({
-						...clip,
-						channel: stream?.channel ?? null,
-						startTimeISO: new Date(clip.startTime * 1000).toISOString(),
-						endTimeISO: new Date(clip.endTime * 1000).toISOString(),
-						durationSeconds: Math.round(clip.endTime - clip.startTime)
-					});
-				} else {
-					notFound.push(clipId);
-				}
-			}
-
-			return {
-				content: [
-					{
-						type: 'text' as const,
-						text: JSON.stringify({
-							count: found.length,
-							clips: found,
-							...(notFound.length > 0 && { notFound })
-						})
-					}
-				]
-			};
-		}
-	);
-
-	// ---------------------------------------------------------------------------
-	// Tool 12 — get_chat_hotspots
-	// ---------------------------------------------------------------------------
-
-	mcpServer.tool(
-		'get_chat_hotspots',
-		'Find the most active chat moments in a stream. Returns the top N time windows ranked by message density, useful for finding hype moments, fails, or big reactions.',
-		{
-			streamId: z.string().describe('The stream ID to analyze'),
-			bucketSeconds: z.number().optional().default(30).describe('Size of each time bucket in seconds (default 30)'),
-			topN: z.number().optional().default(10).describe('Number of top hotspots to return (default 10)')
-		},
-		async ({ streamId, bucketSeconds, topN }) => {
+		async ({ streamId, type, bucketSeconds, topN, from, to }) => {
 			const stream = getStream(streamId);
 			if (!stream) {
 				return {
@@ -771,27 +754,72 @@ export function createMcpServer(): McpServer {
 				};
 			}
 
-			const heatmap = getChatHeatmap(streamId, bucketSeconds ?? 30);
-			const sorted = [...heatmap.buckets].sort((a, b) => b.count - a.count);
-			const top = sorted.slice(0, topN ?? 10);
+			const n = topN ?? 10;
+			const result: Record<string, unknown> = { streamId, channel: stream.channel };
+
+			// --- Chat hotspots ---
+			if (type === 'chat' || type === 'both') {
+				const chatBucket = bucketSeconds ?? 30;
+				const heatmap = getChatHeatmap(streamId, chatBucket);
+				let buckets = heatmap.buckets;
+				if (from !== undefined) buckets = buckets.filter((b) => b.time >= from);
+				if (to !== undefined) buckets = buckets.filter((b) => b.time < to);
+				const sorted = [...buckets].sort((a, b) => b.count - a.count);
+				result.chat = {
+					bucketSeconds: chatBucket,
+					totalBuckets: buckets.length,
+					peakMessagesPerBucket: heatmap.max,
+					hotspots: sorted.slice(0, n).map((h) => ({ timeLocal: h.time, messageCount: h.count }))
+				};
+			}
+
+			// --- Audio hotspots ---
+			if (type === 'audio' || type === 'both') {
+				const audioBucket = bucketSeconds ?? 5;
+				const recordingDir = getStreamRecordingDir(streamId);
+				if (!recordingDir) {
+					if (type === 'audio') {
+						return {
+							isError: true,
+							content: [{ type: 'text' as const, text: `No recording directory found for stream "${streamId}".` }]
+						};
+					}
+					result.audio = { error: 'No recording directory found' };
+				} else {
+					const analysisFrom = from ?? 0;
+					const analysisTo = to ?? stream.durationSeconds ?? Number.MAX_SAFE_INTEGER;
+					try {
+						const loudness = await analyzeAudioLoudness(recordingDir, analysisFrom, analysisTo, audioBucket);
+						const sorted = [...loudness.buckets].sort((a, b) => b.rmsDb - a.rmsDb);
+						result.audio = {
+							bucketSeconds: audioBucket,
+							analyzedRange: { from: loudness.analyzedFrom, to: loudness.analyzedTo },
+							totalBuckets: loudness.buckets.length,
+							hotspots: sorted.slice(0, n).map((h) => ({
+								timeLocal: h.timeLocal,
+								rmsDb: h.rmsDb === -Infinity ? -100 : h.rmsDb,
+								peakDb: h.peakDb === -Infinity ? -100 : h.peakDb
+							}))
+						};
+					} catch (err) {
+						if (type === 'audio') {
+							return {
+								isError: true,
+								content: [
+									{
+										type: 'text' as const,
+										text: `Failed to analyze audio: ${err instanceof Error ? err.message : String(err)}`
+									}
+								]
+							};
+						}
+						result.audio = { error: `Audio analysis failed: ${err instanceof Error ? err.message : String(err)}` };
+					}
+				}
+			}
 
 			return {
-				content: [
-					{
-						type: 'text' as const,
-						text: JSON.stringify({
-							streamId,
-							channel: stream.channel,
-							bucketSeconds: bucketSeconds ?? 30,
-							totalBuckets: heatmap.buckets.length,
-							peakMessagesPerBucket: heatmap.max,
-							hotspots: top.map((h) => ({
-								timeLocal: h.time,
-								messageCount: h.count
-							}))
-						})
-					}
-				]
+				content: [{ type: 'text' as const, text: JSON.stringify(result) }]
 			};
 		}
 	);
@@ -802,9 +830,9 @@ export function createMcpServer(): McpServer {
 
 	mcpServer.tool(
 		'retranscribe',
-		'Re-run transcription on a stopped stream. Clears existing transcriptions and processes all audio again. Only works on streams with status "stopped".',
+		'Re-run transcription on a stopped stream (clears existing).',
 		{
-			streamId: z.string().describe('The stream ID to retranscribe')
+			streamId: z.string().describe('Stream ID')
 		},
 		async ({ streamId }) => {
 			const stream = getStream(streamId);
@@ -848,9 +876,9 @@ export function createMcpServer(): McpServer {
 
 	mcpServer.tool(
 		'get_word_timestamps',
-		'Get word-level timestamps for a transcription segment. Returns an array of words with their precise start/end times (in stream-local seconds). Use the transcription ID from search_transcriptions results.',
+		'Get word-level timestamps for a transcription segment.',
 		{
-			transcriptionId: z.number().describe('The transcription segment ID (from search_transcriptions)')
+			transcriptionId: z.number().describe('Transcription segment ID')
 		},
 		async ({ transcriptionId }) => {
 			const words = loadWordTimestamps(transcriptionId);
@@ -868,11 +896,12 @@ export function createMcpServer(): McpServer {
 					]
 				};
 			}
+			const tuples = words.map((w) => [w.word, w.startTime, w.endTime]);
 			return {
 				content: [
 					{
 						type: 'text' as const,
-						text: JSON.stringify({ transcriptionId, wordCount: words.length, words })
+						text: JSON.stringify({ transcriptionId, wordCount: words.length, words: tuples })
 					}
 				]
 			};
@@ -885,16 +914,16 @@ export function createMcpServer(): McpServer {
 
 	mcpServer.tool(
 		'export_video',
-		'Export a video from one or more clips, stitched in the specified order. Returns immediately with an export ID — the encode runs in the background. Use list_exports to check status.',
+		'Export video from clips. Returns export ID; runs in background.',
 		{
-			clipIds: z.array(z.string()).min(1).describe('Ordered list of clip IDs to include in the export'),
-			title: z.string().describe('Title for the exported video (used as filename)'),
-			description: z.string().optional().describe('Optional description of the export'),
+			clipIds: z.array(z.string()).min(1).describe('Ordered clip IDs to export'),
+			title: z.string().describe('Export title (used as filename)'),
+			description: z.string().optional().describe('Export description'),
 			chronological: z
 				.boolean()
 				.optional()
 				.default(false)
-				.describe('If true, automatically sort clips by start time instead of using the provided order')
+				.describe('Sort clips by start time')
 		},
 		async ({ clipIds, title, description, chronological }) => {
 			try {
@@ -917,7 +946,7 @@ export function createMcpServer(): McpServer {
 							text: JSON.stringify({
 								success: true,
 								exportId: record.id,
-								message: `Export "${title}" queued with ${finalClipIds.length} clip(s)${chronological ? ' (sorted chronologically)' : ''}. Use list_exports to check status.`
+								message: `Export "${title}" queued with ${finalClipIds.length} clip(s)${chronological ? ' (sorted chronologically)' : ''}. Use get_exports to check status.`
 							})
 						}
 					]
@@ -937,52 +966,109 @@ export function createMcpServer(): McpServer {
 	);
 
 	// ---------------------------------------------------------------------------
-	// Tool 14 — list_exports
+	// Tool — get_exports
 	// ---------------------------------------------------------------------------
 
 	mcpServer.tool(
-		'list_exports',
-		'List all video exports with their status (pending, exporting, ready, error). Most recent first.',
-		{},
-		async () => {
+		'get_exports',
+		'Get export by ID, or list all if omitted.',
+		{
+			id: z.string().optional().describe('Export ID (omit to list all)')
+		},
+		async ({ id }) => {
+			if (id) {
+				const record = smLoadExport(id);
+				if (!record) {
+					return {
+						isError: true,
+						content: [{ type: 'text' as const, text: `Export "${id}" not found.` }]
+					};
+				}
+				return {
+					content: [{ type: 'text' as const, text: JSON.stringify(record) }]
+				};
+			}
 			const exports = smLoadAllExports();
 			return {
-				content: [
-					{
-						type: 'text' as const,
-						text: JSON.stringify({ count: exports.length, exports })
-					}
-				]
+				content: [{ type: 'text' as const, text: JSON.stringify({ count: exports.length, exports }) }]
 			};
 		}
 	);
 
 	// ---------------------------------------------------------------------------
-	// Tool 15 — get_export
+	// Tool 16 — get_screenshot
 	// ---------------------------------------------------------------------------
 
 	mcpServer.tool(
-		'get_export',
-		'Get the status and details of a specific video export by ID.',
+		'get_screenshot',
+		'Capture a JPEG frame from a stream at a given timestamp.',
 		{
-			exportId: z.string().describe('The export ID to look up')
+			streamId: z.string().describe('Stream ID'),
+			timestamp: z
+				.number()
+				.describe('Timestamp to capture'),
+			timeFormat: z
+				.enum(['master', 'local'])
+				.optional()
+				.default('local')
+				.describe('"local" (stream-relative, default) or "master" (epoch)')
 		},
-		async ({ exportId }) => {
-			const record = smLoadExport(exportId);
-			if (!record) {
+		async ({ streamId, timestamp, timeFormat }) => {
+			const stream = getStream(streamId);
+			if (!stream) {
 				return {
 					isError: true,
-					content: [{ type: 'text' as const, text: `Export "${exportId}" not found.` }]
+					content: [{ type: 'text' as const, text: `Stream "${streamId}" not found.` }]
 				};
 			}
-			return {
-				content: [
-					{
-						type: 'text' as const,
-						text: JSON.stringify(record)
-					}
-				]
-			};
+
+			const recordingDir = getStreamRecordingDir(streamId);
+			if (!recordingDir) {
+				return {
+					isError: true,
+					content: [{ type: 'text' as const, text: `No recording directory found for stream "${streamId}".` }]
+				};
+			}
+
+			let localTs = timestamp;
+			if (timeFormat === 'master') {
+				localTs = timestamp - stream.startedAt / 1000 + stream.offset;
+			}
+
+			if (localTs < 0) {
+				return {
+					isError: true,
+					content: [
+						{
+							type: 'text' as const,
+							text: `Timestamp resolves to ${localTs.toFixed(1)}s (before stream start). Provide a later timestamp.`
+						}
+					]
+				};
+			}
+
+			try {
+				const buffer = await extractFrame(recordingDir, localTs);
+				return {
+					content: [
+						{
+							type: 'image' as const,
+							data: buffer.toString('base64'),
+							mimeType: 'image/jpeg'
+						}
+					]
+				};
+			} catch (err) {
+				return {
+					isError: true,
+					content: [
+						{
+							type: 'text' as const,
+							text: `Failed to extract frame: ${err instanceof Error ? err.message : String(err)}`
+						}
+					]
+				};
+			}
 		}
 	);
 

@@ -16,7 +16,7 @@ const VOD_COMMENTS_QUERY = `query($videoID: ID!, $cursor: Cursor) {
         node {
           contentOffsetSeconds
           commenter { displayName chatColor }
-          message { fragments { text } }
+          message { fragments { text } userBadges { setID } }
         }
       }
       pageInfo { hasNextPage }
@@ -160,8 +160,13 @@ async function fetchAllPages(entry: QueueEntry) {
 				const text = fragments.map((f: any) => f.text).join('');
 				const timestamp: number = node.contentOffsetSeconds ?? 0;
 				const color: string | null = node.commenter?.chatColor ?? null;
+				const userBadges: any[] = node.message?.userBadges ?? [];
+				const badges: string | null =
+					userBadges.length > 0
+						? userBadges.map((b: any) => b.setID).join(',')
+						: null;
 
-				batch.push({ username, text, timestamp, color });
+				batch.push({ username, text, timestamp, color, badges });
 				totalMessages++;
 
 				cursor = edge.cursor;

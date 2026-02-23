@@ -148,6 +148,13 @@ export async function initDatabase(): Promise<void> {
 		// Column already exists — ignore
 	}
 
+	// Migration: add badges column for chat message user badges
+	try {
+		db.exec('ALTER TABLE chat_messages ADD COLUMN badges TEXT');
+	} catch {
+		// Column already exists — ignore
+	}
+
 	// Migration: add composite index for time-range transcription queries
 	try {
 		db.exec('CREATE INDEX IF NOT EXISTS idx_transcriptions_stream_time ON transcriptions(stream_id, start_time)');
@@ -235,7 +242,7 @@ export async function initDatabase(): Promise<void> {
 
 	// Prepare hot-path statements for better performance
 	stmtSaveChatMessage = db.prepare(
-		'INSERT OR IGNORE INTO chat_messages (stream_id, username, text, timestamp, color) VALUES (?, ?, ?, ?, ?)'
+		'INSERT OR IGNORE INTO chat_messages (stream_id, username, text, timestamp, color, badges) VALUES (?, ?, ?, ?, ?, ?)'
 	);
 	stmtSaveTranscription = db.prepare(
 		'INSERT INTO transcriptions (stream_id, text, start_time, end_time) VALUES (?, ?, ?, ?)'
@@ -306,6 +313,7 @@ interface ChatRow {
 	text: string;
 	timestamp: number;
 	color: string | null;
+	badges: string | null;
 }
 
 interface ClipRow {
@@ -533,15 +541,16 @@ export function deleteTranscriptions(streamId: string): void {
 
 export function saveChatMessage(streamId: string, msg: ChatMessage): void {
 	if (stmtSaveChatMessage) {
-		stmtSaveChatMessage.run(streamId, msg.username, msg.text, msg.timestamp, msg.color ?? null);
+		stmtSaveChatMessage.run(streamId, msg.username, msg.text, msg.timestamp, msg.color ?? null, msg.badges ?? null);
 	} else {
 		const d = getDb();
-		d.run('INSERT OR IGNORE INTO chat_messages (stream_id, username, text, timestamp, color) VALUES (?, ?, ?, ?, ?)', [
+		d.run('INSERT OR IGNORE INTO chat_messages (stream_id, username, text, timestamp, color, badges) VALUES (?, ?, ?, ?, ?, ?)', [
 			streamId,
 			msg.username,
 			msg.text,
 			msg.timestamp,
-			msg.color ?? null
+			msg.color ?? null,
+			msg.badges ?? null
 		]);
 	}
 }
@@ -553,12 +562,12 @@ export function saveChatMessagesBatch(streamId: string, messages: ChatMessage[])
 	const stmt =
 		stmtSaveChatMessage ??
 		d.prepare(
-			'INSERT OR IGNORE INTO chat_messages (stream_id, username, text, timestamp, color) VALUES (?, ?, ?, ?, ?)'
+			'INSERT OR IGNORE INTO chat_messages (stream_id, username, text, timestamp, color, badges) VALUES (?, ?, ?, ?, ?, ?)'
 		);
 	d.exec('BEGIN');
 	try {
 		for (const msg of messages) {
-			stmt.run(streamId, msg.username, msg.text, msg.timestamp, msg.color ?? null);
+			stmt.run(streamId, msg.username, msg.text, msg.timestamp, msg.color ?? null, msg.badges ?? null);
 		}
 		d.exec('COMMIT');
 	} catch (err) {
@@ -589,22 +598,23 @@ export function loadChatMessagesInRange(
 		username: r.username,
 		text: r.text,
 		timestamp: r.timestamp,
-		color: r.color ?? null
+		color: r.color ?? null,
+		badges: r.badges ?? null
 	});
 	if (query) {
 		// When limited, fetch the LAST N messages in the range (most recent, near the playhead)
 		const sql =
 			cap > 0
-				? 'SELECT * FROM (SELECT id, username, text, timestamp, color FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? AND text LIKE ? ORDER BY timestamp DESC LIMIT ?) ORDER BY timestamp'
-				: 'SELECT id, username, text, timestamp, color FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? AND text LIKE ? ORDER BY timestamp';
+				? 'SELECT * FROM (SELECT id, username, text, timestamp, color, badges FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? AND text LIKE ? ORDER BY timestamp DESC LIMIT ?) ORDER BY timestamp'
+				: 'SELECT id, username, text, timestamp, color, badges FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? AND text LIKE ? ORDER BY timestamp';
 		const params =
 			cap > 0 ? [streamId, fromTime, toTime, `%${query}%`, cap] : [streamId, fromTime, toTime, `%${query}%`];
 		return (d.query(sql).all(...params) as ChatRow[]).map(mapRow);
 	}
 	const sql =
 		cap > 0
-			? 'SELECT * FROM (SELECT id, username, text, timestamp, color FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp DESC LIMIT ?) ORDER BY timestamp'
-			: 'SELECT id, username, text, timestamp, color FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp';
+			? 'SELECT * FROM (SELECT id, username, text, timestamp, color, badges FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp DESC LIMIT ?) ORDER BY timestamp'
+			: 'SELECT id, username, text, timestamp, color, badges FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp';
 	const params = cap > 0 ? [streamId, fromTime, toTime, cap] : [streamId, fromTime, toTime];
 	return (d.query(sql).all(...params) as ChatRow[]).map(mapRow);
 }

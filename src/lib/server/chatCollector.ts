@@ -83,8 +83,12 @@ export function startChatCollection(
 					// Prefer display-name from tags (proper casing), fall back to IRC nick
 					const username = extractTag(tags, 'display-name') || fallbackUsername;
 					const color = extractTag(tags, 'color');
+					const badgesRaw = extractTag(tags, 'badges');
+					const badges = badgesRaw
+						? badgesRaw.split(',').map((b) => b.split('/')[0]).join(',')
+						: null;
 
-					onMessage(streamId, { username, text, timestamp, color });
+					onMessage(streamId, { username, text, timestamp, color, badges });
 				}
 			}
 		};
