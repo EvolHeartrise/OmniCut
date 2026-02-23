@@ -11,6 +11,7 @@
 		saveOffset,
 		focusedStreamId,
 		clipRegions,
+		createClipRegion,
 		saveClipRegion,
 		seekRequest,
 		type ClipRegion
@@ -795,14 +796,15 @@
 					(r) => r.streamId === $focusedStreamId && r.startTime < now && now < r.endTime
 				);
 				if (region) {
-					const result = splitClipRegion(region, now);
-					if (result) {
-						pushUndo({
-							type: 'split-region',
-							original: region,
-							createdIds: [result.firstHalf.id, result.secondHalf.id]
-						});
-					}
+					splitClipRegion(region, now).then((result) => {
+						if (result) {
+							pushUndo({
+								type: 'split-region',
+								original: region,
+								createdIds: [result.firstHalf.id, result.secondHalf.id]
+							});
+						}
+					});
 				}
 			}
 		} else if ((e.key === 'l' || e.key === 'L') && !e.repeat) {
@@ -844,20 +846,15 @@
 		}
 	}
 
-	function handleKeyup(e: KeyboardEvent) {
+	async function handleKeyup(e: KeyboardEvent) {
 		if ((e.key === 'w' || e.key === 'W') && markingStreamId) {
+			const startTime = markingStartTime;
 			const endTime = masterCurrentTimeState;
-			const region: ClipRegion = {
-				id: crypto.randomUUID(),
-				streamId: markingStreamId!,
-				startTime: markingStartTime,
-				endTime
-			};
-			clipRegions.update((regions) => [...regions, region]);
-			saveClipRegion(region);
-			pushUndo({ type: 'add-region', region });
+			const streamId = markingStreamId!;
 			markingStreamId = null;
 			markingStartTime = 0;
+			const region = await createClipRegion({ streamId, startTime, endTime });
+			pushUndo({ type: 'add-region', region });
 		}
 	}
 

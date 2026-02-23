@@ -25,6 +25,25 @@ export function restoreClipRegions(): void {
 }
 
 /**
+ * Create a new clip region with a DB-generated auto-incrementing ID.
+ * Returns the full region (including the new ID).
+ */
+export function createClipRegion(data: Omit<ClipRegion, 'id'>): ClipRegion {
+	if (data.startTime >= data.endTime) {
+		throw new Error(
+			`Invalid clip region: startTime (${data.startTime}) must be less than endTime (${data.endTime})`
+		);
+	}
+
+	const id = db.insertClipRegion(data);
+	const region: ClipRegion = { id, ...data };
+	clipRegionsStore.set(id, region);
+	broadcastClipRegionsChanged(getAllClipRegions());
+	enqueueClipEncode(id);
+	return region;
+}
+
+/**
  * Add or update a clip region (upsert by ID).
  * Validates that startTime < endTime.
  * Triggers clip encoding (or re-encoding if times changed).

@@ -15,6 +15,7 @@ import {
 	getStream,
 	getAllClipRegions,
 	addClipRegion,
+	createClipRegion,
 	getChatMessagesInRange,
 	getTranscriptionsInRange,
 	getChatHeatmap,
@@ -26,7 +27,6 @@ import {
 } from './streamManager.js';
 
 import { extractFrame, analyzeAudioLoudness } from './clipEncoder.js';
-
 import { loadWatchlist, loadWordTimestamps } from './persistence.js';
 
 import {
@@ -573,7 +573,7 @@ export function createMcpServer(): McpServer {
 		'upsert_clip',
 		'Create or update a clip. Provide streamId+startTime+endTime to create; omit to update existing fields.',
 		{
-			id: z.string().describe('Clip ID (UUID)'),
+			id: z.string().optional().describe('Clip ID — omit to auto-generate'),
 			streamId: z.string().optional().describe('Stream ID (required for new clips)'),
 			startTime: z.number().optional().describe('Start time'),
 			endTime: z.number().optional().describe('End time'),
@@ -586,7 +586,15 @@ export function createMcpServer(): McpServer {
 			notes: z.string().optional().describe('Clip notes')
 		},
 		async ({ id, streamId, startTime, endTime, timeFormat, title, notes }) => {
-			const existing = getAllClipRegions().find((c) => c.id === id);
+			const existing = id ? getAllClipRegions().find((c) => c.id === id) : undefined;
+
+			// When updating, id is required
+			if (!id && !streamId) {
+				return {
+					isError: true,
+					content: [{ type: 'text' as const, text: 'streamId is required when creating a new clip.' }]
+				};
+			}
 
 			// --- Resolve stream & times ---
 			const resolvedStreamId = streamId ?? existing?.streamId;
@@ -622,22 +630,29 @@ export function createMcpServer(): McpServer {
 			}
 
 			try {
-				addClipRegion({
-					...(existing ?? {}),
-					id,
+				const clipData = {
 					streamId: resolvedStreamId,
 					startTime: newStart,
 					endTime: newEnd,
-					createdBy: existing?.createdBy ?? 'ai',
+					createdBy: (existing?.createdBy ?? 'ai') as 'human' | 'ai',
 					...(title !== undefined && { title }),
 					...(notes !== undefined && { notes })
-				});
+				};
+
+				let resolvedId: string;
+				if (existing) {
+					resolvedId = existing.id;
+					addClipRegion({ ...existing, ...clipData, id: resolvedId });
+				} else {
+					const created = createClipRegion(clipData);
+					resolvedId = created.id;
+				}
 				const action = existing ? 'updated' : 'created';
 				return {
 					content: [
 						{
 							type: 'text' as const,
-							text: `Clip ${action}: ${id} (${Math.round(newEnd - newStart)}s on "${stream.channel}")`
+							text: `Clip ${action}: ${resolvedId} (${Math.round(newEnd - newStart)}s on "${stream.channel}")`
 						}
 					]
 				};

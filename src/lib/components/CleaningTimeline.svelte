@@ -358,8 +358,8 @@
 		removeClipRegionAction(clip);
 	}
 
-	function splitClip(clip: ClipRegion, splitMasterTime: number) {
-		const result = splitClipRegion(clip, splitMasterTime);
+	async function splitClip(clip: ClipRegion, splitMasterTime: number) {
+		const result = await splitClipRegion(clip, splitMasterTime);
 		if (result) {
 			undoStack = [
 				...undoStack,

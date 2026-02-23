@@ -15,6 +15,7 @@
 		streamPlaybackStates,
 		masterTime,
 		clipRegions,
+		createClipRegion,
 		saveClipRegion,
 		type ClipRegion,
 		type TranscriptionEntry
@@ -78,16 +79,20 @@
 	});
 
 	// T-key hold state for transcription-based clip region creation
+	const PENDING_CLIP_ID = '__pending__';
 	let tHeld = $state(false);
-	let tClipId = $state<string | null>(null);
 	let tClipStreamId = $state<string | null>(null);
 
 	// Save in-progress clip if user navigates away mid-hold
 	onDestroy(() => {
-		if (tHeld && tClipId) {
+		if (tHeld) {
 			const regions = $clipRegions;
-			const region = regions.find((r) => r.id === tClipId);
-			if (region) saveClipRegion(region);
+			const region = regions.find((r) => r.id === PENDING_CLIP_ID);
+			if (region) {
+				clipRegions.update((rs) => rs.filter((r) => r.id !== PENDING_CLIP_ID));
+				const { id: _, ...data } = region;
+				createClipRegion(data);
+			}
 		}
 	});
 
@@ -182,14 +187,13 @@
 						}
 						if (entry) {
 							const region: ClipRegion = {
-								id: crypto.randomUUID(),
+								id: PENDING_CLIP_ID,
 								streamId: focused,
 								startTime: entry.startTime + anchor - offset,
 								endTime: entry.endTime + anchor - offset
 							};
 							clipRegions.update((regions) => [...regions, region]);
 							tHeld = true;
-							tClipId = region.id;
 							tClipStreamId = focused;
 						}
 					}
@@ -207,22 +211,23 @@
 		}
 	}
 
-	function handleKeyup(e: KeyboardEvent) {
+	async function handleKeyup(e: KeyboardEvent) {
 		if ((e.key === 't' || e.key === 'T') && tHeld) {
 			tHeld = false;
-			if (tClipId) {
-				const regions = $clipRegions;
-				const region = regions.find((r) => r.id === tClipId);
-				if (region) saveClipRegion(region);
+			const regions = $clipRegions;
+			const region = regions.find((r) => r.id === PENDING_CLIP_ID);
+			clipRegions.update((rs) => rs.filter((r) => r.id !== PENDING_CLIP_ID));
+			if (region) {
+				const { id: _, ...data } = region;
+				await createClipRegion(data);
 			}
-			tClipId = null;
 			tClipStreamId = null;
 		}
 	}
 
 	// While T is held, extend the in-progress clip region
 	$effect(() => {
-		if (!tHeld || !tClipId || !tClipStreamId) return;
+		if (!tHeld || !tClipStreamId) return;
 		const now = $masterTime;
 		const stream = $streams.find((s) => s.id === tClipStreamId);
 		const entries = $transcriptions[tClipStreamId!];
@@ -241,9 +246,8 @@
 		}
 		if (latestEnd < 0) return;
 
-		const clipId = tClipId;
 		clipRegions.update((regions) => {
-			const idx = regions.findIndex((r) => r.id === clipId);
+			const idx = regions.findIndex((r) => r.id === PENDING_CLIP_ID);
 			if (idx === -1) return regions;
 			const existing = regions[idx];
 			if (latestEnd <= existing.endTime) return regions;

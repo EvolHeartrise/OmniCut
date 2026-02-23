@@ -647,7 +647,7 @@ export function updateStreamOffset(id: string, offset: number): boolean {
 }
 
 // --- Clip regions (delegated to clipManager.ts) ---
-export { addClipRegion, removeClipRegion, getAllClipRegions } from './clipManager.js';
+export { addClipRegion, createClipRegion, removeClipRegion, getAllClipRegions } from './clipManager.js';
 
 // --- Clip encoding status (delegated to clipEncoder.ts) ---
 export { getClipEncodeStatus, getEncodedClipPath } from './clipEncoder.js';

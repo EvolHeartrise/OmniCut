@@ -13,6 +13,7 @@ import {
 	refetchVodChat as smRefetchVodChat,
 	updateStreamOffset,
 	addClipRegion,
+	createClipRegion as smCreateClipRegion,
 	removeClipRegion,
 	getChatHeatmap as smGetChatHeatmap,
 	getChatMessagesInRange as smGetChatMessagesInRange,
@@ -309,8 +310,23 @@ export const updateOffsetCmd = command('unchecked', async (args: { id: string; o
 // Commands — Clip Regions
 // ---------------------------------------------------------------------------
 
-/** Save (upsert) a clip region. */
-export const saveClipCmd = command(
+/** Create a new clip region (server generates ID). Returns the created clip. */
+export const createClipCmd = command(
+	'unchecked',
+	async (data: {
+		streamId: string;
+		startTime: number;
+		endTime: number;
+		createdBy?: 'human' | 'ai';
+		title?: string;
+		notes?: string;
+	}) => {
+		return smCreateClipRegion(data);
+	}
+);
+
+/** Update an existing clip region (ID required). */
+export const updateClipCmd = command(
 	'unchecked',
 	async (region: {
 		id: string;

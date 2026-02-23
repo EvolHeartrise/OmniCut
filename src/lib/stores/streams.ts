@@ -9,7 +9,8 @@ import {
 	refetchVodChatCmd,
 	resumeVodCmd,
 	updateOffsetCmd,
-	saveClipCmd,
+	createClipCmd,
+	updateClipCmd,
 	deleteClipCmd
 } from '$lib/streams.remote';
 
@@ -276,11 +277,18 @@ export function saveOffset(id: string, offset: number) {
 }
 
 /**
- * Save a new clip region to the server.
+ * Create a new clip region on the server. Returns the full ClipRegion with server-generated ID.
+ */
+export async function createClipRegion(data: Omit<ClipRegion, 'id'>): Promise<ClipRegion> {
+	return await createClipCmd(data);
+}
+
+/**
+ * Update an existing clip region on the server (ID required).
  */
 export async function saveClipRegion(region: ClipRegion) {
 	try {
-		await saveClipCmd(region);
+		await updateClipCmd(region);
 	} catch (err) {
 		console.error('Failed to save clip region:', err);
 	}

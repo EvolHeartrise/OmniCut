@@ -79,7 +79,7 @@ export async function initDatabase(): Promise<void> {
 		CREATE INDEX IF NOT EXISTS idx_chat_stream_time ON chat_messages(stream_id, timestamp);
 
 		CREATE TABLE IF NOT EXISTS clip_regions (
-			id TEXT PRIMARY KEY,
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			stream_id TEXT NOT NULL,
 			start_time REAL NOT NULL,
 			end_time REAL NOT NULL
@@ -240,6 +240,125 @@ export async function initDatabase(): Promise<void> {
 		);
 	`);
 
+	// Migration: convert clip_regions.id from TEXT to INTEGER PRIMARY KEY AUTOINCREMENT.
+	// This also converts any non-numeric IDs (UUIDs, nanoids) to integers.
+	{
+		const schema = db
+			.query("SELECT sql FROM sqlite_master WHERE type='table' AND name='clip_regions'")
+			.get() as { sql: string } | null;
+		if (schema?.sql && !schema.sql.includes('INTEGER PRIMARY KEY')) {
+			const allRows = db
+				.query('SELECT id, stream_id, start_time, end_time, created_by, title, notes FROM clip_regions ORDER BY CAST(id AS INTEGER)')
+				.all() as { id: string; stream_id: string; start_time: number; end_time: number; created_by: string | null; title: string | null; notes: string | null }[];
+
+			// Build old→new ID map: keep numeric IDs as-is, assign new ones for non-numeric
+			const idMap = new Map<string, number>();
+			let maxNumeric = 0;
+			for (const row of allRows) {
+				const n = Number(row.id);
+				if (/^\d+$/.test(row.id) && Number.isFinite(n)) {
+					idMap.set(row.id, n);
+					if (n > maxNumeric) maxNumeric = n;
+				}
+			}
+			let nextId = maxNumeric + 1;
+			for (const row of allRows) {
+				if (!idMap.has(row.id)) {
+					idMap.set(row.id, nextId++);
+				}
+			}
+
+			db.exec('BEGIN');
+			try {
+				// 1. Recreate table with INTEGER PRIMARY KEY AUTOINCREMENT
+				db.exec(`
+					CREATE TABLE clip_regions_new (
+						id INTEGER PRIMARY KEY AUTOINCREMENT,
+						stream_id TEXT NOT NULL,
+						start_time REAL NOT NULL,
+						end_time REAL NOT NULL,
+						created_by TEXT DEFAULT 'human',
+						title TEXT,
+						notes TEXT
+					);
+				`);
+
+				const insert = db.prepare(
+					'INSERT INTO clip_regions_new (id, stream_id, start_time, end_time, created_by, title, notes) VALUES (?, ?, ?, ?, ?, ?, ?)'
+				);
+				for (const row of allRows) {
+					insert.run(idMap.get(row.id)!, row.stream_id, row.start_time, row.end_time, row.created_by, row.title, row.notes);
+				}
+
+				db.exec('DROP TABLE clip_regions');
+				db.exec('ALTER TABLE clip_regions_new RENAME TO clip_regions');
+				db.exec('CREATE INDEX idx_clip_stream ON clip_regions(stream_id)');
+
+				// 2. Update clip_ids JSON arrays in exports table
+				const exports = db
+					.prepare('SELECT id, clip_ids FROM exports')
+					.all() as { id: string; clip_ids: string }[];
+				const updateExport = db.prepare('UPDATE exports SET clip_ids = ? WHERE id = ?');
+				for (const exp of exports) {
+					const clipIds: string[] = JSON.parse(exp.clip_ids);
+					let changed = false;
+					const updatedIds = clipIds.map((cid) => {
+						const mapped = idMap.get(cid);
+						if (mapped !== undefined && String(mapped) !== cid) {
+							changed = true;
+							return String(mapped);
+						}
+						return cid;
+					});
+					if (changed) {
+						updateExport.run(JSON.stringify(updatedIds), exp.id);
+					}
+				}
+
+				// 3. Rename encoded .mp4 files on disk
+				const clipsDir = path.join(DATA_DIR, 'clips');
+				if (fs.existsSync(clipsDir)) {
+					for (const [oldId, newId] of idMap) {
+						if (oldId === String(newId)) continue;
+						const oldPath = path.join(clipsDir, `${oldId}.mp4`);
+						const newPath = path.join(clipsDir, `${newId}.mp4`);
+						if (fs.existsSync(oldPath)) {
+							fs.renameSync(oldPath, newPath);
+						}
+					}
+				}
+
+				db.exec('COMMIT');
+				console.log(`[migration] Converted clip_regions to INTEGER PRIMARY KEY AUTOINCREMENT (${allRows.length} rows)`);
+			} catch (e) {
+				db.exec('ROLLBACK');
+				throw e;
+			}
+		}
+	}
+
+	// Migration: convert UUID export IDs to nanoid
+	{
+		const { newExportId } = await import('../ids.js');
+		const rows = db
+			.query("SELECT id FROM exports WHERE id LIKE '________-____-____-____-____________'")
+			.all() as { id: string }[];
+		if (rows.length > 0) {
+			const update = db.prepare('UPDATE exports SET id = ? WHERE id = ?');
+			db.exec('BEGIN');
+			try {
+				for (const row of rows) {
+					update.run(newExportId(), row.id);
+				}
+				db.exec('COMMIT');
+				console.log(`[migration] Converted ${rows.length} UUID export IDs to nanoid`);
+			} catch (e) {
+				db.exec('ROLLBACK');
+				throw e;
+			}
+		}
+	}
+
 	// Prepare hot-path statements for better performance
 	stmtSaveChatMessage = db.prepare(
 		'INSERT OR IGNORE INTO chat_messages (stream_id, username, text, timestamp, color, badges) VALUES (?, ?, ?, ?, ?, ?)'
@@ -317,7 +436,7 @@ interface ChatRow {
 }
 
 interface ClipRow {
-	id: string;
+	id: number;
 	stream_id: string;
 	start_time: number;
 	end_time: number;
@@ -637,6 +756,18 @@ export function loadChatHeatmap(streamId: string, bucketSeconds: number): Array<
 
 // --- Clip Regions ---
 
+/** Insert a new clip region, letting the DB auto-generate the ID. Returns the generated ID as a string. */
+export function insertClipRegion(data: Omit<ClipRegion, 'id'>): string {
+	const d = getDb();
+	d.run(
+		'INSERT INTO clip_regions (stream_id, start_time, end_time, created_by, title, notes) VALUES (?, ?, ?, ?, ?, ?)',
+		[data.streamId, data.startTime, data.endTime, data.createdBy ?? 'human', data.title ?? null, data.notes ?? null]
+	);
+	const row = d.query('SELECT last_insert_rowid() as id').get() as { id: number };
+	return String(row.id);
+}
+
+/** Upsert a clip region with a known ID (for updates, undo re-adds, etc.). */
 export function saveClipRegion(region: ClipRegion): void {
 	const d = getDb();
 	d.run(
@@ -665,7 +796,7 @@ export function loadAllClipRegions(): ClipRegion[] {
 		.query('SELECT id, stream_id, start_time, end_time, created_by, title, notes FROM clip_regions')
 		.all() as ClipRow[];
 	return rows.map((r) => ({
-		id: r.id,
+		id: String(r.id),
 		streamId: r.stream_id,
 		startTime: r.start_time,
 		endTime: r.end_time,

@@ -26,6 +26,7 @@
 	},
 	"dependencies": {
 		"@modelcontextprotocol/sdk": "^1.26.0",
-		"hls.js": "^1.6.15"
+		"hls.js": "^1.6.15",
+		"nanoid": "^5.1.6"
 	}
 }

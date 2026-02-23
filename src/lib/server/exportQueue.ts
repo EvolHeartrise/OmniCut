@@ -4,7 +4,7 @@
  * to avoid FFmpeg/disk I/O contention with the clip encoder.
  */
 
-import * as crypto from 'node:crypto';
+import { newExportId } from '../ids.js';
 import { getClipRegion } from './clipManager.js';
 import { exportVideo } from './exporter.js';
 import * as db from './persistence.js';
@@ -34,7 +34,7 @@ export function createAndQueueExport(clipIds: string[], title: string, descripti
 		throw new Error(`Clip IDs not found: ${missing.join(', ')}`);
 	}
 
-	const id = crypto.randomUUID();
+	const id = newExportId();
 	const record: ExportRecord = {
 		id,
 		title,

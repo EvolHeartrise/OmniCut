@@ -1,35 +1,25 @@
-import { clipRegions, saveClipRegion, deleteClipRegion } from './stores/streams.js';
+import { clipRegions, createClipRegion, deleteClipRegion } from './stores/streams.js';
 import type { ClipRegion } from './types.js';
 
 /**
  * Split a clip region at the given master time into two halves.
- * Updates the store and persists to the server.
- * Returns the two new regions, or null if the split time is out of range.
+ * Deletes the original and creates two new regions server-side.
+ * Returns the two new regions (with server-generated IDs), or null if the split time is out of range.
  */
-export function splitClipRegion(
+export async function splitClipRegion(
 	clip: ClipRegion,
 	splitTime: number
-): { firstHalf: ClipRegion; secondHalf: ClipRegion } | null {
+): Promise<{ firstHalf: ClipRegion; secondHalf: ClipRegion } | null> {
 	if (splitTime <= clip.startTime || splitTime >= clip.endTime) return null;
 
-	const firstHalf: ClipRegion = {
-		id: crypto.randomUUID(),
-		streamId: clip.streamId,
-		startTime: clip.startTime,
-		endTime: splitTime
-	};
-	const secondHalf: ClipRegion = {
-		id: crypto.randomUUID(),
-		streamId: clip.streamId,
-		startTime: splitTime,
-		endTime: clip.endTime
-	};
-
-	clipRegions.update((regions) => [...regions.filter((r) => r.id !== clip.id), firstHalf, secondHalf]);
 	deleteClipRegion(clip.id);
-	saveClipRegion(firstHalf);
-	saveClipRegion(secondHalf);
 
+	const [firstHalf, secondHalf] = await Promise.all([
+		createClipRegion({ streamId: clip.streamId, startTime: clip.startTime, endTime: splitTime }),
+		createClipRegion({ streamId: clip.streamId, startTime: splitTime, endTime: clip.endTime })
+	]);
+
+	// No local store update needed — SSE broadcast handles it
 	return { firstHalf, secondHalf };
 }
 
