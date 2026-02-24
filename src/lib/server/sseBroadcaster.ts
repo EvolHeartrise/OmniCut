@@ -35,6 +35,10 @@ export function broadcast(data: string) {
 
 // --- Count management ---
 
+function incrementCount(map: Map<string, number>, key: string, delta = 1): void {
+	map.set(key, (map.get(key) ?? 0) + delta);
+}
+
 export function initCounts(streamId: string): void {
 	chatMessageCounts.set(streamId, db.countChatMessages(streamId));
 	transcriptionCounts.set(streamId, db.countTranscriptions(streamId));
@@ -94,14 +98,14 @@ export function broadcastTranscription(
 	words?: WordTimestamp[]
 ) {
 	db.saveTranscription(streamId, text, startTime, endTime, words);
-	transcriptionCounts.set(streamId, (transcriptionCounts.get(streamId) ?? 0) + 1);
+	incrementCount(transcriptionCounts, streamId);
 	broadcast(JSON.stringify({ type: 'transcription', streamId, text, startTime, endTime }));
 }
 
 export function persistChatMessage(streamId: string, msg: ChatMessage) {
 	try {
 		db.saveChatMessage(streamId, msg);
-		chatMessageCounts.set(streamId, (chatMessageCounts.get(streamId) ?? 0) + 1);
+		incrementCount(chatMessageCounts, streamId);
 	} catch (err) {
 		console.error(`[chat] Failed to save message for stream ${streamId}:`, err);
 	}
@@ -111,7 +115,7 @@ export function persistChatMessagesBatch(streamId: string, messages: ChatMessage
 	if (messages.length === 0) return;
 	try {
 		db.saveChatMessagesBatch(streamId, messages);
-		chatMessageCounts.set(streamId, (chatMessageCounts.get(streamId) ?? 0) + messages.length);
+		incrementCount(chatMessageCounts, streamId, messages.length);
 	} catch (err) {
 		console.error(`[chat] Failed to save ${messages.length} messages for stream ${streamId}:`, err);
 	}

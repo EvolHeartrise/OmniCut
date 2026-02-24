@@ -384,6 +384,15 @@ export function updateStreamOffset(id: string, offset: number): void {
 	d.run('UPDATE streams SET offset = ? WHERE id = ?', [offset, id]);
 }
 
+// --- Shared query helpers ---
+
+/** Build an optional text filter clause for SQL queries using LIKE or REGEXP. */
+function buildTextFilter(query?: string, regex?: string): { clause: string; params: string[] } {
+	if (regex) return { clause: ' AND regexp(?, text)', params: [regex] };
+	if (query) return { clause: ' AND text LIKE ?', params: [`%${query}%`] };
+	return { clause: '', params: [] };
+}
+
 // --- Transcriptions ---
 
 export function saveTranscription(
@@ -432,20 +441,9 @@ export function loadTranscriptionsInRange(
 	regex?: string
 ): Array<{ id: number; text: string; startTime: number; endTime: number }> {
 	const d = getDb();
-	const base = 'SELECT id, text, start_time, end_time FROM transcriptions WHERE stream_id = ? AND end_time >= ? AND start_time <= ?';
-	let sql: string;
-	let params: (string | number)[];
-	if (regex) {
-		sql = base + ' AND regexp(?, text) ORDER BY start_time';
-		params = [streamId, fromTime, toTime, regex];
-	} else if (query) {
-		sql = base + ' AND text LIKE ? ORDER BY start_time';
-		params = [streamId, fromTime, toTime, `%${query}%`];
-	} else {
-		sql = base + ' ORDER BY start_time';
-		params = [streamId, fromTime, toTime];
-	}
-	const rows = d.query(sql).all(...params) as TranscriptionRow[];
+	const { clause, params: filterParams } = buildTextFilter(query, regex);
+	const sql = `SELECT id, text, start_time, end_time FROM transcriptions WHERE stream_id = ? AND end_time >= ? AND start_time <= ?${clause} ORDER BY start_time`;
+	const rows = d.query(sql).all(streamId, fromTime, toTime, ...filterParams) as TranscriptionRow[];
 	return rows.map((r) => ({ id: r.id, text: r.text, startTime: r.start_time, endTime: r.end_time }));
 }
 
@@ -541,23 +539,12 @@ export function loadChatMessagesInRange(
 	});
 	const cols = 'id, username, text, timestamp, color, badges, twitch_id';
 	const base = `SELECT ${cols} FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ?`;
-	let filter: string;
-	let filterParams: (string | number)[];
-	if (regex) {
-		filter = ' AND regexp(?, text)';
-		filterParams = [streamId, fromTime, toTime, regex];
-	} else if (query) {
-		filter = ' AND text LIKE ?';
-		filterParams = [streamId, fromTime, toTime, `%${query}%`];
-	} else {
-		filter = '';
-		filterParams = [streamId, fromTime, toTime];
-	}
+	const { clause, params: textParams } = buildTextFilter(query, regex);
 	// When limited, fetch the LAST N messages in the range (most recent, near the playhead)
 	const sql = cap > 0
-		? `SELECT * FROM (${base}${filter} ORDER BY timestamp DESC LIMIT ?) ORDER BY timestamp`
-		: `${base}${filter} ORDER BY timestamp`;
-	const params = cap > 0 ? [...filterParams, cap] : filterParams;
+		? `SELECT * FROM (${base}${clause} ORDER BY timestamp DESC LIMIT ?) ORDER BY timestamp`
+		: `${base}${clause} ORDER BY timestamp`;
+	const params = cap > 0 ? [streamId, fromTime, toTime, ...textParams, cap] : [streamId, fromTime, toTime, ...textParams];
 	return (d.query(sql).all(...params) as ChatRow[]).map(mapRow);
 }
 
@@ -751,11 +738,18 @@ export function deleteExport(id: string): void {
 }
 
 function mapExportRow(r: ExportRow): ExportRecord {
+	let clipIds: string[];
+	try {
+		clipIds = JSON.parse(r.clip_ids) as string[];
+	} catch {
+		console.error(`[persistence] Corrupt clip_ids JSON for export ${r.id}, treating as empty`);
+		clipIds = [];
+	}
 	return {
 		id: r.id,
 		title: r.title,
 		...(r.description && { description: r.description }),
-		clipIds: JSON.parse(r.clip_ids) as string[],
+		clipIds,
 		status: r.status as ExportRecord['status'],
 		...(r.output_path && { outputPath: r.output_path }),
 		...(r.error && { error: r.error }),

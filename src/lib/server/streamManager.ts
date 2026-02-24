@@ -210,10 +210,9 @@ export async function initStreamManager(): Promise<void> {
 	for (const [id, handle] of captures) {
 		const info = handle.info;
 		if (info.chatComplete) continue;
-		if (info.sourceType !== 'vod' || info.platform !== 'twitch') continue;
-		if (!info.sourceUrl) continue;
+		if (!isTwitchVod(handle)) continue;
 
-		const videoId = extractVideoId(info.sourceUrl);
+		const videoId = extractVideoId(info.sourceUrl!);
 		if (!videoId) continue;
 
 		handle.stopChat = startVodChatFetch(
@@ -244,12 +243,22 @@ export async function initStreamManager(): Promise<void> {
 // Re-export SSE client management
 export const addSSEClient = sseAddClient;
 
+// --- Shared predicates ---
+
+function channelMatches(a: string, b: string): boolean {
+	return a.toLowerCase() === b.toLowerCase();
+}
+
+function isTwitchVod(handle: CaptureHandle): boolean {
+	return handle.info.sourceType === 'vod' && handle.info.platform === 'twitch' && !!handle.info.sourceUrl;
+}
+
 // --- Duplicate capture guards ---
 
 function findActiveCapture(channel: string, platform: string, sourceType: 'live' | 'vod'): CaptureHandle | undefined {
 	for (const [, handle] of captures) {
 		if (
-			handle.info.channel.toLowerCase() === channel.toLowerCase() &&
+			channelMatches(handle.info.channel, channel) &&
 			handle.info.platform === platform &&
 			handle.info.sourceType === sourceType &&
 			handle.info.status !== 'stopped'
@@ -340,7 +349,7 @@ export async function addVodStream(channel: string, language?: string | null): P
 
 	// Link to the live capture if one exists
 	for (const [id, handle] of captures) {
-		if (handle.info.channel.toLowerCase() === channel.toLowerCase() && handle.info.sourceType === 'live') {
+		if (channelMatches(handle.info.channel, channel) && handle.info.sourceType === 'live') {
 			vodHandle.info.parentStreamId = id;
 			break;
 		}
@@ -482,9 +491,7 @@ export function resumeVodStream(id: string): boolean {
 	const handle = captures.get(id);
 	if (!handle) return false;
 	if (handle.info.status !== 'stopped') return false;
-	if (handle.info.sourceType !== 'vod') return false;
-	if (handle.info.platform !== 'twitch') return false;
-	if (!handle.info.sourceUrl) return false;
+	if (!isTwitchVod(handle)) return false;
 
 	const playlistPath = path.join(handle.info.recordingDir, 'playlist.m3u8');
 	const playlistDuration = parsePlaylistDuration(playlistPath);
@@ -495,7 +502,7 @@ export function resumeVodStream(id: string): boolean {
 	const originalStreamTitle = handle.info.streamTitle;
 	const originalGameName = handle.info.gameName;
 	const originalParentStreamId = handle.info.parentStreamId;
-	const sourceUrl = handle.info.sourceUrl;
+	const sourceUrl = handle.info.sourceUrl!;
 	const channel = handle.info.channel;
 
 	// Clear old stub handle's interval
@@ -546,11 +553,9 @@ export function resumeVodStream(id: string): boolean {
 export function refetchVodChat(id: string): boolean {
 	const handle = captures.get(id);
 	if (!handle) return false;
-	if (handle.info.sourceType !== 'vod') return false;
-	if (handle.info.platform !== 'twitch') return false;
-	if (!handle.info.sourceUrl) return false;
+	if (!isTwitchVod(handle)) return false;
 
-	const videoId = extractVideoId(handle.info.sourceUrl);
+	const videoId = extractVideoId(handle.info.sourceUrl!);
 	if (!videoId) return false;
 
 	// Stop any existing chat fetch
@@ -752,7 +757,7 @@ export function getStreamRecordingDir(id: string): string | null {
  * Export all clip regions as a single stitched video file (UI path).
  * Sorts clips by startTime and goes through the export queue for consistency.
  */
-export { createAndQueueExport, loadExport, loadAllExports } from './exportQueue.js';
+export { createAndQueueExport, loadExport, loadAllExports, deleteExport } from './exportQueue.js';
 
 // --- Shutdown ---
 

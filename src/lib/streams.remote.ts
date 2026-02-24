@@ -21,6 +21,7 @@ import {
 	createAndQueueExport,
 	loadAllExports as smLoadAllExports,
 	loadExport as smLoadExport,
+	deleteExport as smDeleteExport,
 	getClipEncodeStatuses as smGetClipEncodeStatuses
 } from '$lib/server/streamManager.js';
 import {
@@ -422,6 +423,13 @@ export const reexportCmd = command('unchecked', async (args: { id: string }) => 
 	if (!existing) throw new Error('Export not found');
 	const record = createAndQueueExport(existing.clipIds, existing.title, existing.description);
 	return { exportId: record.id };
+});
+
+/** Delete an export by ID (removes DB record and output file). */
+export const deleteExportCmd = command('unchecked', async (args: { id: string }) => {
+	if (!args.id || typeof args.id !== 'string') throw new Error('Missing or invalid "id" field');
+	smDeleteExport(args.id);
+	return { success: true };
 });
 
 /** Export selected clips by IDs (in order). */

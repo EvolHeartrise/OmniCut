@@ -8,6 +8,7 @@ import {
 	waitForClipReady,
 	ffmpegConcatEscape
 } from './clipEncoder.js';
+import { runFfmpeg } from './ffmpeg.js';
 
 const EXPORTS_DIR = path.resolve(process.env.EXPORTS_DIR || path.join(process.cwd(), 'exports'));
 
@@ -103,7 +104,7 @@ export async function exportVideo(
 			'+faststart',
 			'-y',
 			outputPath
-		]);
+		], 1000);
 
 		onProgress(`Done — saved to ${outputPath}`, totalSteps, totalSteps);
 		return { outputPath };
@@ -113,22 +114,6 @@ export async function exportVideo(
 		} catch {
 			/* best effort */
 		}
-	}
-}
-
-/** Run an ffmpeg command and return a promise. Rejects with full stderr on failure. */
-async function runFfmpeg(args: string[]): Promise<void> {
-	const proc = Bun.spawn(['ffmpeg', ...args], {
-		stdin: 'ignore',
-		stdout: 'pipe',
-		stderr: 'pipe'
-	});
-
-	const stderrText = await new Response(proc.stderr).text();
-	const code = await proc.exited;
-
-	if (code !== 0) {
-		throw new Error(`ffmpeg failed (code ${code}): ${stderrText.slice(-1000)}`);
 	}
 }
 

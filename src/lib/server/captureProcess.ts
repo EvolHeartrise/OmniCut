@@ -4,6 +4,7 @@ import * as os from 'node:os';
 import * as crypto from 'node:crypto';
 import type { StreamInfo, CaptureHandle, StreamMeta } from './types.js';
 import { twitchGql, STREAM_META_GQL, VOD_META_GQL, fetchDouyuChannel } from './twitchApi.js';
+import { cleanupFiles } from './fsUtils.js';
 
 export type { CaptureHandle };
 
@@ -51,11 +52,7 @@ async function getDouyuSignParams(roomId: string): Promise<Record<string, string
 	const output = await new Response(proc.stdout).text();
 	await proc.exited;
 
-	try {
-		fs.unlinkSync(tmpPath);
-	} catch {
-		/* ignore */
-	}
+	cleanupFiles(tmpPath);
 
 	// Parse the query string result into key-value pairs
 	const params: Record<string, string> = {};
@@ -213,7 +210,10 @@ export function startCapture(
 					const stat = await fs.promises.stat(segPath);
 					cumulativeDiskUsage += stat.size;
 					nextSegIndex++;
-				} catch {
+				} catch (err: unknown) {
+					if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+						console.warn(`[capture] stat failed for ${segPath}: ${(err as Error).message}`);
+					}
 					break; // File doesn't exist yet — stop probing
 				}
 			}

@@ -7,6 +7,7 @@
 import { newExportId } from '../ids.js';
 import { getClipRegion } from './clipManager.js';
 import { exportVideo } from './exporter.js';
+import { cleanupFiles } from './fsUtils.js';
 import * as db from './persistence.js';
 import type { ExportRecord } from './persistence.js';
 import { broadcastExportStatus } from './sseBroadcaster.js';
@@ -89,6 +90,19 @@ export function loadExport(id: string): ExportRecord | null {
 
 export function loadAllExports(): ExportRecord[] {
 	return db.loadAllExports();
+}
+
+export function deleteExport(id: string): void {
+	if (activeExport?.exportId === id) {
+		throw new Error('Cannot delete an export that is currently in progress');
+	}
+	// Remove from queue if pending
+	const idx = queue.indexOf(id);
+	if (idx !== -1) queue.splice(idx, 1);
+	// Delete output file if it exists
+	const record = db.loadExport(id);
+	if (record?.outputPath) cleanupFiles(record.outputPath);
+	db.deleteExport(id);
 }
 
 // --- Internal ---

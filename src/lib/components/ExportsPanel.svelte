@@ -2,7 +2,7 @@
 	import { onMount, untrack } from 'svelte';
 	import Hls from 'hls.js';
 	import { exportStatusEvents, exportLog, streams, syncOffsets, clipRegions } from '$lib/stores/streams.js';
-	import { listExportsCmd, reexportCmd } from '$lib/streams.remote';
+	import { listExportsCmd, reexportCmd, deleteExportCmd } from '$lib/streams.remote';
 	import { formatDuration, createHlsConfig } from '$lib/utils.js';
 	import type { ClipRegion } from '$lib/stores/streams.js';
 
@@ -113,6 +113,17 @@
 			await fetchExports();
 		} catch (err) {
 			console.error('Re-export failed:', err);
+		}
+	}
+
+	async function handleDelete(id: string) {
+		if (!confirm('Delete this export? The output file will also be removed.')) return;
+		try {
+			await deleteExportCmd({ id });
+			if (previewExportId === id) closePreview();
+			exports = exports.filter((e) => e.id !== id);
+		} catch (err) {
+			console.error('Delete export failed:', err);
 		}
 	}
 
@@ -424,6 +435,7 @@
 								{/if}
 								{#if exp.status === 'ready' || exp.status === 'error'}
 									<button class="btn-reexport" onclick={() => handleReexport(exp.id)}>Re-export</button>
+									<button class="btn-delete" onclick={() => handleDelete(exp.id)}>Delete</button>
 								{/if}
 								<span class="export-status {info.cls}">{info.label}</span>
 							</div>
@@ -590,6 +602,21 @@
 	.btn-reexport:hover {
 		background: #3a3a5a;
 		color: #fff;
+	}
+
+	.btn-delete {
+		background: #3a1a1a;
+		border: 1px solid #5a2a2a;
+		color: #c88;
+		font-size: 0.65rem;
+		padding: 2px 8px;
+		border-radius: 3px;
+		cursor: pointer;
+	}
+
+	.btn-delete:hover {
+		background: #5a2a2a;
+		color: #faa;
 	}
 
 	.loading-text {

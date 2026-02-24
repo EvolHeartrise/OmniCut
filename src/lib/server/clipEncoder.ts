@@ -9,9 +9,10 @@
 
 import * as path from 'node:path';
 import * as fs from 'node:fs';
-import type { Subprocess } from 'bun';
 import type { ClipRegion, StreamInfo } from './types.js';
 import { broadcastClipEncodeStatus } from './sseBroadcaster.js';
+import { spawnFfmpeg, awaitFfmpeg } from './ffmpeg.js';
+import { cleanupFiles } from './fsUtils.js';
 
 // Resolved lazily after first call — depends on EXPORTS_DIR env
 let clipsDir: string | null = null;
@@ -37,7 +38,7 @@ interface EncodeEntry {
 
 const encodeStatus = new Map<string, EncodeEntry>();
 const queue: string[] = [];
-const activeEncodes = new Map<string, { proc: Subprocess | null }>();
+const activeEncodes = new Map<string, { proc: ReturnType<typeof spawnFfmpeg> | null }>();
 const MAX_CONCURRENT_NVENC = 2;
 const MAX_CONCURRENT_CPU = 1;
 let cachedNvenc: boolean | null = null;
@@ -198,11 +199,7 @@ export function enqueueClipEncode(clipId: string): void {
 	// Delete stale encoded file if it exists
 	const existing = encodeStatus.get(clipId);
 	if (existing?.outputPath) {
-		try {
-			fs.unlinkSync(existing.outputPath);
-		} catch {
-			/* ok */
-		}
+		cleanupFiles(existing.outputPath);
 	}
 
 	encodeStatus.set(clipId, { status: 'pending' });
@@ -230,11 +227,7 @@ export function cancelClipEncode(clipId: string): void {
 	// Delete encoded file
 	const entry = encodeStatus.get(clipId);
 	if (entry?.outputPath) {
-		try {
-			fs.unlinkSync(entry.outputPath);
-		} catch {
-			/* ok */
-		}
+		cleanupFiles(entry.outputPath);
 	}
 
 	encodeStatus.delete(clipId);
@@ -293,11 +286,7 @@ export function restoreEncodeState(clipIds: string[]): void {
 				continue;
 			}
 			// Empty file — delete and re-encode
-			try {
-				fs.unlinkSync(filePath);
-			} catch {
-				/* ok */
-			}
+			cleanupFiles(filePath);
 		}
 		// No valid file — enqueue for encoding
 		encodeStatus.set(clipId, { status: 'pending' });
@@ -326,27 +315,14 @@ function processQueue(): void {
 		const clipId = queue.shift()!;
 		// Reserve the slot immediately so the next iteration sees the correct size
 		activeEncodes.set(clipId, { proc: null });
-		encodeClip(clipId);
+		encodeClip(clipId).catch(() => {}); // errors handled internally in encodeClip's try/catch
 	}
 }
 
 async function runFfmpeg(args: string[], clipId: string): Promise<void> {
-	const proc = Bun.spawn(['ffmpeg', ...args], {
-		stdin: 'ignore',
-		stdout: 'pipe',
-		stderr: 'pipe'
-	});
+	const proc = spawnFfmpeg(args);
 	activeEncodes.set(clipId, { proc });
-
-	const stderrText = await new Response(proc.stderr).text();
-	const code = await proc.exited;
-	if (code !== 0) throw new Error(`ffmpeg failed (code ${code}): ${stderrText.slice(-500)}`);
-}
-
-function cleanupTempFiles(...paths: string[]): void {
-	for (const p of paths) {
-		try { fs.unlinkSync(p); } catch { /* ok */ }
-	}
+	await awaitFfmpeg(proc);
 }
 
 async function encodeClip(clipId: string): Promise<void> {
@@ -505,16 +481,16 @@ async function encodeClip(clipId: string): Promise<void> {
 						];
 						await runFfmpeg(concatArgs, clipId);
 					} finally {
-						cleanupTempFiles(partsConcatPath);
+						cleanupFiles(partsConcatPath);
 					}
 				}
 			} catch (err) {
 				// Smart cut failed — fall back to full encode
 				console.warn(`[clip-encoder] ${clipId}: smart cut failed, falling back to full encode:`, err);
-				cleanupTempFiles(...tempFiles);
+				cleanupFiles(...tempFiles);
 				await fullEncode(clipId, concatPath, trimStart, dur, outputPath, useNvenc);
 			} finally {
-				cleanupTempFiles(...tempFiles);
+				cleanupFiles(...tempFiles);
 			}
 		} else {
 			// Edge-only / short clip — full re-encode
@@ -522,7 +498,7 @@ async function encodeClip(clipId: string): Promise<void> {
 		}
 
 		// Clean up concat file
-		cleanupTempFiles(concatPath);
+		cleanupFiles(concatPath);
 
 		encodeStatus.set(clipId, { status: 'ready', outputPath });
 		broadcastClipEncodeStatus(clipId, 'ready');
@@ -533,7 +509,7 @@ async function encodeClip(clipId: string): Promise<void> {
 		broadcastClipEncodeStatus(clipId, 'error', message);
 		console.error(`[clip-encoder] Failed to encode clip ${clipId}:`, message);
 
-		cleanupTempFiles(outputPath, outputPath + '.concat.txt');
+		cleanupFiles(outputPath, outputPath + '.concat.txt');
 	} finally {
 		activeEncodes.delete(clipId);
 		processQueue();
@@ -678,10 +654,6 @@ export async function extractFrame(recordingDir: string, localTimestamp: number)
 
 		return buffer;
 	} finally {
-		try {
-			fs.unlinkSync(concatPath);
-		} catch {
-			/* ok */
-		}
+		cleanupFiles(concatPath);
 	}
 }

@@ -1,5 +1,6 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
+import { cleanupFiles } from './fsUtils.js';
 
 const BATCH_SIZE = 15; // segments per batch (~30 seconds at 2s/segment, Whisper's full context window)
 const VOD_BATCH_SIZE = 3600; // segments per VOD batch (~2 hours at 2s/segment)
@@ -242,9 +243,12 @@ function spawnWorker(pool: Pool, workerId: number): PoolWorker | null {
 				);
 				setTimeout(() => {
 					if (pool.failed) return;
+					// Check again after delay — another exit handler may have already respawned this slot
+					if (pool.workers.some((w) => w.id === workerId)) return;
 					const newWorker = spawnWorker(pool, workerId);
 					if (newWorker) {
 						pool.workers.push(newWorker);
+						processQueue(pool);
 					}
 				}, delay);
 			}
@@ -492,9 +496,7 @@ async function extractAudioBuffer(recordingDir: string, segmentFiles: string[]):
 		proc.exited
 	]);
 
-	try {
-		fs.unlinkSync(listPath);
-	} catch {}
+	cleanupFiles(listPath);
 
 	if (code !== 0) {
 		console.warn(`[transcriber] PCM extraction failed (code ${code}) for ${recordingDir}`);
@@ -561,6 +563,9 @@ async function checkForNewSegments(streamId: string) {
 
 	if (availableCount < needed) return;
 
+	// Re-check tracker is still active after awaiting probes
+	if (!tracker.active) return;
+
 	const batch: string[] = [];
 	for (let i = 0; i < BATCH_SIZE; i++) {
 		batch.push(segmentFilename(startIdx + i));
@@ -573,6 +578,9 @@ async function checkForNewSegments(streamId: string) {
 	if (!wavPath) return;
 
 	try {
+		// Re-check after audio extraction await
+		if (!tracker.active) return;
+
 		let sentences: Sentence[];
 		try {
 			sentences = deduplicateSentences(await transcribeAudio(livePool, wavPath, tracker.language));
@@ -582,6 +590,10 @@ async function checkForNewSegments(streamId: string) {
 			);
 			return;
 		}
+
+		// Re-check after transcription await
+		if (!tracker.active) return;
+
 		const batchOffset = startIdx * SEGMENT_DURATION;
 
 		for (let i = 0; i < sentences.length; i++) {
@@ -619,9 +631,7 @@ async function checkForNewSegments(streamId: string) {
 			tracker.pendingPartial = null;
 		}
 	} finally {
-		try {
-			fs.unlinkSync(wavPath);
-		} catch {}
+		cleanupFiles(wavPath);
 	}
 }
 
