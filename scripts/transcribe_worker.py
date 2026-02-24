@@ -41,7 +41,7 @@ def _detect_device():
     """Detect whether CUDA is available, falling back to CPU."""
     try:
         import ctranslate2
-        if "cuda" in ctranslate2.get_supported_compute_types("cuda"):
+        if ctranslate2.get_supported_compute_types("cuda"):
             return "cuda", "int8_float32"
     except Exception:
         pass
@@ -49,20 +49,22 @@ def _detect_device():
 
 
 def main():
+    _add_cuda_dll_paths()
+    device, compute_type = _detect_device()
+
     try:
-        from faster_whisper import WhisperModel
+        from faster_whisper import WhisperModel, BatchedInferencePipeline
     except ImportError:
         print(json.dumps({"error": "faster-whisper not installed. Run: pip install faster-whisper"}), flush=True)
         sys.exit(1)
-
-    _add_cuda_dll_paths()
-    device, compute_type = _detect_device()
     print(json.dumps({"device": device}), flush=True)
 
     # Lazy-load models: English model loads eagerly (always needed),
     # multilingual model loads on first non-English request.
     model_en = WhisperModel("small.en", device=device, compute_type=compute_type)
+    batched_en = BatchedInferencePipeline(model=model_en)
     model_multi = None
+    batched_multi = None
     print(json.dumps({"ready": True}), flush=True)
 
     for line in sys.stdin:
@@ -81,11 +83,12 @@ def main():
         try:
             use_english = not language or language == "en"
             if use_english:
-                model = model_en
+                batched = batched_en
             else:
                 if model_multi is None:
                     model_multi = WhisperModel("small", device=device, compute_type=compute_type)
-                model = model_multi
+                    batched_multi = BatchedInferencePipeline(model=model_multi)
+                batched = batched_multi
             transcribe_kwargs = dict(
                 beam_size=beam_size,
                 word_timestamps=True,
@@ -98,7 +101,7 @@ def main():
                 task=task,
                 language="en" if use_english else language,
             )
-            segments, _ = model.transcribe(wav_path, **transcribe_kwargs)
+            segments, _ = batched.transcribe(wav_path, batch_size=4, **transcribe_kwargs)
             # Collect all words across segments
             words = []
             for seg in segments:

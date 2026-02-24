@@ -11,6 +11,7 @@
 	} from '$lib/stores/streams.js';
 	import { formatDuration, createHlsConfig } from '$lib/utils.js';
 	import { getClipEncodeStatuses } from '$lib/streams.remote';
+	import { splitClipRegion } from '$lib/clipActions.js';
 
 	// --- Current clip under review (oldest AI clip) ---
 	let aiClips = $derived(
@@ -23,7 +24,10 @@
 	let deleteConfirmTimer: ReturnType<typeof setTimeout> | null = null;
 
 	// --- Undo stack ---
-	type ReviewUndoEntry = { type: 'update-region'; before: ClipRegion } | { type: 'delete-region'; region: ClipRegion };
+	type ReviewUndoEntry =
+		| { type: 'update-region'; before: ClipRegion }
+		| { type: 'delete-region'; region: ClipRegion }
+		| { type: 'split-region'; original: ClipRegion; createdIds: [string, string] };
 
 	let undoStack = $state<ReviewUndoEntry[]>([]);
 	function pushUndo(entry: ReviewUndoEntry) {
@@ -46,6 +50,14 @@
 				clipRegions.update((regions) => regions.map((r) => (r.id === entry.before.id ? { ...entry.before } : r)));
 				saveClipRegion(entry.before);
 				break;
+			case 'split-region':
+				// Undo split → remove the two halves, restore original
+				clipRegions.update((regions) => regions.filter((r) => !entry.createdIds.includes(r.id)));
+				deleteClipRegion(entry.createdIds[0]);
+				deleteClipRegion(entry.createdIds[1]);
+				clipRegions.update((regions) => [...regions, entry.original]);
+				saveClipRegion(entry.original);
+				break;
 		}
 	}
 
@@ -64,6 +76,16 @@
 	let isSeeking = $state(false);
 	let loadedClipId = $state<string | null>(null);
 	let playbackRate = $state(1);
+
+	// --- Waveform ---
+	const WAVEFORM_BINS = 800;
+	let waveformCanvas = $state<HTMLCanvasElement | null>(null);
+	let waveformPeaks = new Float32Array(WAVEFORM_BINS);
+	let waveformActive = false;
+	let isDraggingWaveform = $state(false);
+
+	// --- Waveform background scan ---
+	let scanAbort: AbortController | null = null;
 
 	// --- Helpers ---
 	function clipChannel(clip: ClipRegion): string {
@@ -156,6 +178,7 @@
 		}
 
 		loadedClipId = clip.id;
+		startWaveformScan(clip);
 	}
 
 	// Auto-load player when currentClip changes
@@ -166,16 +189,19 @@
 				hls.destroy();
 				hls = null;
 			}
+			stopWaveformScan();
 			loadedClipId = null;
 			playing = false;
 			return;
 		}
 		if (clip.id === loadedClipId) return;
 		// Reset state for new clip
+		stopWaveformScan();
 		playing = false;
 		progress = 0;
 		currentTime = '0:00';
 		durationText = fmtTime(clip.endTime - clip.startTime);
+		waveformPeaks = new Float32Array(WAVEFORM_BINS);
 		editingId = null;
 		deleteConfirmId = null;
 		// Wait for DOM
@@ -306,6 +332,172 @@
 		if (videoEl) videoEl.playbackRate = playbackRate;
 	}
 
+	function drawWaveform() {
+		const canvas = waveformCanvas;
+		if (!canvas) return;
+		const ctx = canvas.getContext('2d');
+		if (!ctx) return;
+
+		const dpr = window.devicePixelRatio || 1;
+		const rect = canvas.getBoundingClientRect();
+		const w = rect.width;
+		const h = rect.height;
+
+		if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+			canvas.width = Math.round(w * dpr);
+			canvas.height = Math.round(h * dpr);
+		}
+		ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+		ctx.clearRect(0, 0, w, h);
+
+		// Find peak for normalisation
+		let maxPeak = 0;
+		for (let i = 0; i < WAVEFORM_BINS; i++) {
+			if (waveformPeaks[i] > maxPeak) maxPeak = waveformPeaks[i];
+		}
+		if (maxPeak < 0.001) maxPeak = 1; // avoid div-by-zero
+
+		const barW = w / WAVEFORM_BINS;
+		const halfH = h / 2;
+		const playBin = Math.floor(progress * WAVEFORM_BINS);
+
+		// Center line for empty regions
+		ctx.strokeStyle = '#1a1a2e';
+		ctx.lineWidth = 1;
+		ctx.beginPath();
+		ctx.moveTo(0, halfH);
+		ctx.lineTo(w, halfH);
+		ctx.stroke();
+
+		// Draw bars
+		for (let i = 0; i < WAVEFORM_BINS; i++) {
+			const amp = waveformPeaks[i] / maxPeak;
+			const barH = Math.max(1, amp * (halfH - 2));
+			const x = i * barW;
+			ctx.fillStyle = i <= playBin ? '#7c3aed' : '#2a2a4a';
+			ctx.fillRect(x, halfH - barH, barW - 0.5, barH * 2);
+		}
+
+		// Playhead
+		const px = progress * w;
+		ctx.save();
+		ctx.shadowColor = '#7c3aed';
+		ctx.shadowBlur = 6;
+		ctx.strokeStyle = '#ffffff';
+		ctx.lineWidth = 2;
+		ctx.beginPath();
+		ctx.moveTo(px, 0);
+		ctx.lineTo(px, h);
+		ctx.stroke();
+		ctx.restore();
+	}
+
+	function waveformLoop() {
+		if (!waveformActive) return;
+		// Update progress every frame for smooth playhead
+		if (!isSeeking && videoEl && currentClip) {
+			const bounds = getClipLocalBounds(currentClip);
+			if (bounds) {
+				const clipDur = bounds.localEnd - bounds.localStart;
+				const elapsed = videoEl.currentTime - bounds.localStart;
+				progress = clipDur > 0 ? Math.max(0, Math.min(1, elapsed / clipDur)) : 0;
+				currentTime = fmtTime(elapsed);
+			}
+		}
+		drawWaveform();
+		requestAnimationFrame(waveformLoop);
+	}
+
+	// --- Waveform pointer handlers ---
+	function waveformSeekFromEvent(e: PointerEvent) {
+		const canvas = waveformCanvas;
+		if (!canvas) return;
+		const rect = canvas.getBoundingClientRect();
+		const x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+		progress = x;
+		if (currentClip) {
+			const bounds = getClipLocalBounds(currentClip);
+			if (bounds) currentTime = fmtTime(x * (bounds.localEnd - bounds.localStart));
+		}
+	}
+
+	function handleWaveformPointerDown(e: PointerEvent) {
+		if (e.button !== 0) return;
+		isDraggingWaveform = true;
+		isSeeking = true;
+		(e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
+		waveformSeekFromEvent(e);
+	}
+
+	function handleWaveformPointerMove(e: PointerEvent) {
+		if (!isDraggingWaveform) return;
+		waveformSeekFromEvent(e);
+	}
+
+	function handleWaveformPointerUp(e: PointerEvent) {
+		if (!isDraggingWaveform) return;
+		isDraggingWaveform = false;
+		waveformSeekFromEvent(e);
+		// Commit seek
+		if (videoEl && currentClip) {
+			const bounds = getClipLocalBounds(currentClip);
+			if (bounds) {
+				videoEl.currentTime = bounds.localStart + progress * (bounds.localEnd - bounds.localStart);
+			}
+		}
+		isSeeking = false;
+	}
+
+	// --- Waveform background scan ---
+	function stopWaveformScan() {
+		if (scanAbort) {
+			scanAbort.abort();
+			scanAbort = null;
+		}
+	}
+
+	function startWaveformScan(clip: ClipRegion) {
+		stopWaveformScan();
+
+		const stream = $streams.find((s) => s.id === clip.streamId);
+		if (!stream) return;
+
+		const offset = $syncOffsets[clip.streamId] || 0;
+		const anchor = stream.startedAt / 1000;
+		const localStart = clip.startTime - anchor + offset;
+		const localEnd = clip.endTime - anchor + offset;
+		if (localEnd <= localStart) return;
+
+		const abort = new AbortController();
+		scanAbort = abort;
+
+		fetch(`/api/waveform/${clip.streamId}?start=${localStart.toFixed(3)}&end=${localEnd.toFixed(3)}`, {
+			signal: abort.signal
+		})
+			.then((r) => {
+				if (!r.ok) throw new Error(r.statusText);
+				return r.arrayBuffer();
+			})
+			.then((buf) => {
+				if (abort.signal.aborted) return;
+				const samples = new Int16Array(buf);
+				const samplesPerBin = Math.max(1, Math.floor(samples.length / WAVEFORM_BINS));
+				const peaks = new Float32Array(WAVEFORM_BINS);
+				for (let bin = 0; bin < WAVEFORM_BINS; bin++) {
+					const start = bin * samplesPerBin;
+					const end = Math.min(start + samplesPerBin, samples.length);
+					let sum = 0;
+					for (let i = start; i < end; i++) {
+						const s = samples[i] / 32768;
+						sum += s * s;
+					}
+					peaks[bin] = Math.sqrt(sum / (end - start));
+				}
+				waveformPeaks = peaks;
+			})
+			.catch(() => {});
+	}
+
 	// --- Clip boundary adjustment ---
 	function updateClipBounds(clip: ClipRegion, newStart: number, newEnd: number) {
 		if (newEnd <= newStart) return;
@@ -313,6 +505,23 @@
 		const updated = { ...clip, startTime: newStart, endTime: newEnd };
 		clipRegions.update((regions) => regions.map((r) => (r.id === updated.id ? updated : r)));
 		saveClipRegion(updated);
+
+		// Immediately refresh display for the new bounds
+		const clipDur = newEnd - newStart;
+		durationText = fmtTime(clipDur);
+		if (videoEl) {
+			const bounds = getClipLocalBounds(updated);
+			if (bounds) {
+				const elapsed = videoEl.currentTime - bounds.localStart;
+				progress = clipDur > 0 ? Math.max(0, Math.min(1, elapsed / clipDur)) : 0;
+				currentTime = fmtTime(Math.max(0, elapsed));
+			}
+		}
+
+		// Rescan waveform for new boundaries
+		waveformPeaks = new Float32Array(WAVEFORM_BINS);
+		stopWaveformScan();
+		startWaveformScan(updated);
 	}
 
 	function getMasterTimeAtPlayhead(): number | null {
@@ -322,6 +531,21 @@
 		const offset = $syncOffsets[currentClip!.streamId] || 0;
 		const anchor = stream.startedAt / 1000;
 		return videoEl.currentTime + anchor - offset;
+	}
+
+	async function splitAtPlayhead() {
+		if (!currentClip) return;
+		const mt = getMasterTimeAtPlayhead();
+		if (mt == null) return;
+		const snapshot = { ...currentClip };
+		const result = await splitClipRegion(currentClip, mt);
+		if (!result) return;
+		pushUndo({
+			type: 'split-region',
+			original: snapshot,
+			createdIds: [result.firstHalf.id, result.secondHalf.id]
+		});
+		loadedClipId = null;
 	}
 
 	// --- Keyboard shortcuts ---
@@ -394,8 +618,23 @@
 				}
 				break;
 			}
+			case 's':
+			case 'S':
+				splitAtPlayhead();
+				break;
 		}
 	}
+
+	// Waveform animation loop lifecycle
+	$effect(() => {
+		if (waveformCanvas) {
+			waveformActive = true;
+			waveformLoop();
+			return () => {
+				waveformActive = false;
+			};
+		}
+	});
 
 	// Cleanup
 	$effect(() => {
@@ -404,6 +643,8 @@
 				hls.destroy();
 				hls = null;
 			}
+			waveformActive = false;
+			stopWaveformScan();
 		};
 	});
 </script>
@@ -437,22 +678,26 @@
 				<!-- svelte-ignore a11y_media_has_caption -->
 				<video bind:this={videoEl} ontimeupdate={handleTimeUpdate} playsinline class="review-video"></video>
 				<div class="video-controls">
-					<button class="btn-ctl" onclick={togglePlay}>
-						{playing ? '⏸' : '▶'}
-					</button>
-					<span class="vid-time">{currentTime}</span>
-					<input
-						type="range"
-						class="vid-seek"
-						min="0"
-						max="1"
-						step="0.001"
-						value={progress}
-						oninput={handleSeekInput}
-						onchange={handleSeekCommit}
-					/>
-					<span class="vid-time">{durationText}</span>
-					<span class="vid-speed">{playbackRate}x</span>
+					<div class="timeline-row">
+						<button class="btn-ctl" onclick={togglePlay}>
+							{playing ? '⏸' : '▶'}
+						</button>
+						<div class="waveform-seek">
+							<canvas
+								bind:this={waveformCanvas}
+								class="waveform-canvas"
+								onpointerdown={handleWaveformPointerDown}
+								onpointermove={handleWaveformPointerMove}
+								onpointerup={handleWaveformPointerUp}
+							></canvas>
+						</div>
+					</div>
+					<div class="transport-row">
+						<span class="vid-time">{currentTime}</span>
+						<span style="flex:1"></span>
+						<span class="vid-time">{durationText}</span>
+						<span class="vid-speed">{playbackRate}x</span>
+					</div>
 				</div>
 			</div>
 
@@ -535,12 +780,12 @@
 	.review-page {
 		flex: 1;
 		min-height: 0;
-		overflow-y: auto;
+		overflow: hidden;
 		display: flex;
 		flex-direction: column;
 		align-items: center;
-		padding: 32px 24px;
-		gap: 16px;
+		padding: 8px 12px;
+		gap: 4px;
 	}
 
 	.empty-state {
@@ -568,14 +813,15 @@
 		font-size: 0.8rem;
 		color: #888;
 		align-self: flex-start;
-		max-width: 900px;
 		width: 100%;
-		margin: 0 auto;
 	}
 
 	.review-card {
 		width: 100%;
-		max-width: 900px;
+		flex: 1;
+		min-height: 0;
+		display: flex;
+		flex-direction: column;
 		background: #0f0f23;
 		border: 1px solid #1a1a2e;
 		border-radius: 8px;
@@ -585,20 +831,57 @@
 	/* Video */
 	.video-container {
 		background: #000;
+		flex: 1;
+		min-height: 0;
+		display: flex;
+		flex-direction: column;
 	}
 
 	.review-video {
 		width: 100%;
-		max-height: 500px;
+		flex: 1;
+		min-height: 0;
+		object-fit: contain;
 		display: block;
 	}
 
 	.video-controls {
 		display: flex;
+		flex-direction: column;
+		background: #0a0a1a;
+	}
+
+	.timeline-row {
+		display: flex;
+		align-items: stretch;
+		flex-shrink: 0;
+	}
+
+	.timeline-row .btn-ctl {
+		border-radius: 0;
+		padding: 0 14px;
+		flex-shrink: 0;
+	}
+
+	.waveform-seek {
+		height: 64px;
+		cursor: pointer;
+		touch-action: none;
+		flex: 1;
+		min-width: 0;
+	}
+
+	.waveform-canvas {
+		display: block;
+		width: 100%;
+		height: 100%;
+	}
+
+	.transport-row {
+		display: flex;
 		align-items: center;
 		gap: 8px;
-		padding: 8px 16px;
-		background: #0a0a1a;
+		padding: 4px 16px 6px;
 	}
 
 	.vid-time {
@@ -608,46 +891,6 @@
 		font-family: monospace;
 		min-width: 3em;
 		text-align: center;
-	}
-
-	.vid-seek {
-		flex: 1;
-		height: 4px;
-		-webkit-appearance: none;
-		appearance: none;
-		background: #2a2a4a;
-		border-radius: 2px;
-		outline: none;
-		cursor: pointer;
-	}
-
-	.vid-seek::-webkit-slider-thumb {
-		-webkit-appearance: none;
-		width: 14px;
-		height: 14px;
-		border-radius: 50%;
-		background: #7c3aed;
-		cursor: pointer;
-	}
-
-	.vid-seek::-moz-range-thumb {
-		width: 14px;
-		height: 14px;
-		border-radius: 50%;
-		background: #7c3aed;
-		border: none;
-		cursor: pointer;
-	}
-
-	.vid-seek::-webkit-slider-runnable-track {
-		height: 4px;
-		border-radius: 2px;
-	}
-
-	.vid-seek::-moz-range-track {
-		height: 4px;
-		background: #2a2a4a;
-		border-radius: 2px;
 	}
 
 	.vid-speed {
@@ -677,7 +920,8 @@
 
 	/* Clip info */
 	.clip-info {
-		padding: 16px 20px;
+		padding: 10px 20px;
+		flex-shrink: 0;
 	}
 
 	.clip-header {

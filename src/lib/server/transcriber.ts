@@ -2,6 +2,7 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 
 const BATCH_SIZE = 15; // segments per batch (~30 seconds at 2s/segment, Whisper's full context window)
+const VOD_BATCH_SIZE = 3600; // segments per VOD batch (~2 hours at 2s/segment)
 const POLL_INTERVAL = 3000; // check for new segments every 3s
 const SEGMENT_DURATION = 2; // seconds per HLS segment (matches -hls_time 2)
 const LIVE_POOL_SIZE = 2; // number of concurrent live transcription workers
@@ -169,6 +170,9 @@ function spawnWorker(pool: Pool, workerId: number): PoolWorker | null {
 								const { resolve } = workerResolvers.get(worker)!;
 								workerResolvers.delete(worker);
 								worker.busy = false;
+								if (data.error) {
+									console.warn(`[transcriber:${pool.label}:w${workerId}] Transcription error: ${data.error}`);
+								}
 								resolve(data.sentences || []);
 								processQueue(pool);
 							}
@@ -647,7 +651,10 @@ async function doFullTranscription(job: VodJob): Promise<void> {
 		return;
 	}
 
-	console.log(`[transcriber:vod] Starting full transcription for stream ${streamId} (${segFiles.length} segments)`);
+	const totalBatches = Math.ceil(segFiles.length / VOD_BATCH_SIZE);
+	console.log(
+		`[transcriber:vod] Starting full transcription for stream ${streamId} (${segFiles.length} segments, ${totalBatches} batches)`
+	);
 
 	// Ensure VOD worker pool is started; wait until at least one worker is ready (with timeout)
 	ensurePool(vodPool);
@@ -667,24 +674,107 @@ async function doFullTranscription(job: VodJob): Promise<void> {
 		return;
 	}
 
-	const wavPath = await extractAudio(recordingDir, segFiles);
-	if (!wavPath) return;
+	// Process in batches to avoid creating enormous WAV files (a 35-hour recording
+	// would be ~3.76 GB as a single WAV, which can fail in ffmpeg or Whisper)
+	let totalSentences = 0;
+	let totalDuplicates = 0;
+	let pendingPartial: { text: string; startTime: number; endTime: number; words?: WordTimestamp[] } | null =
+		null;
 
-	try {
-		const raw = await transcribeAudio(vodPool, wavPath, language, 5, VOD_QUEUE_ITEM_TIMEOUT_MS);
-		const sentences = deduplicateSentences(raw);
-		const skipped = raw.length - sentences.length;
-		for (const s of sentences) {
-			onResult(streamId, s.text, s.start, s.end, s.words);
+	for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
+		const batchStart = batchIdx * VOD_BATCH_SIZE;
+		const batchEnd = Math.min(batchStart + VOD_BATCH_SIZE, segFiles.length);
+		const batchFiles = segFiles.slice(batchStart, batchEnd);
+
+		// Compute time offset from the first segment's index
+		const firstSegIndex = parseInt(batchFiles[0].match(/\d+/)![0], 10);
+		const batchOffset = firstSegIndex * SEGMENT_DURATION;
+
+		const wavPath = await extractAudio(recordingDir, batchFiles);
+		if (!wavPath) {
+			console.warn(
+				`[transcriber:vod] Audio extraction failed for batch ${batchIdx + 1}/${totalBatches}, skipping`
+			);
+			continue;
 		}
-		console.log(
-			`[transcriber:vod] Full transcription complete for stream ${streamId}: ${sentences.length} sentences${skipped > 0 ? ` (${skipped} duplicates removed)` : ''}`
-		);
-	} finally {
+
 		try {
-			fs.unlinkSync(wavPath);
-		} catch {}
+			const raw = await transcribeAudio(vodPool, wavPath, language, 5, VOD_QUEUE_ITEM_TIMEOUT_MS);
+			const sentences = deduplicateSentences(raw);
+			totalDuplicates += raw.length - sentences.length;
+
+			for (let i = 0; i < sentences.length; i++) {
+				const s = sentences[i];
+				let text = s.text;
+				let startTime = batchOffset + s.start;
+				const endTime = batchOffset + s.end;
+				let words = s.words?.map((w) => ({
+					...w,
+					start: batchOffset + w.start,
+					end: batchOffset + w.end
+				}));
+
+				// Merge pending partial from previous batch into the first sentence
+				if (i === 0 && pendingPartial) {
+					text = pendingPartial.text + ' ' + text;
+					startTime = pendingPartial.startTime;
+					words = [...(pendingPartial.words ?? []), ...(words ?? [])];
+					pendingPartial = null;
+				}
+
+				// Hold back partial (incomplete) sentences for merging with next batch
+				if (s.partial) {
+					pendingPartial = { text, startTime, endTime, words };
+				} else {
+					onResult(streamId, text, startTime, endTime, words);
+					totalSentences++;
+				}
+			}
+
+			// If no sentences came back, clear any stale partial
+			if (sentences.length === 0 && pendingPartial) {
+				onResult(
+					streamId,
+					pendingPartial.text,
+					pendingPartial.startTime,
+					pendingPartial.endTime,
+					pendingPartial.words
+				);
+				totalSentences++;
+				pendingPartial = null;
+			}
+
+			if ((batchIdx + 1) % 10 === 0 || batchIdx === totalBatches - 1) {
+				console.log(
+					`[transcriber:vod] Stream ${streamId}: batch ${batchIdx + 1}/${totalBatches} (${totalSentences} sentences so far)`
+				);
+			}
+		} catch (err) {
+			console.warn(
+				`[transcriber:vod] Batch ${batchIdx + 1}/${totalBatches} failed for stream ${streamId}: ${err instanceof Error ? err.message : err}`
+			);
+		} finally {
+			try {
+				fs.unlinkSync(wavPath);
+			} catch {}
+		}
 	}
+
+	// Flush any remaining partial sentence
+	if (pendingPartial) {
+		onResult(
+			streamId,
+			pendingPartial.text,
+			pendingPartial.startTime,
+			pendingPartial.endTime,
+			pendingPartial.words
+		);
+		totalSentences++;
+	}
+
+	console.log(
+		`[transcriber:vod] Full transcription complete for stream ${streamId}: ${totalSentences} sentences${totalDuplicates > 0 ? ` (${totalDuplicates} duplicates removed)` : ''}`
+	);
 }
 
 /**
