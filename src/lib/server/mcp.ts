@@ -66,6 +66,11 @@ export function createMcpServer(): McpServer {
 		'List all streams with status, metadata, and clip counts.',
 		{},
 		async () => {
+			const clipRegions = getAllClipRegions();
+			const clipCountsByStream: Record<string, number> = {};
+			for (const r of clipRegions) {
+				clipCountsByStream[r.streamId] = (clipCountsByStream[r.streamId] || 0) + 1;
+			}
 			const streams = listStreams().map((s) => ({
 				id: s.id,
 				channel: s.channel,
@@ -77,19 +82,14 @@ export function createMcpServer(): McpServer {
 				sourceType: s.sourceType,
 				viewerCount: s.viewerCount,
 				durationSeconds: s.durationSeconds,
+				clipCount: clipCountsByStream[s.id] ?? 0,
 				...(s.error && { error: s.error })
 			}));
-			const clipRegions = getAllClipRegions();
-			// Count clips per stream instead of returning full clip data
-			const clipCountsByStream: Record<string, number> = {};
-			for (const r of clipRegions) {
-				clipCountsByStream[r.streamId] = (clipCountsByStream[r.streamId] || 0) + 1;
-			}
 			return {
 				content: [
 					{
 						type: 'text' as const,
-						text: JSON.stringify({ streams, clipCounts: clipCountsByStream, totalClips: clipRegions.length })
+						text: JSON.stringify(streams)
 					}
 				]
 			};
@@ -108,7 +108,7 @@ export function createMcpServer(): McpServer {
 				.union([z.string(), z.array(z.string())])
 				.optional()
 				.describe('Clip ID or array of IDs'),
-			streamId: z.string().optional().describe('Filter by stream ID'),
+			streamId: z.string().optional(),
 			channel: z.string().optional().describe('Filter by channel (case-insensitive)'),
 			after: z
 				.string()
@@ -225,15 +225,13 @@ export function createMcpServer(): McpServer {
 		'search_stream',
 		'Search chat and/or transcription in a time range. Supports regex, badge filter, and pagination.',
 		{
-			type: z
-				.enum(['chat', 'transcript', 'both'])
-				.describe('What to search'),
+			type: z.enum(['chat', 'transcript', 'both']),
 			ranges: z
 				.array(
 					z.object({
-						streamId: z.string().describe('Stream ID'),
-						from: z.number().describe('Start (stream-local seconds)'),
-						to: z.number().describe('End (stream-local seconds)')
+						streamId: z.string(),
+						from: z.number().describe('Stream-local seconds'),
+						to: z.number().describe('Stream-local seconds')
 					})
 				)
 				.min(1)
@@ -248,8 +246,8 @@ export function createMcpServer(): McpServer {
 				.describe(
 					'Filter by badges (chat only)'
 				),
-			limit: z.number().optional().describe('Max results to return'),
-			offset: z.number().optional().default(0).describe('Results to skip (pagination)')
+			limit: z.number().optional(),
+			offset: z.number().optional().default(0)
 		},
 		async ({ type, ranges, query, badges, limit, offset }) => {
 			// sqlite-regex uses Rust's regex crate which is case-sensitive by default.
@@ -351,7 +349,7 @@ export function createMcpServer(): McpServer {
 		'Look up a channel\'s live status, title, game, and viewer count.',
 		{
 			channel: z.string().describe('Channel login or room ID'),
-			platform: z.enum(['twitch', 'douyu']).optional().default('twitch').describe('Platform')
+			platform: z.enum(['twitch', 'douyu']).optional().default('twitch')
 		},
 		async ({ channel, platform }) => {
 			try {
@@ -387,9 +385,9 @@ export function createMcpServer(): McpServer {
 		'get_channel_vods',
 		'List past VODs (archives) for a Twitch channel.',
 		{
-			login: z.string().describe('Twitch channel login'),
+			login: z.string(),
 			first: z.number().optional().default(20).describe('Number of VODs (max 100)'),
-			after: z.string().optional().describe('Pagination cursor')
+			after: z.string().optional().describe('Cursor for pagination')
 		},
 		async ({ login, first, after }) => {
 			const clampedFirst = Math.min(Math.max(first, 1), 100);
@@ -474,13 +472,9 @@ export function createMcpServer(): McpServer {
 		'query_at_time',
 		'Get chat and transcription in a window centered on a timestamp.',
 		{
-			streamId: z.string().describe('Stream ID'),
+			streamId: z.string(),
 			timestamp: z.number().describe('Center timestamp (stream-local seconds)'),
-			windowSeconds: z
-				.number()
-				.optional()
-				.default(30)
-				.describe('Window size in seconds (default 30)')
+			windowSeconds: z.number().optional().default(30)
 		},
 		async ({ streamId, timestamp, windowSeconds }) => {
 			const stream = getStream(streamId);
@@ -554,7 +548,7 @@ export function createMcpServer(): McpServer {
 					: undefined;
 
 			const parts = [
-				JSON.stringify({ channel: stream.channel, status: stream.status, durationSeconds: stream.durationSeconds, timestamp, windowStart, windowEnd, ...(note && { note }) }),
+				JSON.stringify({ channel: stream.channel, status: stream.status, durationSeconds: stream.durationSeconds, ...(note && { note }) }),
 				'',
 				'--- chat ---',
 				...chatLines,
@@ -573,17 +567,17 @@ export function createMcpServer(): McpServer {
 	// ---------------------------------------------------------------------------
 
 	const clipSchema = z.object({
-		id: z.string().optional().describe('Clip ID — omit to auto-generate'),
-		streamId: z.string().optional().describe('Stream ID (required for new clips)'),
-		startTime: z.number().optional().describe('Start time'),
-		endTime: z.number().optional().describe('End time'),
+		id: z.string().optional(),
+		streamId: z.string().optional().describe('Required for new clips'),
+		startTime: z.number().optional(),
+		endTime: z.number().optional(),
 		timeFormat: z
 			.enum(['master', 'local'])
 			.optional()
 			.default('master')
 			.describe('"master" (epoch) or "local" (stream-relative)'),
-		title: z.string().optional().describe('Clip title'),
-		notes: z.string().optional().describe('Clip notes')
+		title: z.string().optional(),
+		notes: z.string().optional()
 	});
 
 	type ClipInput = z.infer<typeof clipSchema>;
@@ -662,7 +656,7 @@ export function createMcpServer(): McpServer {
 		'upsert_clip',
 		'Create or update a clip. Provide streamId+startTime+endTime to create; omit to update existing fields.',
 		{
-			clips: z.array(clipSchema).min(1).describe('Clip(s) to create/update')
+			clips: z.array(clipSchema).min(1)
 		},
 		async (params) => {
 			const batch: ClipInput[] = params.clips;
@@ -715,14 +709,11 @@ export function createMcpServer(): McpServer {
 		'get_hotspots',
 		'Find peak moments by chat density. Accepts a single stream ID or an array. When multiple streams are provided, the top N hotspots are ranked across all streams combined. Each hotspot is a tuple: [streamId, channel, timeLocal, messageCount].',
 		{
-			streamId: z.union([z.string(), z.array(z.string())]).describe('Stream ID or array of IDs'),
-			bucketSeconds: z
-				.number()
-				.optional()
-				.describe('Bucket size in seconds (default: 30)'),
-			topN: z.number().optional().default(10).describe('Number of hotspots (default 10)'),
-			from: z.number().optional().describe('Range start (stream-local seconds)'),
-			to: z.number().optional().describe('Range end (stream-local seconds)')
+			streamId: z.union([z.string(), z.array(z.string())]),
+			bucketSeconds: z.number().optional(),
+			topN: z.number().optional().default(10),
+			from: z.number().optional().describe('Stream-local seconds'),
+			to: z.number().optional().describe('Stream-local seconds')
 		},
 		async ({ streamId, bucketSeconds, topN, from, to }) => {
 			const ids = Array.isArray(streamId) ? streamId : [streamId];
@@ -773,7 +764,7 @@ export function createMcpServer(): McpServer {
 		'retranscribe',
 		'Re-run transcription on a stopped stream (clears existing).',
 		{
-			streamId: z.string().describe('Stream ID')
+			streamId: z.string()
 		},
 		async ({ streamId }) => {
 			const stream = getStream(streamId);
@@ -819,7 +810,7 @@ export function createMcpServer(): McpServer {
 		'get_word_timestamps',
 		'Get word-level timestamps for a transcription segment.',
 		{
-			transcriptionId: z.number().describe('Transcription segment ID')
+			transcriptionId: z.number()
 		},
 		async ({ transcriptionId }) => {
 			const words = loadWordTimestamps(transcriptionId);
@@ -857,14 +848,10 @@ export function createMcpServer(): McpServer {
 		'export_video',
 		'Export video from clips. Returns export ID; runs in background.',
 		{
-			clipIds: z.array(z.string()).min(1).describe('Ordered clip IDs to export'),
-			title: z.string().describe('Export title (used as filename)'),
-			description: z.string().optional().describe('Export description'),
-			chronological: z
-				.boolean()
-				.optional()
-				.default(false)
-				.describe('Sort clips by start time')
+			clipIds: z.array(z.string()).min(1),
+			title: z.string().describe('Used as filename'),
+			description: z.string().optional(),
+			chronological: z.boolean().optional().default(false)
 		},
 		async ({ clipIds, title, description, chronological }) => {
 			try {
@@ -914,7 +901,7 @@ export function createMcpServer(): McpServer {
 		'get_exports',
 		'Get export by ID, or list all if omitted.',
 		{
-			id: z.string().optional().describe('Export ID (omit to list all)')
+			id: z.string().optional()
 		},
 		async ({ id }) => {
 			if (id) {
@@ -944,10 +931,8 @@ export function createMcpServer(): McpServer {
 		'get_screenshot',
 		'Capture a JPEG frame from a stream at a given timestamp.',
 		{
-			streamId: z.string().describe('Stream ID'),
-			timestamp: z
-				.number()
-				.describe('Timestamp to capture'),
+			streamId: z.string(),
+			timestamp: z.number(),
 			timeFormat: z
 				.enum(['master', 'local'])
 				.optional()
