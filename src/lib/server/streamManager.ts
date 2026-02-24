@@ -205,8 +205,40 @@ export async function initStreamManager(): Promise<void> {
 	// Mark any incomplete exports from a previous session as error
 	restoreExportQueue();
 
+	// Resume chat downloads for Twitch VODs that didn't finish
+	let chatResumed = 0;
+	for (const [id, handle] of captures) {
+		const info = handle.info;
+		if (info.chatComplete) continue;
+		if (info.sourceType !== 'vod' || info.platform !== 'twitch') continue;
+		if (!info.sourceUrl) continue;
+
+		const videoId = extractVideoId(info.sourceUrl);
+		if (!videoId) continue;
+
+		handle.stopChat = startVodChatFetch(
+			id,
+			videoId,
+			(_sid, msg) => {
+				persistChatMessage(id, msg);
+			},
+			(success) => {
+				if (success) {
+					handle.info.chatComplete = true;
+					db.saveStream(handle.info);
+					broadcastUpdate(handle.info);
+				}
+			},
+			(_sid, msgs) => {
+				persistChatMessagesBatch(id, msgs);
+			}
+		);
+		chatResumed++;
+	}
+
 	const streamCount = captures.size;
-	console.log(`[init] Restored ${streamCount} streams, ${getClipRegionCount()} clip regions`);
+	console.log(`[init] Restored ${streamCount} streams, ${getClipRegionCount()} clip regions` +
+		(chatResumed > 0 ? `, resumed ${chatResumed} chat downloads` : ''));
 }
 
 // Re-export SSE client management

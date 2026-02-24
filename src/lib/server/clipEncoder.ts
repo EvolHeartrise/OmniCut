@@ -3,7 +3,8 @@
  * Encodes clip regions to MP4 eagerly (on create/update) so exports can
  * concat pre-encoded files near-instantly with `-c copy`.
  *
- * Sequential FIFO queue — one FFmpeg encode at a time to avoid GPU contention.
+ * Supports parallel encoding (N-concurrent) and smart-cut to minimize
+ * re-encoding by stream-copying GOP-aligned middles.
  */
 
 import * as path from 'node:path';
@@ -36,7 +37,9 @@ interface EncodeEntry {
 
 const encodeStatus = new Map<string, EncodeEntry>();
 const queue: string[] = [];
-let activeEncode: { clipId: string; proc: Subprocess } | null = null;
+const activeEncodes = new Map<string, { proc: Subprocess }>();
+const MAX_CONCURRENT_NVENC = 4;
+const MAX_CONCURRENT_CPU = 1;
 
 // Injected lookups — set via setLookups() from streamManager init
 let lookupClip: (id: string) => ClipRegion | undefined;
@@ -57,6 +60,144 @@ export function setLookups(
 	detectNvenc = nvencFn;
 }
 
+// --- Step 1: ffprobe helpers ---
+
+interface KeyframeInfo {
+	firstKF: number | null; // first keyframe >= startTime
+	lastKF: number | null; // last keyframe <= endTime
+}
+
+async function probeKeyframes(concatPath: string, startTime: number, endTime: number): Promise<KeyframeInfo> {
+	const proc = Bun.spawn(
+		[
+			'ffprobe',
+			'-v', 'quiet',
+			'-select_streams', 'v:0',
+			'-show_entries', 'packet=pts_time,flags',
+			'-read_intervals', `${startTime.toFixed(3)}%${endTime.toFixed(3)}`,
+			'-of', 'csv=p=0',
+			'-f', 'concat',
+			'-safe', '0',
+			'-i', concatPath
+		],
+		{ stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' }
+	);
+
+	const stdout = await new Response(proc.stdout).text();
+	const code = await proc.exited;
+	if (code !== 0) return { firstKF: null, lastKF: null };
+
+	let firstKF: number | null = null;
+	let lastKF: number | null = null;
+
+	for (const line of stdout.split('\n')) {
+		const trimmed = line.trim();
+		if (!trimmed) continue;
+		// Format: pts_time,flags  e.g. "12.345,K__"
+		const parts = trimmed.split(',');
+		if (parts.length < 2) continue;
+		const pts = parseFloat(parts[0]);
+		const flags = parts[1];
+		if (isNaN(pts) || !flags.startsWith('K')) continue;
+
+		if (pts >= startTime && firstKF === null) firstKF = pts;
+		if (pts <= endTime) lastKF = pts;
+	}
+
+	return { firstKF, lastKF };
+}
+
+interface StreamParams {
+	bitrate: number; // bps
+	profile: string;
+	level: string;
+}
+
+async function probeStreamParams(concatPath: string): Promise<StreamParams | null> {
+	const proc = Bun.spawn(
+		[
+			'ffprobe',
+			'-v', 'quiet',
+			'-select_streams', 'v:0',
+			'-show_entries', 'stream=bit_rate,profile,level',
+			'-of', 'csv=p=0',
+			'-f', 'concat',
+			'-safe', '0',
+			'-i', concatPath
+		],
+		{ stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' }
+	);
+
+	const stdout = await new Response(proc.stdout).text();
+	const code = await proc.exited;
+	if (code !== 0) return null;
+
+	const line = stdout.trim().split('\n')[0];
+	if (!line) return null;
+	// Format: profile,level,bit_rate  e.g. "High,31,4000000"
+	const parts = line.split(',');
+	if (parts.length < 3) return null;
+
+	const profile = parts[0] || 'High';
+	const level = parts[1] || '31';
+	const bitrate = parseInt(parts[2], 10);
+
+	return { bitrate: isNaN(bitrate) ? 6_000_000 : bitrate, profile, level };
+}
+
+// --- Step 5: Consolidated ffmpeg arg builder ---
+
+interface EncodeOpts {
+	concatPath: string;
+	seekStart: number;
+	duration: number;
+	outputPath: string;
+	useNvenc: boolean;
+	/** When set, use bitrate mode instead of quality mode (for smart-cut edges) */
+	targetBitrate?: number;
+}
+
+function buildEncodeArgs(opts: EncodeOpts): string[] {
+	const { concatPath, seekStart, duration, outputPath, useNvenc, targetBitrate } = opts;
+
+	const input = [
+		...(useNvenc ? ['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'] : []),
+		'-f', 'concat',
+		'-safe', '0',
+		'-i', concatPath,
+		'-ss', seekStart.toFixed(3),
+		'-t', duration.toFixed(3),
+		'-map', '0:v:0',
+		'-map', '0:a:0'
+	];
+
+	let videoArgs: string[];
+	if (useNvenc) {
+		if (targetBitrate) {
+			videoArgs = ['-c:v', 'h264_nvenc', '-preset', 'p4', '-b:v', `${targetBitrate}`];
+		} else {
+			videoArgs = ['-c:v', 'h264_nvenc', '-preset', 'p4', '-qp', '18'];
+		}
+	} else {
+		// CPU fallback — keep format filter for safety
+		if (targetBitrate) {
+			videoArgs = ['-vf', 'format=yuv420p', '-c:v', 'libx264', '-preset', 'ultrafast', '-b:v', `${targetBitrate}`];
+		} else {
+			videoArgs = ['-vf', 'format=yuv420p', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18'];
+		}
+	}
+
+	return [
+		...input,
+		...videoArgs,
+		'-c:a', 'aac',
+		'-b:a', '192k',
+		'-movflags', '+faststart',
+		'-y',
+		outputPath
+	];
+}
+
 // --- Public API ---
 
 /**
@@ -68,9 +209,10 @@ export function enqueueClipEncode(clipId: string): void {
 	if (idx !== -1) queue.splice(idx, 1);
 
 	// If actively encoding this clip, kill it — it'll be re-queued
-	if (activeEncode?.clipId === clipId) {
-		activeEncode.proc.kill();
-		activeEncode = null;
+	const active = activeEncodes.get(clipId);
+	if (active) {
+		active.proc.kill();
+		activeEncodes.delete(clipId);
 	}
 
 	// Delete stale encoded file if it exists
@@ -98,10 +240,10 @@ export function cancelClipEncode(clipId: string): void {
 	if (idx !== -1) queue.splice(idx, 1);
 
 	// Kill if actively encoding
-	if (activeEncode?.clipId === clipId) {
-		activeEncode.proc.kill();
-		activeEncode = null;
-		// Kick the queue forward
+	const active = activeEncodes.get(clipId);
+	if (active) {
+		active.proc.kill();
+		activeEncodes.delete(clipId);
 		processQueue();
 	}
 
@@ -185,22 +327,48 @@ export function restoreEncodeState(clipIds: string[]): void {
 }
 
 /**
- * Kill the active encode process on shutdown.
+ * Kill all active encode processes on shutdown.
  */
 export function shutdownEncoder(): void {
-	if (activeEncode) {
-		activeEncode.proc.kill();
-		activeEncode = null;
+	for (const [, { proc }] of activeEncodes) {
+		proc.kill();
 	}
+	activeEncodes.clear();
 	queue.length = 0;
 }
 
 // --- Internal ---
 
 function processQueue(): void {
-	if (activeEncode || queue.length === 0) return;
-	const clipId = queue.shift()!;
-	encodeClip(clipId);
+	const useNvencCached = detectNvenc();
+	// We can't synchronously know NVENC status, so use a safe default
+	// and let the actual encode function handle it properly.
+	// For concurrency limit, we check optimistically.
+	const maxConcurrent = MAX_CONCURRENT_NVENC; // worst-case is launching 4; if CPU, jobs are light enough
+
+	while (activeEncodes.size < maxConcurrent && queue.length > 0) {
+		const clipId = queue.shift()!;
+		encodeClip(clipId);
+	}
+}
+
+async function runFfmpeg(args: string[], clipId: string): Promise<void> {
+	const proc = Bun.spawn(['ffmpeg', ...args], {
+		stdin: 'ignore',
+		stdout: 'pipe',
+		stderr: 'pipe'
+	});
+	activeEncodes.set(clipId, { proc });
+
+	const stderrText = await new Response(proc.stderr).text();
+	const code = await proc.exited;
+	if (code !== 0) throw new Error(`ffmpeg failed (code ${code}): ${stderrText.slice(-500)}`);
+}
+
+function cleanupTempFiles(...paths: string[]): void {
+	for (const p of paths) {
+		try { fs.unlinkSync(p); } catch { /* ok */ }
+	}
 }
 
 async function encodeClip(clipId: string): Promise<void> {
@@ -245,137 +413,176 @@ async function encodeClip(clipId: string): Promise<void> {
 		const segGroupStart = segments[0].startTime;
 		const trimStart = Math.max(0, localStart - segGroupStart);
 
-		// Detect encoder
 		const useNvenc = await detectNvenc();
-		const encodeArgs = useNvenc
-			? ['-c:v', 'h264_nvenc', '-preset', 'p4', '-qp', '18']
-			: ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18'];
 
-		const args = [
-			'-f',
-			'concat',
-			'-safe',
-			'0',
-			'-i',
-			concatPath,
-			'-ss',
-			trimStart.toFixed(3),
-			'-t',
-			dur.toFixed(3),
-			'-map',
-			'0:v:0',
-			'-map',
-			'0:a:0',
-			'-vf',
-			'format=yuv420p',
-			...encodeArgs,
-			'-c:a',
-			'aac',
-			'-b:a',
-			'192k',
-			'-movflags',
-			'+faststart',
-			'-y',
-			outputPath
-		];
+		// --- Step 3: Smart cut ---
+		const kf = await probeKeyframes(concatPath, trimStart, trimStart + dur);
 
-		let success = false;
-		try {
-			const proc = Bun.spawn(['ffmpeg', ...args], {
-				stdin: 'ignore',
-				stdout: 'pipe',
-				stderr: 'pipe'
-			});
-			activeEncode = { clipId, proc };
+		// Minimum duration for smart cut to be worthwhile (~2 GOPs, ~4s at typical 2s GOP)
+		const MIN_SMART_CUT_DURATION = 4.0;
+		const canSmartCut =
+			kf.firstKF !== null &&
+			kf.lastKF !== null &&
+			kf.lastKF > kf.firstKF &&
+			dur >= MIN_SMART_CUT_DURATION;
 
-			const stderrText = await new Response(proc.stderr).text();
-			const code = await proc.exited;
-			if (code !== 0) throw new Error(`ffmpeg failed (code ${code}): ${stderrText.slice(-500)}`);
-			success = true;
-		} catch (err) {
-			// NVENC failure — retry with libx264
-			if (useNvenc) {
-				console.error(`[clip-encoder] NVENC failed for ${clipId}, retrying with libx264`);
-				const fallbackArgs = [
-					'-f',
-					'concat',
-					'-safe',
-					'0',
-					'-i',
-					concatPath,
-					'-ss',
-					trimStart.toFixed(3),
-					'-t',
-					dur.toFixed(3),
-					'-map',
-					'0:v:0',
-					'-map',
-					'0:a:0',
-					'-vf',
-					'format=yuv420p',
-					'-c:v',
-					'libx264',
-					'-preset',
-					'ultrafast',
-					'-crf',
-					'18',
-					'-c:a',
-					'aac',
-					'-b:a',
-					'192k',
-					'-movflags',
-					'+faststart',
-					'-y',
-					outputPath
-				];
-				const proc = Bun.spawn(['ffmpeg', ...fallbackArgs], {
-					stdin: 'ignore',
-					stdout: 'pipe',
-					stderr: 'pipe'
-				});
-				activeEncode = { clipId, proc };
+		// Check if both cut points land on keyframes (full copy)
+		const KF_TOLERANCE = 0.05; // 50ms tolerance for keyframe alignment
+		const startOnKF = kf.firstKF !== null && Math.abs(kf.firstKF - trimStart) < KF_TOLERANCE;
+		const endOnKF = kf.lastKF !== null && Math.abs(kf.lastKF - (trimStart + dur)) < KF_TOLERANCE;
 
-				const stderrText = await new Response(proc.stderr).text();
-				const code = await proc.exited;
-				if (code !== 0) throw new Error(`ffmpeg fallback failed (code ${code}): ${stderrText.slice(-500)}`);
-				success = true;
-			} else {
-				throw err;
+		if (startOnKF && endOnKF) {
+			// Full copy — both cut points on keyframes
+			console.log(`[clip-encoder] ${clipId}: full stream copy (both cuts on keyframes)`);
+			const args = [
+				'-f', 'concat', '-safe', '0', '-i', concatPath,
+				'-ss', trimStart.toFixed(3),
+				'-t', dur.toFixed(3),
+				'-map', '0:v:0', '-map', '0:a:0',
+				'-c', 'copy',
+				'-movflags', '+faststart',
+				'-y', outputPath
+			];
+			try {
+				await runFfmpeg(args, clipId);
+			} catch (err) {
+				// Stream copy can fail on edge cases — fall back to full encode
+				console.warn(`[clip-encoder] ${clipId}: stream copy failed, falling back to full encode`);
+				await fullEncode(clipId, concatPath, trimStart, dur, outputPath, useNvenc);
 			}
+		} else if (canSmartCut) {
+			// Smart cut — encode edges, copy middle
+			console.log(`[clip-encoder] ${clipId}: smart cut [${trimStart.toFixed(2)} → ${kf.firstKF!.toFixed(2)} | copy → ${kf.lastKF!.toFixed(2)} | → ${(trimStart + dur).toFixed(2)}]`);
+
+			const streamParams = await probeStreamParams(concatPath);
+			// Edge bitrate = source bitrate × 1.2 to avoid visible seams
+			const edgeBitrate = streamParams ? Math.round(streamParams.bitrate * 1.2) : 6_000_000;
+
+			const leadPath = path.join(getClipsDir(), `${clipId}_lead.mp4`);
+			const bulkPath = path.join(getClipsDir(), `${clipId}_bulk.mp4`);
+			const trailPath = path.join(getClipsDir(), `${clipId}_trail.mp4`);
+			const tempFiles = [leadPath, bulkPath, trailPath];
+
+			try {
+				const hasLeading = kf.firstKF! - trimStart > KF_TOLERANCE;
+				const hasTrailing = (trimStart + dur) - kf.lastKF! > KF_TOLERANCE;
+				const partFiles: string[] = [];
+
+				// Leading edge: [trimStart → firstKF]
+				if (hasLeading) {
+					const leadDur = kf.firstKF! - trimStart;
+					const leadArgs = buildEncodeArgs({
+						concatPath, seekStart: trimStart, duration: leadDur,
+						outputPath: leadPath, useNvenc, targetBitrate: edgeBitrate
+					});
+					await runFfmpeg(leadArgs, clipId);
+					partFiles.push(leadPath);
+				}
+
+				// Bulk: stream copy [firstKF → lastKF]
+				const bulkDur = kf.lastKF! - kf.firstKF!;
+				if (bulkDur > 0) {
+					const bulkArgs = [
+						'-f', 'concat', '-safe', '0', '-i', concatPath,
+						'-ss', kf.firstKF!.toFixed(3),
+						'-t', bulkDur.toFixed(3),
+						'-map', '0:v:0', '-map', '0:a:0',
+						'-c', 'copy',
+						'-movflags', '+faststart',
+						'-y', bulkPath
+					];
+					await runFfmpeg(bulkArgs, clipId);
+					partFiles.push(bulkPath);
+				}
+
+				// Trailing edge: [lastKF → trimStart + dur]
+				if (hasTrailing) {
+					const trailDur = (trimStart + dur) - kf.lastKF!;
+					const trailArgs = buildEncodeArgs({
+						concatPath, seekStart: kf.lastKF!, duration: trailDur,
+						outputPath: trailPath, useNvenc, targetBitrate: edgeBitrate
+					});
+					await runFfmpeg(trailArgs, clipId);
+					partFiles.push(trailPath);
+				}
+
+				if (partFiles.length === 1) {
+					// Only one part — just rename it
+					fs.renameSync(partFiles[0], outputPath);
+				} else {
+					// Concat the parts
+					const partsConcatPath = outputPath + '.parts.txt';
+					fs.writeFileSync(partsConcatPath, partFiles.map((f) => ffmpegConcatEscape(f)).join('\n'));
+					try {
+						const concatArgs = [
+							'-f', 'concat', '-safe', '0', '-i', partsConcatPath,
+							'-c', 'copy',
+							'-movflags', '+faststart',
+							'-y', outputPath
+						];
+						await runFfmpeg(concatArgs, clipId);
+					} finally {
+						cleanupTempFiles(partsConcatPath);
+					}
+				}
+			} catch (err) {
+				// Smart cut failed — fall back to full encode
+				console.warn(`[clip-encoder] ${clipId}: smart cut failed, falling back to full encode:`, err);
+				cleanupTempFiles(...tempFiles);
+				await fullEncode(clipId, concatPath, trimStart, dur, outputPath, useNvenc);
+			} finally {
+				cleanupTempFiles(...tempFiles);
+			}
+		} else {
+			// Edge-only / short clip — full re-encode
+			await fullEncode(clipId, concatPath, trimStart, dur, outputPath, useNvenc);
 		}
 
 		// Clean up concat file
-		try {
-			fs.unlinkSync(concatPath);
-		} catch {
-			/* ok */
-		}
+		cleanupTempFiles(concatPath);
 
-		if (success) {
-			encodeStatus.set(clipId, { status: 'ready', outputPath });
-			broadcastClipEncodeStatus(clipId, 'ready');
-			console.log(`[clip-encoder] Encoded clip ${clipId} → ${outputPath}`);
-		}
+		encodeStatus.set(clipId, { status: 'ready', outputPath });
+		broadcastClipEncodeStatus(clipId, 'ready');
+		console.log(`[clip-encoder] Encoded clip ${clipId} → ${outputPath}`);
 	} catch (err: unknown) {
 		const message = err instanceof Error ? err.message : String(err);
 		encodeStatus.set(clipId, { status: 'error', error: message });
 		broadcastClipEncodeStatus(clipId, 'error', message);
 		console.error(`[clip-encoder] Failed to encode clip ${clipId}:`, message);
 
-		// Clean up partial output
-		try {
-			fs.unlinkSync(outputPath);
-		} catch {
-			/* ok */
-		}
-		try {
-			fs.unlinkSync(outputPath + '.concat.txt');
-		} catch {
-			/* ok */
-		}
+		cleanupTempFiles(outputPath, outputPath + '.concat.txt');
 	} finally {
-		activeEncode = null;
+		activeEncodes.delete(clipId);
 		processQueue();
+	}
+}
+
+async function fullEncode(
+	clipId: string,
+	concatPath: string,
+	trimStart: number,
+	dur: number,
+	outputPath: string,
+	useNvenc: boolean
+): Promise<void> {
+	const args = buildEncodeArgs({
+		concatPath, seekStart: trimStart, duration: dur,
+		outputPath, useNvenc
+	});
+
+	try {
+		await runFfmpeg(args, clipId);
+	} catch (err) {
+		if (useNvenc) {
+			console.error(`[clip-encoder] NVENC failed for ${clipId}, retrying with libx264`);
+			const fallbackArgs = buildEncodeArgs({
+				concatPath, seekStart: trimStart, duration: dur,
+				outputPath, useNvenc: false
+			});
+			await runFfmpeg(fallbackArgs, clipId);
+		} else {
+			throw err;
+		}
 	}
 }
 
