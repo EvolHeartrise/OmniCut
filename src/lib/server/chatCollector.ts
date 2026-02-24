@@ -87,8 +87,10 @@ export function startChatCollection(
 					const badges = badgesRaw
 						? badgesRaw.split(',').map((b) => b.split('/')[0]).join(',')
 						: null;
+					const twitchId = extractTag(tags, 'id');
+					if (!twitchId) continue; // skip messages without a Twitch ID
 
-					onMessage(streamId, { username, text, timestamp, color, badges });
+					onMessage(streamId, { username, text, timestamp, color, badges, twitchId });
 				}
 			}
 		};

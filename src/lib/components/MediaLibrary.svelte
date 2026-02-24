@@ -20,7 +20,72 @@
 	let confirmingId = $state<string | null>(null);
 	let confirmTimer: ReturnType<typeof setTimeout> | null = null;
 
-	let sorted = $derived([...$streams].sort((a, b) => b.startedAt - a.startedAt));
+	// --- Filters ---
+	let filterChannel = $state('');
+	let filterStatus = $state<'' | 'capturing' | 'stopped' | 'error'>('');
+	let filterType = $state<'' | 'live' | 'vod'>('');
+
+	// --- Sorting ---
+	type SortKey = 'channel' | 'type' | 'status' | 'date' | 'size' | 'chat' | 'transcripts' | 'clips';
+	let sortKey = $state<SortKey>('date');
+	let sortAsc = $state(false);
+
+	let uniqueChannels = $derived(
+		[...new Set($streams.map((s) => s.channel))].sort()
+	);
+
+	let filtered = $derived.by(() => {
+		let list = [...$streams];
+		if (filterChannel) list = list.filter((s) => s.channel === filterChannel);
+		if (filterStatus) list = list.filter((s) => s.status === filterStatus);
+		if (filterType) list = list.filter((s) => s.sourceType === filterType);
+
+		list.sort((a, b) => {
+			let cmp = 0;
+			switch (sortKey) {
+				case 'channel':
+					cmp = a.channel.localeCompare(b.channel);
+					break;
+				case 'type':
+					cmp = a.sourceType.localeCompare(b.sourceType);
+					break;
+				case 'status':
+					cmp = a.status.localeCompare(b.status);
+					break;
+				case 'date':
+					cmp = a.startedAt - b.startedAt;
+					break;
+				case 'size':
+					cmp = a.diskUsageBytes - b.diskUsageBytes;
+					break;
+				case 'chat':
+					cmp = a.chatMessageCount - b.chatMessageCount;
+					break;
+				case 'transcripts':
+					cmp = a.transcriptionCount - b.transcriptionCount;
+					break;
+				case 'clips':
+					cmp = (clipCounts[a.id] || 0) - (clipCounts[b.id] || 0);
+					break;
+			}
+			return sortAsc ? cmp : -cmp;
+		});
+		return list;
+	});
+
+	function toggleSort(key: SortKey) {
+		if (sortKey === key) {
+			sortAsc = !sortAsc;
+		} else {
+			sortKey = key;
+			sortAsc = key === 'channel';
+		}
+	}
+
+	function sortIndicator(key: SortKey): string {
+		if (sortKey !== key) return '';
+		return sortAsc ? ' \u25B2' : ' \u25BC';
+	}
 
 	function statusColor(status: string): string {
 		switch (status) {
@@ -64,81 +129,107 @@
 </script>
 
 <div class="media-library">
-	{#if sorted.length === 0}
+	<div class="filters-bar">
+		<!-- svelte-ignore a11y_label_has_associated_control -->
+		<label class="filter-group">
+			<span class="filter-label">Channel</span>
+			<select class="filter-select" bind:value={filterChannel}>
+				<option value="">All</option>
+				{#each uniqueChannels as ch}
+					<option value={ch}>{ch}</option>
+				{/each}
+			</select>
+		</label>
+		<!-- svelte-ignore a11y_label_has_associated_control -->
+		<label class="filter-group">
+			<span class="filter-label">Status</span>
+			<select class="filter-select" bind:value={filterStatus}>
+				<option value="">All</option>
+				<option value="capturing">Capturing</option>
+				<option value="stopped">Stopped</option>
+				<option value="error">Error</option>
+			</select>
+		</label>
+		<!-- svelte-ignore a11y_label_has_associated_control -->
+		<label class="filter-group">
+			<span class="filter-label">Type</span>
+			<select class="filter-select" bind:value={filterType}>
+				<option value="">All</option>
+				<option value="live">Live</option>
+				<option value="vod">VOD</option>
+			</select>
+		</label>
+		<div class="filter-spacer"></div>
+		<span class="row-count">{filtered.length} of {$streams.length}</span>
+	</div>
+
+	{#if $streams.length === 0}
 		<p class="empty">No media recorded yet</p>
 	{:else}
-		<div class="media-list">
-			{#each sorted as stream (stream.id)}
-				<div class="media-row">
-					<span class="status-dot" style="background:{statusColor(stream.status)}" title={stream.status}></span>
-
-					<span class="channel">
-						{stream.channel}
-						{#if stream.platform === 'douyu'}<span class="platform-badge">DY</span>{/if}
-					</span>
-
-					<span class="type-badge" class:vod={stream.sourceType === 'vod'}>
-						{stream.sourceType === 'vod' ? 'VOD' : 'Live'}
-					</span>
-
-					<span class="title" title={stream.streamTitle || ''}>
-						{stream.streamTitle || ''}
-					</span>
-
-					<span class="meta">{formatBytes(stream.diskUsageBytes)}</span>
-
-					{#if stream.chatMessageCount > 0}
-						<span class="meta chat">{stream.chatMessageCount.toLocaleString()} msgs</span>
-					{/if}
-
-					{#if stream.transcriptionCount > 0}
-						<span class="meta transcript">{stream.transcriptionCount.toLocaleString()} transcripts</span>
-					{/if}
-
-					{#if clipCounts[stream.id]}
-						<span class="meta clips">{clipCounts[stream.id]} clip{clipCounts[stream.id] !== 1 ? 's' : ''}</span>
-					{/if}
-
-					<span class="meta date">{formatDate(stream.startedAt)}</span>
-
-					<span class="actions">
-						{#if stream.status === 'capturing' && stream.sourceType === 'vod'}
-							<button class="btn-action btn-stop" onclick={() => stopStream(stream.id)} title="Stop downloading"
-								>Stop</button
-							>
-						{/if}
-						{#if stream.status === 'stopped'}
-							{#if stream.sourceType === 'vod' && stream.platform === 'twitch'}
+		<div class="table-wrap">
+			<table class="media-table">
+				<thead>
+					<tr>
+						<th class="th-status"></th>
+						<th class="th-sortable" onclick={() => toggleSort('channel')}>Channel{sortIndicator('channel')}</th>
+						<th class="th-sortable" onclick={() => toggleSort('type')}>Type{sortIndicator('type')}</th>
+						<th class="th-title">Title</th>
+						<th class="th-sortable th-right" onclick={() => toggleSort('size')}>Size{sortIndicator('size')}</th>
+						<th class="th-sortable th-right" onclick={() => toggleSort('chat')}>Chat{sortIndicator('chat')}</th>
+						<th class="th-sortable th-right" onclick={() => toggleSort('transcripts')}>Trans.{sortIndicator('transcripts')}</th>
+						<th class="th-sortable th-right" onclick={() => toggleSort('clips')}>Clips{sortIndicator('clips')}</th>
+						<th class="th-sortable" onclick={() => toggleSort('date')}>Date{sortIndicator('date')}</th>
+						<th class="th-actions">Actions</th>
+					</tr>
+				</thead>
+				<tbody>
+					{#each filtered as stream (stream.id)}
+						<tr class="media-row">
+							<td>
+								<span class="status-dot" style="background:{statusColor(stream.status)}" title={stream.status}></span>
+							</td>
+							<td class="cell-channel">
+								{stream.channel}
+								{#if stream.platform === 'douyu'}<span class="platform-badge">DY</span>{/if}
+							</td>
+							<td>
+								<span class="type-badge" class:vod={stream.sourceType === 'vod'}>
+									{stream.sourceType === 'vod' ? 'VOD' : 'Live'}
+								</span>
+							</td>
+							<td class="cell-title" title={stream.streamTitle || ''}>
+								{stream.streamTitle || ''}
+							</td>
+							<td class="cell-right">{formatBytes(stream.diskUsageBytes)}</td>
+							<td class="cell-right cell-chat">{stream.chatMessageCount > 0 ? stream.chatMessageCount.toLocaleString() : ''}</td>
+							<td class="cell-right cell-transcript">{stream.transcriptionCount > 0 ? stream.transcriptionCount.toLocaleString() : ''}</td>
+							<td class="cell-right cell-clips">{clipCounts[stream.id] || ''}</td>
+							<td class="cell-date">{formatDate(stream.startedAt)}</td>
+							<td class="cell-actions">
+								{#if stream.status === 'capturing' && stream.sourceType === 'vod'}
+									<button class="btn-action btn-stop" onclick={() => stopStream(stream.id)} title="Stop downloading">Stop</button>
+								{/if}
+								{#if stream.status === 'stopped'}
+									{#if stream.sourceType === 'vod' && stream.platform === 'twitch'}
+										<button class="btn-action btn-resume" onclick={() => resumeVodStream(stream.id)} title="Resume VOD download">Resume</button>
+									{/if}
+									{#if stream.platform === 'twitch'}
+										<button class="btn-action btn-refetch" onclick={() => refetchVodChat(stream.id)} title={stream.chatComplete ? 'Re-download chat (merges with existing)' : 'Download chat from Twitch'}>{stream.chatComplete ? 'Re-dl Chat' : 'Dl Chat'}</button>
+									{/if}
+									<button class="btn-action btn-retranscribe" onclick={() => retranscribeStream(stream.id)} title="Re-transcribe entire recording">Transcribe</button>
+								{/if}
 								<button
-									class="btn-action btn-resume"
-									onclick={() => resumeVodStream(stream.id)}
-									title="Resume VOD download">Resume</button
+									class="btn-delete"
+									class:confirming={confirmingId === stream.id}
+									onclick={() => handleDelete(stream.id)}
 								>
-							{/if}
-							{#if stream.platform === 'twitch' && !stream.chatComplete}
-								<button
-									class="btn-action btn-refetch"
-									onclick={() => refetchVodChat(stream.id)}
-									title="Refetch VOD chat from Twitch">Chat</button
-								>
-							{/if}
-							<button
-								class="btn-action btn-retranscribe"
-								onclick={() => retranscribeStream(stream.id)}
-								title="Re-transcribe entire recording">Transcribe</button
-							>
-						{/if}
-					</span>
-
-					<button
-						class="btn-delete"
-						class:confirming={confirmingId === stream.id}
-						onclick={() => handleDelete(stream.id)}
-					>
-						{confirmingId === stream.id ? 'Confirm?' : 'Delete'}
-					</button>
-				</div>
-			{/each}
+									{confirmingId === stream.id ? 'Confirm?' : 'Del'}
+								</button>
+							</td>
+						</tr>
+					{/each}
+				</tbody>
+			</table>
 		</div>
 	{/if}
 </div>
@@ -148,11 +239,56 @@
 		background: #0f0f23;
 		border: 1px solid #1a1a2e;
 		border-radius: 8px;
-		padding: 16px;
 		flex: 1;
 		display: flex;
 		flex-direction: column;
 		overflow: hidden;
+	}
+
+	.filters-bar {
+		display: flex;
+		align-items: center;
+		gap: 16px;
+		padding: 10px 16px;
+		border-bottom: 1px solid #1a1a2e;
+		flex-shrink: 0;
+	}
+
+	.filter-group {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+	}
+
+	.filter-label {
+		font-size: 0.7rem;
+		color: #888;
+		text-transform: uppercase;
+		letter-spacing: 0.5px;
+		font-weight: 600;
+	}
+
+	.filter-select {
+		background: #1a1a2e;
+		border: 1px solid #2a2a4a;
+		color: #e0e0ff;
+		font-size: 0.75rem;
+		padding: 4px 8px;
+		border-radius: 4px;
+		outline: none;
+	}
+
+	.filter-select:focus {
+		border-color: #7c3aed;
+	}
+
+	.filter-spacer {
+		flex: 1;
+	}
+
+	.row-count {
+		font-size: 0.7rem;
+		color: #666;
 	}
 
 	.empty {
@@ -162,46 +298,93 @@
 		padding: 24px 0;
 	}
 
-	.media-list {
-		display: flex;
-		flex-direction: column;
-		gap: 4px;
-		overflow-y: auto;
+	.table-wrap {
 		flex: 1;
 		min-height: 0;
+		overflow: auto;
+		scrollbar-width: thin;
+		scrollbar-color: #2a2a4a #0a0a1a;
+	}
+
+	.media-table {
+		width: 100%;
+		border-collapse: collapse;
+		font-size: 0.75rem;
+	}
+
+	thead {
+		position: sticky;
+		top: 0;
+		z-index: 1;
+	}
+
+	th {
+		background: #13132a;
+		color: #666;
+		font-size: 0.65rem;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.5px;
+		padding: 6px 8px;
+		text-align: left;
+		white-space: nowrap;
+		border-bottom: 1px solid #2a2a4a;
+		user-select: none;
+	}
+
+	.th-sortable {
+		cursor: pointer;
+	}
+
+	.th-sortable:hover {
+		color: #aaa;
+	}
+
+	.th-right {
+		text-align: right;
+	}
+
+	.th-status {
+		width: 20px;
+	}
+
+	.th-title {
+		width: 100%;
+	}
+
+	.th-actions {
+		text-align: right;
 	}
 
 	.media-row {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-		padding: 6px 8px;
-		border-radius: 4px;
-		background: #1a1a2e;
-		transition: background 0.15s;
+		transition: background 0.1s;
 	}
 
 	.media-row:hover {
-		background: #222244;
+		background: #1a1a2e;
+	}
+
+	.media-row td {
+		padding: 5px 8px;
+		border-bottom: 1px solid #141428;
+		vertical-align: middle;
+		white-space: nowrap;
 	}
 
 	.status-dot {
 		width: 8px;
 		height: 8px;
 		border-radius: 50%;
-		flex-shrink: 0;
+		display: inline-block;
 	}
 
-	.channel {
+	.cell-channel {
 		font-weight: 700;
-		font-size: 0.8rem;
 		color: #e0e0ff;
-		white-space: nowrap;
-		flex-shrink: 0;
 	}
 
 	.platform-badge {
-		font-size: 0.6rem;
+		font-size: 0.55rem;
 		font-weight: 700;
 		color: #f59e0b;
 		margin-left: 3px;
@@ -216,7 +399,6 @@
 		background: #22c55e22;
 		color: #22c55e;
 		text-transform: uppercase;
-		flex-shrink: 0;
 	}
 
 	.type-badge.vod {
@@ -224,43 +406,42 @@
 		color: #d97706;
 	}
 
-	.title {
-		font-size: 0.75rem;
+	.cell-title {
 		color: #888;
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
-		flex: 1;
-		min-width: 0;
+		max-width: 300px;
 	}
 
-	.meta {
-		font-size: 0.7rem;
+	.cell-right {
+		text-align: right;
 		color: #666;
-		white-space: nowrap;
-		flex-shrink: 0;
+		font-variant-numeric: tabular-nums;
+		font-family: monospace;
+		font-size: 0.7rem;
 	}
 
-	.meta.chat {
+	.cell-chat {
 		color: #7c3aed;
 	}
 
-	.meta.transcript {
+	.cell-transcript {
 		color: #0891b2;
 	}
 
-	.meta.clips {
+	.cell-clips {
 		color: #e67e22;
 	}
 
-	.meta.date {
+	.cell-date {
 		color: #555;
+		font-size: 0.7rem;
 	}
 
-	.actions {
-		display: flex;
-		gap: 4px;
-		flex-shrink: 0;
+	.cell-actions {
+		text-align: right;
+		white-space: nowrap;
 	}
 
 	.btn-action {
@@ -276,7 +457,7 @@
 		transition:
 			background 0.15s,
 			color 0.15s;
-		flex-shrink: 0;
+		margin-left: 3px;
 	}
 
 	.btn-stop {
@@ -322,7 +503,7 @@
 	.btn-delete {
 		font-size: 0.6rem;
 		font-weight: 700;
-		padding: 2px 8px;
+		padding: 2px 6px;
 		border-radius: 4px;
 		border: 1px solid #444;
 		background: transparent;
@@ -334,7 +515,7 @@
 			background 0.15s,
 			color 0.15s,
 			border-color 0.15s;
-		flex-shrink: 0;
+		margin-left: 3px;
 	}
 
 	.btn-delete:hover {

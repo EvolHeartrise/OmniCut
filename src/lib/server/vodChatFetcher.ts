@@ -14,6 +14,7 @@ const VOD_COMMENTS_QUERY = `query($videoID: ID!, $cursor: Cursor) {
       edges {
         cursor
         node {
+          id
           contentOffsetSeconds
           commenter { displayName chatColor }
           message { fragments { text } userBadges { setID } }
@@ -155,6 +156,8 @@ async function fetchAllPages(entry: QueueEntry) {
 				if (entry.stopped) break;
 
 				const node = edge.node;
+				const twitchId: string | undefined = node.id ?? undefined;
+				if (!twitchId) continue; // skip messages without a Twitch ID
 				const username = node.commenter?.displayName ?? '[deleted]';
 				const fragments: any[] = node.message?.fragments ?? [];
 				const text = fragments.map((f: any) => f.text).join('');
@@ -166,7 +169,7 @@ async function fetchAllPages(entry: QueueEntry) {
 						? userBadges.map((b: any) => b.setID).join(',')
 						: null;
 
-				batch.push({ username, text, timestamp, color, badges });
+				batch.push({ username, text, timestamp, color, badges, twitchId });
 				totalMessages++;
 
 				cursor = edge.cursor;

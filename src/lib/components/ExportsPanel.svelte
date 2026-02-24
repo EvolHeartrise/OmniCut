@@ -1,8 +1,10 @@
 <script lang="ts">
 	import { onMount, untrack } from 'svelte';
-	import { exportStatusEvents, exportLog } from '$lib/stores/streams.js';
-	import { listExportsCmd } from '$lib/streams.remote';
-	import { formatDuration } from '$lib/utils.js';
+	import Hls from 'hls.js';
+	import { exportStatusEvents, exportLog, streams, syncOffsets, clipRegions } from '$lib/stores/streams.js';
+	import { listExportsCmd, reexportCmd } from '$lib/streams.remote';
+	import { formatDuration, createHlsConfig } from '$lib/utils.js';
+	import type { ClipRegion } from '$lib/stores/streams.js';
 
 	interface ExportRecord {
 		id: string;
@@ -18,6 +20,30 @@
 
 	let exports = $state<ExportRecord[]>([]);
 	let loading = $state(true);
+
+	// --- Preview state ---
+	let previewExportId = $state<string | null>(null);
+	let previewVideoEl = $state<HTMLVideoElement | null>(null);
+	let previewHls: Hls | null = null;
+	let previewPlaying = $state(false);
+	let previewProgress = $state(0);
+	let previewCurrentTime = $state('0:00');
+	let previewTotalDuration = $state('0:00');
+	let isSeeking = $state(false);
+	let currentClipIndex = $state(0);
+
+	// Resolve the previewing export's clip IDs to actual ClipRegion objects
+	let previewClips = $derived.by(() => {
+		if (!previewExportId) return [];
+		const exp = exports.find((e) => e.id === previewExportId);
+		if (!exp) return [];
+		const clips: ClipRegion[] = [];
+		for (const id of exp.clipIds) {
+			const clip = $clipRegions.find((c) => c.id === id);
+			if (clip) clips.push(clip);
+		}
+		return clips;
+	});
 
 	onMount(() => {
 		fetchExports();
@@ -81,11 +107,286 @@
 		});
 	}
 
+	async function handleReexport(id: string) {
+		try {
+			await reexportCmd({ id });
+			await fetchExports();
+		} catch (err) {
+			console.error('Re-export failed:', err);
+		}
+	}
+
 	// Active export progress from SSE
 	let activeProgress = $derived.by(() => {
 		if ($exportLog.length === 0) return null;
 		const latest = $exportLog[$exportLog.length - 1];
 		return latest;
+	});
+
+	// --- Preview helpers ---
+
+	function getClipLocalBounds(clip: ClipRegion): { localStart: number; localEnd: number } | null {
+		const stream = $streams.find((s) => s.id === clip.streamId);
+		if (!stream) return null;
+		const offset = $syncOffsets[clip.streamId] || 0;
+		const anchor = stream.startedAt / 1000;
+		return { localStart: clip.startTime - anchor + offset, localEnd: clip.endTime - anchor + offset };
+	}
+
+	function formatTime(seconds: number): string {
+		const s = Math.max(0, Math.floor(seconds));
+		const m = Math.floor(s / 60);
+		const sec = s % 60;
+		return `${m}:${sec.toString().padStart(2, '0')}`;
+	}
+
+	function getClipDuration(clip: ClipRegion): number {
+		return clip.endTime - clip.startTime;
+	}
+
+	function getTotalDuration(clips: ClipRegion[]): number {
+		let total = 0;
+		for (const c of clips) total += getClipDuration(c);
+		return total;
+	}
+
+	function getPriorDuration(clips: ClipRegion[], upToIndex: number): number {
+		let total = 0;
+		for (let i = 0; i < upToIndex; i++) total += getClipDuration(clips[i]);
+		return total;
+	}
+
+	// --- Core multi-clip playback ---
+
+	function openPreview(exp: ExportRecord) {
+		if (previewExportId === exp.id) {
+			closePreview();
+			return;
+		}
+		closePreview();
+		previewExportId = exp.id;
+		previewPlaying = false;
+		previewProgress = 0;
+		previewCurrentTime = '0:00';
+		currentClipIndex = 0;
+
+		// Compute total duration from resolved clips (need to read store now)
+		const clips: ClipRegion[] = [];
+		for (const id of exp.clipIds) {
+			const clip = $clipRegions.find((c) => c.id === id);
+			if (clip) clips.push(clip);
+		}
+		previewTotalDuration = formatTime(getTotalDuration(clips));
+
+		requestAnimationFrame(() => {
+			if (clips.length > 0) loadClipAtIndex(0, clips);
+		});
+	}
+
+	function loadClipAtIndex(index: number, clips?: ClipRegion[]) {
+		const resolvedClips = clips ?? previewClips;
+		if (index < 0 || index >= resolvedClips.length) return;
+		currentClipIndex = index;
+
+		const clip = resolvedClips[index];
+		const stream = $streams.find((s) => s.id === clip.streamId);
+		if (!stream || !previewVideoEl) return;
+
+		if (previewHls) {
+			previewHls.destroy();
+			previewHls = null;
+		}
+
+		const url = `/hls/${clip.streamId}/playlist.m3u8`;
+		const offset = $syncOffsets[clip.streamId] || 0;
+		const anchor = stream.startedAt / 1000;
+		const localStart = clip.startTime - anchor + offset;
+
+		const autoPlay = () => {
+			previewVideoEl!
+				.play()
+				.then(() => {
+					previewPlaying = true;
+				})
+				.catch(() => {});
+		};
+
+		if (Hls.isSupported()) {
+			const h = new Hls(createHlsConfig(false));
+			previewHls = h;
+			h.loadSource(url);
+			h.attachMedia(previewVideoEl);
+			h.on(Hls.Events.MANIFEST_PARSED, () => {
+				previewVideoEl!.currentTime = localStart;
+				autoPlay();
+			});
+			h.on(Hls.Events.ERROR, (_event, data) => {
+				if (data.fatal && data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+					h.recoverMediaError();
+				}
+			});
+		} else {
+			previewVideoEl.src = url;
+			previewVideoEl.currentTime = localStart;
+			autoPlay();
+		}
+	}
+
+	function handlePreviewTimeUpdate() {
+		if (!previewVideoEl || previewClips.length === 0) return;
+		const clip = previewClips[currentClipIndex];
+		if (!clip) return;
+		const bounds = getClipLocalBounds(clip);
+		if (!bounds) return;
+		const { localStart, localEnd } = bounds;
+		const clipDur = localEnd - localStart;
+		const totalDur = getTotalDuration(previewClips);
+
+		if (previewVideoEl.currentTime >= localEnd) {
+			// Clip ended — advance or stop
+			if (currentClipIndex < previewClips.length - 1) {
+				loadClipAtIndex(currentClipIndex + 1);
+			} else {
+				// Last clip — pause and reset
+				previewVideoEl.pause();
+				previewPlaying = false;
+				previewProgress = 1;
+				previewCurrentTime = formatTime(totalDur);
+			}
+		} else if (!isSeeking) {
+			const elapsed = previewVideoEl.currentTime - localStart;
+			const globalElapsed = getPriorDuration(previewClips, currentClipIndex) + elapsed;
+			previewProgress = totalDur > 0 ? Math.max(0, Math.min(1, globalElapsed / totalDur)) : 0;
+			previewCurrentTime = formatTime(globalElapsed);
+		}
+	}
+
+	function handleSeekInput(e: Event) {
+		isSeeking = true;
+		const value = +(e.target as HTMLInputElement).value;
+		previewProgress = value;
+		const totalDur = getTotalDuration(previewClips);
+		previewCurrentTime = formatTime(value * totalDur);
+	}
+
+	function handleSeekCommit() {
+		if (!previewVideoEl || previewClips.length === 0) {
+			isSeeking = false;
+			return;
+		}
+		const totalDur = getTotalDuration(previewClips);
+		const targetTime = previewProgress * totalDur;
+
+		// Find which clip this falls into
+		let accumulated = 0;
+		let targetIndex = 0;
+		let offsetInClip = 0;
+		for (let i = 0; i < previewClips.length; i++) {
+			const dur = getClipDuration(previewClips[i]);
+			if (accumulated + dur > targetTime) {
+				targetIndex = i;
+				offsetInClip = targetTime - accumulated;
+				break;
+			}
+			accumulated += dur;
+			if (i === previewClips.length - 1) {
+				targetIndex = i;
+				offsetInClip = dur;
+			}
+		}
+
+		if (targetIndex !== currentClipIndex) {
+			// Need to load a different clip, then seek within it
+			currentClipIndex = targetIndex;
+			const clip = previewClips[targetIndex];
+			const stream = $streams.find((s) => s.id === clip.streamId);
+			if (!stream) {
+				isSeeking = false;
+				return;
+			}
+
+			if (previewHls) {
+				previewHls.destroy();
+				previewHls = null;
+			}
+
+			const url = `/hls/${clip.streamId}/playlist.m3u8`;
+			const offset = $syncOffsets[clip.streamId] || 0;
+			const anchor = stream.startedAt / 1000;
+			const localStart = clip.startTime - anchor + offset;
+			const seekTo = localStart + offsetInClip;
+
+			if (Hls.isSupported()) {
+				const h = new Hls(createHlsConfig(false));
+				previewHls = h;
+				h.loadSource(url);
+				h.attachMedia(previewVideoEl);
+				h.on(Hls.Events.MANIFEST_PARSED, () => {
+					previewVideoEl!.currentTime = seekTo;
+					isSeeking = false;
+					if (previewPlaying) {
+						previewVideoEl!.play().catch(() => {});
+					}
+				});
+				h.on(Hls.Events.ERROR, (_event, data) => {
+					if (data.fatal && data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+						h.recoverMediaError();
+					}
+				});
+			} else {
+				previewVideoEl.src = url;
+				previewVideoEl.currentTime = seekTo;
+				isSeeking = false;
+				if (previewPlaying) {
+					previewVideoEl.play().catch(() => {});
+				}
+			}
+		} else {
+			// Same clip — just seek
+			const bounds = getClipLocalBounds(previewClips[targetIndex]);
+			if (bounds) {
+				previewVideoEl.currentTime = bounds.localStart + offsetInClip;
+			}
+			isSeeking = false;
+		}
+	}
+
+	function togglePreviewPlay() {
+		if (!previewVideoEl) return;
+		if (previewPlaying) {
+			previewVideoEl.pause();
+		} else {
+			// If at the end, restart from beginning
+			if (previewProgress >= 1 && previewClips.length > 0) {
+				previewProgress = 0;
+				previewCurrentTime = '0:00';
+				loadClipAtIndex(0);
+				return;
+			}
+			previewVideoEl.play().catch(() => {});
+		}
+		previewPlaying = !previewPlaying;
+	}
+
+	function closePreview() {
+		if (previewHls) {
+			previewHls.destroy();
+			previewHls = null;
+		}
+		previewExportId = null;
+		previewPlaying = false;
+		previewProgress = 0;
+		currentClipIndex = 0;
+	}
+
+	// Cleanup on unmount
+	$effect(() => {
+		return () => {
+			if (previewHls) {
+				previewHls.destroy();
+				previewHls = null;
+			}
+		};
 	});
 </script>
 
@@ -107,10 +408,25 @@
 			<div class="exports-list">
 				{#each exports as exp (exp.id)}
 					{@const info = statusInfo(exp.status)}
+					{@const isPreviewing = previewExportId === exp.id}
 					<div class="export-item">
 						<div class="export-item-header">
 							<span class="export-item-title">{exp.title}</span>
-							<span class="export-status {info.cls}">{info.label}</span>
+							<div class="export-item-actions">
+								{#if exp.clipIds.length > 0}
+									<button
+										class="btn-preview"
+										onclick={() => openPreview(exp)}
+										title={isPreviewing ? 'Close preview' : 'Preview clips'}
+									>
+										{isPreviewing ? '\u2715' : '\u25B6'}
+									</button>
+								{/if}
+								{#if exp.status === 'ready' || exp.status === 'error'}
+									<button class="btn-reexport" onclick={() => handleReexport(exp.id)}>Re-export</button>
+								{/if}
+								<span class="export-status {info.cls}">{info.label}</span>
+							</div>
 						</div>
 						{#if exp.description}
 							<div class="export-description">{exp.description}</div>
@@ -143,6 +459,47 @@
 						{#if exp.status === 'error' && exp.error}
 							<div class="export-error">{exp.error}</div>
 						{/if}
+
+						{#if isPreviewing}
+							<div class="preview-container">
+								{#if previewClips.length > 0}
+									<div class="preview-clip-info">
+										<div class="preview-clip-header">
+											<span class="preview-clip-index">Clip {currentClipIndex + 1}/{previewClips.length}</span>
+											<span class="preview-clip-title">{previewClips[currentClipIndex]?.title || 'Untitled'}</span>
+										</div>
+										{#if previewClips[currentClipIndex]?.notes}
+											<span class="preview-clip-notes">{previewClips[currentClipIndex].notes}</span>
+										{/if}
+									</div>
+								{/if}
+								<!-- svelte-ignore a11y_media_has_caption -->
+								<video
+									bind:this={previewVideoEl}
+									ontimeupdate={handlePreviewTimeUpdate}
+									playsinline
+									class="preview-video"
+								></video>
+								<div class="preview-controls">
+									<button class="btn-ctl" onclick={togglePreviewPlay}>
+										{previewPlaying ? '\u23F8' : '\u25B6'}
+									</button>
+									<span class="preview-time">{previewCurrentTime}</span>
+									<input
+										type="range"
+										class="preview-seek"
+										min="0"
+										max="1"
+										step="0.001"
+										value={previewProgress}
+										oninput={handleSeekInput}
+										onchange={handleSeekCommit}
+									/>
+									<span class="preview-time">{previewTotalDuration}</span>
+									<button class="btn-ctl" onclick={closePreview}>Close</button>
+								</div>
+							</div>
+						{/if}
 					</div>
 				{/each}
 			</div>
@@ -166,7 +523,7 @@
 		border-radius: 8px;
 		padding: 24px;
 		width: 100%;
-		max-width: 640px;
+		max-width: 960px;
 	}
 
 	.exports-header {
@@ -194,6 +551,43 @@
 	}
 
 	.btn-refresh:hover {
+		background: #3a3a5a;
+		color: #fff;
+	}
+
+	.export-item-actions {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		flex-shrink: 0;
+	}
+
+	.btn-preview {
+		background: #2a2a4a;
+		border: 1px solid #3a3a5a;
+		color: #ccc;
+		font-size: 0.65rem;
+		padding: 2px 8px;
+		border-radius: 3px;
+		cursor: pointer;
+	}
+
+	.btn-preview:hover {
+		background: #3a3a5a;
+		color: #fff;
+	}
+
+	.btn-reexport {
+		background: #2a2a4a;
+		border: 1px solid #3a3a5a;
+		color: #ccc;
+		font-size: 0.65rem;
+		padding: 2px 8px;
+		border-radius: 3px;
+		cursor: pointer;
+	}
+
+	.btn-reexport:hover {
 		background: #3a3a5a;
 		color: #fff;
 	}
@@ -333,5 +727,120 @@
 		padding: 6px 10px;
 		background: rgba(220, 38, 38, 0.08);
 		border-radius: 4px;
+	}
+
+	/* Preview */
+	.preview-container {
+		margin-top: 10px;
+		padding-top: 10px;
+		border-top: 1px solid #2a2a4a;
+	}
+
+	.preview-clip-info {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		margin-bottom: 8px;
+		font-size: 0.7rem;
+	}
+
+	.preview-clip-header {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+
+	.preview-clip-index {
+		color: #7c3aed;
+		font-weight: 600;
+		flex-shrink: 0;
+	}
+
+	.preview-clip-title {
+		color: #ccc;
+	}
+
+	.preview-clip-notes {
+		color: #666;
+		white-space: pre-wrap;
+	}
+
+	.preview-video {
+		width: 100%;
+		max-height: 540px;
+		background: #000;
+		border-radius: 4px;
+		display: block;
+	}
+
+	.preview-controls {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		margin-top: 6px;
+	}
+
+	.preview-time {
+		font-size: 0.65rem;
+		color: #888;
+		font-variant-numeric: tabular-nums;
+		font-family: monospace;
+		min-width: 3em;
+		text-align: center;
+	}
+
+	.preview-seek {
+		flex: 1;
+		height: 4px;
+		-webkit-appearance: none;
+		appearance: none;
+		background: #2a2a4a;
+		border-radius: 2px;
+		outline: none;
+		cursor: pointer;
+	}
+
+	.preview-seek::-webkit-slider-thumb {
+		-webkit-appearance: none;
+		width: 12px;
+		height: 12px;
+		border-radius: 50%;
+		background: #7c3aed;
+		cursor: pointer;
+	}
+
+	.preview-seek::-moz-range-thumb {
+		width: 12px;
+		height: 12px;
+		border-radius: 50%;
+		background: #7c3aed;
+		border: none;
+		cursor: pointer;
+	}
+
+	.preview-seek::-webkit-slider-runnable-track {
+		height: 4px;
+		border-radius: 2px;
+	}
+
+	.preview-seek::-moz-range-track {
+		height: 4px;
+		background: #2a2a4a;
+		border-radius: 2px;
+	}
+
+	.btn-ctl {
+		background: #2a2a4a;
+		border: none;
+		color: #ccc;
+		padding: 4px 10px;
+		border-radius: 4px;
+		cursor: pointer;
+		font-size: 0.75rem;
+	}
+
+	.btn-ctl:hover {
+		background: #3a3a5a;
+		color: #fff;
 	}
 </style>

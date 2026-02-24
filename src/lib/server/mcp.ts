@@ -26,7 +26,7 @@ import {
 	getStreamRecordingDir
 } from './streamManager.js';
 
-import { extractFrame, analyzeAudioLoudness } from './clipEncoder.js';
+import { extractFrame } from './clipEncoder.js';
 import { loadWatchlist, loadWordTimestamps } from './persistence.js';
 
 import {
@@ -496,12 +496,13 @@ export function createMcpServer(): McpServer {
 			const chat = getChatMessagesInRange(streamId, windowStart, windowEnd);
 			const transcriptions = getTranscriptionsInRange(streamId, windowStart, windowEnd);
 
-			// Sample chat: at most 8 messages per 1-second bucket
-			const MAX_PER_SECOND = 8;
+			// Sample chat: at most 30 messages per 5-second bucket
+			const MAX_PER_BUCKET = 30;
+			const BUCKET_SECONDS = 5;
 			const totalChat = chat.length;
 			const buckets = new Map<number, typeof chat>();
 			for (const m of chat) {
-				const key = Math.floor(m.timestamp);
+				const key = Math.floor(m.timestamp / BUCKET_SECONDS);
 				let bucket = buckets.get(key);
 				if (!bucket) {
 					bucket = [];
@@ -511,22 +512,22 @@ export function createMcpServer(): McpServer {
 			}
 			const sampled: typeof chat = [];
 			for (const [, bucket] of buckets) {
-				if (bucket.length <= MAX_PER_SECOND) {
+				if (bucket.length <= MAX_PER_BUCKET) {
 					sampled.push(...bucket);
 				} else {
 					// Always keep badged messages, fill remaining slots randomly
 					const badged = bucket.filter((m) => m.badges);
 					const unbadged = bucket.filter((m) => !m.badges);
-					if (badged.length >= MAX_PER_SECOND) {
-						// More badged than slots — shuffle and take MAX_PER_SECOND
+					if (badged.length >= MAX_PER_BUCKET) {
+						// More badged than slots — shuffle and take MAX_PER_BUCKET
 						for (let i = badged.length - 1; i > 0; i--) {
 							const j = Math.floor(Math.random() * (i + 1));
 							[badged[i], badged[j]] = [badged[j], badged[i]];
 						}
-						sampled.push(...badged.slice(0, MAX_PER_SECOND));
+						sampled.push(...badged.slice(0, MAX_PER_BUCKET));
 					} else {
 						sampled.push(...badged);
-						const remaining = MAX_PER_SECOND - badged.length;
+						const remaining = MAX_PER_BUCKET - badged.length;
 						// Fisher-Yates partial shuffle on unbadged to pick remaining random items
 						for (let i = unbadged.length - 1; i > unbadged.length - 1 - remaining; i--) {
 							const j = Math.floor(Math.random() * (i + 1));
@@ -629,6 +630,31 @@ export function createMcpServer(): McpServer {
 				if (endTime !== undefined) newEnd = anchor + endTime;
 			}
 
+			// Validate clip timestamps fall within the stream's time range
+			const streamStartEpoch = stream.startedAt / 1000;
+			const streamEndEpoch = stream.durationSeconds
+				? streamStartEpoch + stream.durationSeconds
+				: null;
+
+			if (newStart < streamStartEpoch) {
+				return {
+					isError: true,
+					content: [{
+						type: 'text' as const,
+						text: `Clip startTime (${new Date(newStart * 1000).toISOString()}) is before this stream started (${new Date(stream.startedAt).toISOString()}). Wrong streamId?`
+					}]
+				};
+			}
+			if (streamEndEpoch && newEnd > streamEndEpoch + 60) {
+				return {
+					isError: true,
+					content: [{
+						type: 'text' as const,
+						text: `Clip endTime (${new Date(newEnd * 1000).toISOString()}) is after this stream ended (${new Date(streamEndEpoch * 1000).toISOString()}). Wrong streamId?`
+					}]
+				};
+			}
+
 			try {
 				const clipData = {
 					streamId: resolvedStreamId,
@@ -671,95 +697,56 @@ export function createMcpServer(): McpServer {
 	);
 
 	// ---------------------------------------------------------------------------
-	// Tool — get_hotspots  (chat, audio, or both)
+	// Tool — get_hotspots  (chat density)
 	// ---------------------------------------------------------------------------
 
 	mcpServer.tool(
 		'get_hotspots',
-		'Find peak moments by chat density, audio loudness, or both.',
+		'Find peak moments by chat density. Accepts a single stream ID or an array. When multiple streams are provided, the top N hotspots are ranked across all streams combined.',
 		{
-			streamId: z.string().describe('Stream ID'),
-			type: z.enum(['chat', 'audio', 'both']).describe('Analysis type'),
+			streamId: z.union([z.string(), z.array(z.string())]).describe('Stream ID or array of IDs'),
 			bucketSeconds: z
 				.number()
 				.optional()
-				.describe('Bucket size in seconds (default: 30 chat, 5 audio)'),
+				.describe('Bucket size in seconds (default: 30)'),
 			topN: z.number().optional().default(10).describe('Number of hotspots (default 10)'),
 			from: z.number().optional().describe('Range start (stream-local seconds)'),
 			to: z.number().optional().describe('Range end (stream-local seconds)')
 		},
-		async ({ streamId, type, bucketSeconds, topN, from, to }) => {
-			const stream = getStream(streamId);
-			if (!stream) {
+		async ({ streamId, bucketSeconds, topN, from, to }) => {
+			const ids = Array.isArray(streamId) ? streamId : [streamId];
+			const n = topN ?? 10;
+			const chatBucket = bucketSeconds ?? 30;
+
+			const notFound = ids.filter((id) => !getStream(id));
+			if (notFound.length > 0) {
 				return {
 					isError: true,
-					content: [{ type: 'text' as const, text: `Stream "${streamId}" not found.` }]
+					content: [{ type: 'text' as const, text: `Stream(s) not found: ${notFound.join(', ')}` }]
 				};
 			}
 
-			const n = topN ?? 10;
-			const result: Record<string, unknown> = { streamId, channel: stream.channel };
+			const allBuckets: { streamId: string; channel: string; timeLocal: number; messageCount: number }[] = [];
 
-			// --- Chat hotspots ---
-			if (type === 'chat' || type === 'both') {
-				const chatBucket = bucketSeconds ?? 30;
-				const heatmap = getChatHeatmap(streamId, chatBucket);
+			for (const id of ids) {
+				const stream = getStream(id)!;
+				const heatmap = getChatHeatmap(id, chatBucket);
 				let buckets = heatmap.buckets;
 				if (from !== undefined) buckets = buckets.filter((b) => b.time >= from);
 				if (to !== undefined) buckets = buckets.filter((b) => b.time < to);
-				const sorted = [...buckets].sort((a, b) => b.count - a.count);
-				result.chat = {
-					bucketSeconds: chatBucket,
-					totalBuckets: buckets.length,
-					peakMessagesPerBucket: heatmap.max,
-					hotspots: sorted.slice(0, n).map((h) => ({ timeLocal: h.time, messageCount: h.count }))
-				};
-			}
-
-			// --- Audio hotspots ---
-			if (type === 'audio' || type === 'both') {
-				const audioBucket = bucketSeconds ?? 5;
-				const recordingDir = getStreamRecordingDir(streamId);
-				if (!recordingDir) {
-					if (type === 'audio') {
-						return {
-							isError: true,
-							content: [{ type: 'text' as const, text: `No recording directory found for stream "${streamId}".` }]
-						};
-					}
-					result.audio = { error: 'No recording directory found' };
-				} else {
-					const analysisFrom = from ?? 0;
-					const analysisTo = to ?? stream.durationSeconds ?? Number.MAX_SAFE_INTEGER;
-					try {
-						const loudness = await analyzeAudioLoudness(recordingDir, analysisFrom, analysisTo, audioBucket);
-						const sorted = [...loudness.buckets].sort((a, b) => b.rmsDb - a.rmsDb);
-						result.audio = {
-							bucketSeconds: audioBucket,
-							analyzedRange: { from: loudness.analyzedFrom, to: loudness.analyzedTo },
-							totalBuckets: loudness.buckets.length,
-							hotspots: sorted.slice(0, n).map((h) => ({
-								timeLocal: h.timeLocal,
-								rmsDb: h.rmsDb === -Infinity ? -100 : h.rmsDb,
-								peakDb: h.peakDb === -Infinity ? -100 : h.peakDb
-							}))
-						};
-					} catch (err) {
-						if (type === 'audio') {
-							return {
-								isError: true,
-								content: [
-									{
-										type: 'text' as const,
-										text: `Failed to analyze audio: ${err instanceof Error ? err.message : String(err)}`
-									}
-								]
-							};
-						}
-						result.audio = { error: `Audio analysis failed: ${err instanceof Error ? err.message : String(err)}` };
-					}
+				for (const b of buckets) {
+					allBuckets.push({ streamId: id, channel: stream.channel, timeLocal: b.time, messageCount: b.count });
 				}
 			}
+
+			allBuckets.sort((a, b) => b.messageCount - a.messageCount);
+
+			const result = {
+				streamIds: ids,
+				bucketSeconds: chatBucket,
+				totalBuckets: allBuckets.length,
+				hotspots: allBuckets.slice(0, n)
+			};
 
 			return {
 				content: [{ type: 'text' as const, text: JSON.stringify(result) }]

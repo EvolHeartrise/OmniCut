@@ -29,6 +29,7 @@ export interface ChatMessage {
 	timestamp: number; // stream-local seconds (seconds since capture startedAt)
 	color?: string | null; // user's chat color (hex string like "#FF69B4")
 	badges?: string | null; // comma-separated badge set IDs (e.g. "moderator,subscriber")
+	twitchId: string; // Twitch-assigned globally unique message ID (UUID)
 }
 
 export type ChatCallback = (streamId: string, msg: ChatMessage) => void;

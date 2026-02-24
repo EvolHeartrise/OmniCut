@@ -52,7 +52,11 @@ export async function initDatabase(): Promise<void> {
 			recording_dir TEXT NOT NULL,
 			offset REAL NOT NULL DEFAULT 0,
 			source_type TEXT NOT NULL DEFAULT 'live',
-			parent_stream_id TEXT
+			parent_stream_id TEXT,
+			platform TEXT NOT NULL DEFAULT 'twitch',
+			source_url TEXT,
+			chat_complete INTEGER NOT NULL DEFAULT 0,
+			duration_seconds REAL
 		);
 
 		CREATE TABLE IF NOT EXISTS transcriptions (
@@ -65,6 +69,18 @@ export async function initDatabase(): Promise<void> {
 		);
 
 		CREATE INDEX IF NOT EXISTS idx_transcriptions_stream ON transcriptions(stream_id);
+		CREATE INDEX IF NOT EXISTS idx_transcriptions_stream_time ON transcriptions(stream_id, start_time);
+
+		CREATE TABLE IF NOT EXISTS transcription_words (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			transcription_id INTEGER NOT NULL,
+			word TEXT NOT NULL,
+			start_time REAL NOT NULL,
+			end_time REAL NOT NULL,
+			FOREIGN KEY (transcription_id) REFERENCES transcriptions(id) ON DELETE CASCADE
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_twords_transcription ON transcription_words(transcription_id);
 
 		CREATE TABLE IF NOT EXISTS chat_messages (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,17 +88,24 @@ export async function initDatabase(): Promise<void> {
 			username TEXT NOT NULL,
 			text TEXT NOT NULL,
 			timestamp REAL NOT NULL,
+			color TEXT,
+			badges TEXT,
+			twitch_id TEXT NOT NULL,
 			FOREIGN KEY (stream_id) REFERENCES streams(id) ON DELETE CASCADE
 		);
 
 		CREATE INDEX IF NOT EXISTS idx_chat_stream ON chat_messages(stream_id);
 		CREATE INDEX IF NOT EXISTS idx_chat_stream_time ON chat_messages(stream_id, timestamp);
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_twitch_id ON chat_messages(twitch_id);
 
 		CREATE TABLE IF NOT EXISTS clip_regions (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			stream_id TEXT NOT NULL,
 			start_time REAL NOT NULL,
-			end_time REAL NOT NULL
+			end_time REAL NOT NULL,
+			created_by TEXT DEFAULT 'human',
+			title TEXT,
+			notes TEXT
 		);
 
 		CREATE INDEX IF NOT EXISTS idx_clip_stream ON clip_regions(stream_id);
@@ -104,129 +127,7 @@ export async function initDatabase(): Promise<void> {
 			added_at INTEGER NOT NULL DEFAULT (unixepoch()),
 			PRIMARY KEY (login, platform)
 		);
-	`);
 
-	// Migration: add game_name column for existing databases
-	try {
-		db.exec('ALTER TABLE streams ADD COLUMN game_name TEXT');
-	} catch {
-		// Column already exists — ignore
-	}
-
-	// Migration: add platform column for existing databases
-	try {
-		db.exec("ALTER TABLE streams ADD COLUMN platform TEXT NOT NULL DEFAULT 'twitch'");
-	} catch {
-		// Column already exists — ignore
-	}
-
-	// Migration: add source_url column for VOD deduplication
-	try {
-		db.exec('ALTER TABLE streams ADD COLUMN source_url TEXT');
-	} catch {
-		// Column already exists — ignore
-	}
-
-	// Migration: add chat_complete flag
-	try {
-		db.exec('ALTER TABLE streams ADD COLUMN chat_complete INTEGER NOT NULL DEFAULT 0');
-	} catch {
-		// Column already exists — ignore
-	}
-
-	// Migration: add unique index for chat message dedup on refetch
-	try {
-		db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_dedup ON chat_messages(stream_id, username, timestamp, text)');
-	} catch {
-		// Index already exists — ignore
-	}
-
-	// Migration: add color column for chat message user colors
-	try {
-		db.exec('ALTER TABLE chat_messages ADD COLUMN color TEXT');
-	} catch {
-		// Column already exists — ignore
-	}
-
-	// Migration: add badges column for chat message user badges
-	try {
-		db.exec('ALTER TABLE chat_messages ADD COLUMN badges TEXT');
-	} catch {
-		// Column already exists — ignore
-	}
-
-	// Migration: add composite index for time-range transcription queries
-	try {
-		db.exec('CREATE INDEX IF NOT EXISTS idx_transcriptions_stream_time ON transcriptions(stream_id, start_time)');
-	} catch {
-		// Index already exists — ignore
-	}
-
-	// Migration: add duration_seconds column for VOD duration
-	try {
-		db.exec('ALTER TABLE streams ADD COLUMN duration_seconds REAL');
-	} catch {
-		// Column already exists — ignore
-	}
-
-	// Migration: add created_by column to clip_regions for AI/human attribution
-	try {
-		db.exec("ALTER TABLE clip_regions ADD COLUMN created_by TEXT DEFAULT 'human'");
-	} catch {
-		// Column already exists — ignore
-	}
-
-	// Migration: add title and notes columns to clip_regions for metadata
-	try {
-		db.exec('ALTER TABLE clip_regions ADD COLUMN title TEXT');
-	} catch {
-		// Column already exists — ignore
-	}
-	try {
-		db.exec('ALTER TABLE clip_regions ADD COLUMN notes TEXT');
-	} catch {
-		// Column already exists — ignore
-	}
-
-	// Migration: add transcription_words table for word-level timestamps
-	db.exec(`
-		CREATE TABLE IF NOT EXISTS transcription_words (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			transcription_id INTEGER NOT NULL,
-			word TEXT NOT NULL,
-			start_time REAL NOT NULL,
-			end_time REAL NOT NULL,
-			FOREIGN KEY (transcription_id) REFERENCES transcriptions(id) ON DELETE CASCADE
-		);
-		CREATE INDEX IF NOT EXISTS idx_twords_transcription ON transcription_words(transcription_id);
-	`);
-
-	// Migration: remove ON DELETE CASCADE from clip_regions so clips survive stream deletion.
-	// SQLite doesn't support ALTER FOREIGN KEY, so we recreate the table.
-	const hasClipCascade = db.query("SELECT sql FROM sqlite_master WHERE type='table' AND name='clip_regions'").get() as {
-		sql: string;
-	} | null;
-	if (hasClipCascade?.sql?.includes('ON DELETE CASCADE')) {
-		db.exec(`
-			CREATE TABLE clip_regions_new (
-				id TEXT PRIMARY KEY,
-				stream_id TEXT NOT NULL,
-				start_time REAL NOT NULL,
-				end_time REAL NOT NULL,
-				created_by TEXT DEFAULT 'human',
-				title TEXT,
-				notes TEXT
-			);
-			INSERT INTO clip_regions_new SELECT id, stream_id, start_time, end_time, created_by, title, notes FROM clip_regions;
-			DROP TABLE clip_regions;
-			ALTER TABLE clip_regions_new RENAME TO clip_regions;
-			CREATE INDEX idx_clip_stream ON clip_regions(stream_id);
-		`);
-		console.log('[migration] Removed CASCADE from clip_regions — clips now survive stream deletion');
-	}
-
-	// Migration: add exports table
-	db.exec(`
 		CREATE TABLE IF NOT EXISTS exports (
 			id TEXT PRIMARY KEY,
 			title TEXT NOT NULL,
@@ -240,128 +141,9 @@ export async function initDatabase(): Promise<void> {
 		);
 	`);
 
-	// Migration: convert clip_regions.id from TEXT to INTEGER PRIMARY KEY AUTOINCREMENT.
-	// This also converts any non-numeric IDs (UUIDs, nanoids) to integers.
-	{
-		const schema = db
-			.query("SELECT sql FROM sqlite_master WHERE type='table' AND name='clip_regions'")
-			.get() as { sql: string } | null;
-		if (schema?.sql && !schema.sql.includes('INTEGER PRIMARY KEY')) {
-			const allRows = db
-				.query('SELECT id, stream_id, start_time, end_time, created_by, title, notes FROM clip_regions ORDER BY CAST(id AS INTEGER)')
-				.all() as { id: string; stream_id: string; start_time: number; end_time: number; created_by: string | null; title: string | null; notes: string | null }[];
-
-			// Build old→new ID map: keep numeric IDs as-is, assign new ones for non-numeric
-			const idMap = new Map<string, number>();
-			let maxNumeric = 0;
-			for (const row of allRows) {
-				const n = Number(row.id);
-				if (/^\d+$/.test(row.id) && Number.isFinite(n)) {
-					idMap.set(row.id, n);
-					if (n > maxNumeric) maxNumeric = n;
-				}
-			}
-			let nextId = maxNumeric + 1;
-			for (const row of allRows) {
-				if (!idMap.has(row.id)) {
-					idMap.set(row.id, nextId++);
-				}
-			}
-
-			db.exec('BEGIN');
-			try {
-				// 1. Recreate table with INTEGER PRIMARY KEY AUTOINCREMENT
-				db.exec(`
-					CREATE TABLE clip_regions_new (
-						id INTEGER PRIMARY KEY AUTOINCREMENT,
-						stream_id TEXT NOT NULL,
-						start_time REAL NOT NULL,
-						end_time REAL NOT NULL,
-						created_by TEXT DEFAULT 'human',
-						title TEXT,
-						notes TEXT
-					);
-				`);
-
-				const insert = db.prepare(
-					'INSERT INTO clip_regions_new (id, stream_id, start_time, end_time, created_by, title, notes) VALUES (?, ?, ?, ?, ?, ?, ?)'
-				);
-				for (const row of allRows) {
-					insert.run(idMap.get(row.id)!, row.stream_id, row.start_time, row.end_time, row.created_by, row.title, row.notes);
-				}
-
-				db.exec('DROP TABLE clip_regions');
-				db.exec('ALTER TABLE clip_regions_new RENAME TO clip_regions');
-				db.exec('CREATE INDEX idx_clip_stream ON clip_regions(stream_id)');
-
-				// 2. Update clip_ids JSON arrays in exports table
-				const exports = db
-					.prepare('SELECT id, clip_ids FROM exports')
-					.all() as { id: string; clip_ids: string }[];
-				const updateExport = db.prepare('UPDATE exports SET clip_ids = ? WHERE id = ?');
-				for (const exp of exports) {
-					const clipIds: string[] = JSON.parse(exp.clip_ids);
-					let changed = false;
-					const updatedIds = clipIds.map((cid) => {
-						const mapped = idMap.get(cid);
-						if (mapped !== undefined && String(mapped) !== cid) {
-							changed = true;
-							return String(mapped);
-						}
-						return cid;
-					});
-					if (changed) {
-						updateExport.run(JSON.stringify(updatedIds), exp.id);
-					}
-				}
-
-				// 3. Rename encoded .mp4 files on disk
-				const clipsDir = path.join(DATA_DIR, 'clips');
-				if (fs.existsSync(clipsDir)) {
-					for (const [oldId, newId] of idMap) {
-						if (oldId === String(newId)) continue;
-						const oldPath = path.join(clipsDir, `${oldId}.mp4`);
-						const newPath = path.join(clipsDir, `${newId}.mp4`);
-						if (fs.existsSync(oldPath)) {
-							fs.renameSync(oldPath, newPath);
-						}
-					}
-				}
-
-				db.exec('COMMIT');
-				console.log(`[migration] Converted clip_regions to INTEGER PRIMARY KEY AUTOINCREMENT (${allRows.length} rows)`);
-			} catch (e) {
-				db.exec('ROLLBACK');
-				throw e;
-			}
-		}
-	}
-
-	// Migration: convert UUID export IDs to nanoid
-	{
-		const { newExportId } = await import('../ids.js');
-		const rows = db
-			.query("SELECT id FROM exports WHERE id LIKE '________-____-____-____-____________'")
-			.all() as { id: string }[];
-		if (rows.length > 0) {
-			const update = db.prepare('UPDATE exports SET id = ? WHERE id = ?');
-			db.exec('BEGIN');
-			try {
-				for (const row of rows) {
-					update.run(newExportId(), row.id);
-				}
-				db.exec('COMMIT');
-				console.log(`[migration] Converted ${rows.length} UUID export IDs to nanoid`);
-			} catch (e) {
-				db.exec('ROLLBACK');
-				throw e;
-			}
-		}
-	}
-
 	// Prepare hot-path statements for better performance
 	stmtSaveChatMessage = db.prepare(
-		'INSERT OR IGNORE INTO chat_messages (stream_id, username, text, timestamp, color, badges) VALUES (?, ?, ?, ?, ?, ?)'
+		'INSERT OR IGNORE INTO chat_messages (stream_id, username, text, timestamp, color, badges, twitch_id) VALUES (?, ?, ?, ?, ?, ?, ?)'
 	);
 	stmtSaveTranscription = db.prepare(
 		'INSERT INTO transcriptions (stream_id, text, start_time, end_time) VALUES (?, ?, ?, ?)'
@@ -433,6 +215,7 @@ interface ChatRow {
 	timestamp: number;
 	color: string | null;
 	badges: string | null;
+	twitch_id: string;
 }
 
 interface ClipRow {
@@ -660,16 +443,17 @@ export function deleteTranscriptions(streamId: string): void {
 
 export function saveChatMessage(streamId: string, msg: ChatMessage): void {
 	if (stmtSaveChatMessage) {
-		stmtSaveChatMessage.run(streamId, msg.username, msg.text, msg.timestamp, msg.color ?? null, msg.badges ?? null);
+		stmtSaveChatMessage.run(streamId, msg.username, msg.text, msg.timestamp, msg.color ?? null, msg.badges ?? null, msg.twitchId);
 	} else {
 		const d = getDb();
-		d.run('INSERT OR IGNORE INTO chat_messages (stream_id, username, text, timestamp, color, badges) VALUES (?, ?, ?, ?, ?, ?)', [
+		d.run('INSERT OR IGNORE INTO chat_messages (stream_id, username, text, timestamp, color, badges, twitch_id) VALUES (?, ?, ?, ?, ?, ?, ?)', [
 			streamId,
 			msg.username,
 			msg.text,
 			msg.timestamp,
 			msg.color ?? null,
-			msg.badges ?? null
+			msg.badges ?? null,
+			msg.twitchId
 		]);
 	}
 }
@@ -681,12 +465,12 @@ export function saveChatMessagesBatch(streamId: string, messages: ChatMessage[])
 	const stmt =
 		stmtSaveChatMessage ??
 		d.prepare(
-			'INSERT OR IGNORE INTO chat_messages (stream_id, username, text, timestamp, color, badges) VALUES (?, ?, ?, ?, ?, ?)'
+			'INSERT OR IGNORE INTO chat_messages (stream_id, username, text, timestamp, color, badges, twitch_id) VALUES (?, ?, ?, ?, ?, ?, ?)'
 		);
 	d.exec('BEGIN');
 	try {
 		for (const msg of messages) {
-			stmt.run(streamId, msg.username, msg.text, msg.timestamp, msg.color ?? null, msg.badges ?? null);
+			stmt.run(streamId, msg.username, msg.text, msg.timestamp, msg.color ?? null, msg.badges ?? null, msg.twitchId);
 		}
 		d.exec('COMMIT');
 	} catch (err) {
@@ -718,22 +502,23 @@ export function loadChatMessagesInRange(
 		text: r.text,
 		timestamp: r.timestamp,
 		color: r.color ?? null,
-		badges: r.badges ?? null
+		badges: r.badges ?? null,
+		twitchId: r.twitch_id
 	});
 	if (query) {
 		// When limited, fetch the LAST N messages in the range (most recent, near the playhead)
 		const sql =
 			cap > 0
-				? 'SELECT * FROM (SELECT id, username, text, timestamp, color, badges FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? AND text LIKE ? ORDER BY timestamp DESC LIMIT ?) ORDER BY timestamp'
-				: 'SELECT id, username, text, timestamp, color, badges FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? AND text LIKE ? ORDER BY timestamp';
+				? 'SELECT * FROM (SELECT id, username, text, timestamp, color, badges, twitch_id FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? AND text LIKE ? ORDER BY timestamp DESC LIMIT ?) ORDER BY timestamp'
+				: 'SELECT id, username, text, timestamp, color, badges, twitch_id FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? AND text LIKE ? ORDER BY timestamp';
 		const params =
 			cap > 0 ? [streamId, fromTime, toTime, `%${query}%`, cap] : [streamId, fromTime, toTime, `%${query}%`];
 		return (d.query(sql).all(...params) as ChatRow[]).map(mapRow);
 	}
 	const sql =
 		cap > 0
-			? 'SELECT * FROM (SELECT id, username, text, timestamp, color, badges FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp DESC LIMIT ?) ORDER BY timestamp'
-			: 'SELECT id, username, text, timestamp, color, badges FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp';
+			? 'SELECT * FROM (SELECT id, username, text, timestamp, color, badges, twitch_id FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp DESC LIMIT ?) ORDER BY timestamp'
+			: 'SELECT id, username, text, timestamp, color, badges, twitch_id FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp';
 	const params = cap > 0 ? [streamId, fromTime, toTime, cap] : [streamId, fromTime, toTime];
 	return (d.query(sql).all(...params) as ChatRow[]).map(mapRow);
 }

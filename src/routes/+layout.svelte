@@ -16,7 +16,8 @@
 	let isClipping = $derived(pathname === '/clipping');
 
 	const tabs = [
-		{ href: '/sources', label: 'Sources' },
+		{ href: '/browse', label: 'Browse' },
+		{ href: '/library', label: 'Library' },
 		{ href: '/clipping', label: 'Clipping' },
 		{ href: '/clips', label: 'Clips' },
 		{ href: '/review', label: 'Review' },

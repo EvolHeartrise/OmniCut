@@ -39,8 +39,9 @@ export async function exportVideo(
 		}
 	}
 
-	// Wait for all clips to finish encoding
+	// Wait for all clips to finish encoding (skip failures)
 	const clipFiles: string[] = [];
+	let skipped = 0;
 	for (let i = 0; i < clips.length; i++) {
 		const clip = clips[i];
 		const dur = clip.endTime - clip.startTime;
@@ -50,7 +51,10 @@ export async function exportVideo(
 			onProgress(`Waiting for clip ${i + 1}/${clips.length} to finish encoding (${dur.toFixed(1)}s)`, i, totalSteps);
 			const finalStatus = await waitForClipReady(clip.id);
 			if (finalStatus === 'error') {
-				throw new Error(`Clip ${i + 1} failed to encode`);
+				console.warn(`Export: skipping clip ${i + 1}/${clips.length} (encode failed)`);
+				onProgress(`Skipping clip ${i + 1}/${clips.length} (encode failed)`, i, totalSteps);
+				skipped++;
+				continue;
 			}
 			encodedPath = getEncodedClipPath(clip.id);
 		} else {
@@ -58,9 +62,16 @@ export async function exportVideo(
 		}
 
 		if (!encodedPath) {
-			throw new Error(`Clip ${i + 1} has no encoded file after encoding completed`);
+			console.warn(`Export: skipping clip ${i + 1}/${clips.length} (no encoded file)`);
+			onProgress(`Skipping clip ${i + 1}/${clips.length} (no encoded file)`, i, totalSteps);
+			skipped++;
+			continue;
 		}
 		clipFiles.push(encodedPath);
+	}
+
+	if (clipFiles.length === 0) {
+		throw new Error('All clips failed to encode — nothing to export');
 	}
 
 	// Concat all pre-encoded clips with stream copy (near-instant)
@@ -75,7 +86,8 @@ export async function exportVideo(
 		const safeName = path.basename(filename).replace(/[<>:"/\\|?*]/g, '_');
 		const outputPath = path.join(EXPORTS_DIR, `${safeName}.mp4`);
 
-		onProgress(`Concatenating ${clipFiles.length} clips into ${safeName}.mp4`, clips.length, totalSteps);
+		const skipMsg = skipped > 0 ? ` (${skipped} skipped)` : '';
+		onProgress(`Concatenating ${clipFiles.length} clips into ${safeName}.mp4${skipMsg}`, clips.length, totalSteps);
 
 		// Fast concat — all clips are already encoded mp4s with consistent format
 		await runFfmpeg([

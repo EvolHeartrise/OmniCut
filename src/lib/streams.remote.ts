@@ -416,6 +416,14 @@ export const getClipEncodeStatuses = query('unchecked', async (args: { clipIds: 
 	return smGetClipEncodeStatuses(args.clipIds);
 });
 
+/** Re-export an existing export (creates a new export with the same clips/title/description). */
+export const reexportCmd = command('unchecked', async (args: { id: string }) => {
+	const existing = smLoadExport(args.id);
+	if (!existing) throw new Error('Export not found');
+	const record = createAndQueueExport(existing.clipIds, existing.title, existing.description);
+	return { exportId: record.id };
+});
+
 /** Export selected clips by IDs (in order). */
 export const exportSelectedClipsCmd = command('unchecked', async (args: { clipIds: string[]; title: string }) => {
 	if (!args.clipIds || args.clipIds.length === 0) {
