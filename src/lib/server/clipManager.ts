@@ -99,19 +99,6 @@ export function getAllClipRegions(): ClipRegion[] {
 }
 
 /**
- * Remove all clip regions for a given stream.
- * Cancels encoding for each removed clip.
- */
-export function removeClipRegionsForStream(streamId: string): void {
-	for (const [clipId, region] of clipRegionsStore) {
-		if (region.streamId === streamId) {
-			clipRegionsStore.delete(clipId);
-			cancelClipEncode(clipId);
-		}
-	}
-}
-
-/**
  * Get the count of stored clip regions.
  */
 export function getClipRegionCount(): number {

@@ -249,6 +249,8 @@ export function startCapture(
 			info.viewerCount = meta.viewerCount;
 			info.streamTitle = meta.title;
 			info.gameName = meta.gameName;
+		}).catch(() => {
+			/* will be retried by the interval above */
 		});
 	}
 

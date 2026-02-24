@@ -127,9 +127,7 @@ async function runExport(exportId: string): Promise<void> {
 	const safeName = record.title.replace(/[<>:"/\\|?*]/g, '_').slice(0, 100);
 
 	try {
-		const { outputPath } = await exportVideo(clips, safeName, (_message, _step, _totalSteps) => {
-			// Progress is already broadcast by exporter via broadcastExportProgress
-		});
+		const { outputPath } = await exportVideo(clips, safeName, () => {});
 
 		db.updateExportStatus(exportId, 'ready', outputPath);
 		broadcastExportStatus(exportId, 'ready', outputPath);

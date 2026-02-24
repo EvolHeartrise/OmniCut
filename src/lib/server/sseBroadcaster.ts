@@ -117,10 +117,6 @@ export function persistChatMessagesBatch(streamId: string, messages: ChatMessage
 	}
 }
 
-export function broadcastExportProgress(message: string, step: number, totalSteps: number) {
-	broadcast(JSON.stringify({ type: 'export-progress', message, step, totalSteps }));
-}
-
 export function broadcastTranscriptionCleared(streamId: string) {
 	broadcast(JSON.stringify({ type: 'transcription-cleared', streamId }));
 }

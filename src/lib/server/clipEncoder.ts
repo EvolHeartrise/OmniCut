@@ -61,22 +61,30 @@ export function setLookups(
 	detectNvenc = nvencFn;
 }
 
-// --- Step 1: ffprobe helpers ---
+// --- Step 1: ffprobe helper (single call for keyframes + stream params) ---
 
-interface KeyframeInfo {
+interface ClipProbeResult {
 	firstKF: number | null; // first keyframe >= startTime
 	lastKF: number | null; // last keyframe <= endTime
+	bitrate: number; // bps (default 6Mbps if unavailable)
 }
 
-async function probeKeyframes(concatPath: string, startTime: number, endTime: number): Promise<KeyframeInfo> {
+async function probeClipInfo(
+	concatPath: string,
+	startTime: number,
+	endTime: number
+): Promise<ClipProbeResult> {
+	const defaultResult: ClipProbeResult = { firstKF: null, lastKF: null, bitrate: 6_000_000 };
+
+	// Single ffprobe call: packets (keyframes) + stream params
 	const proc = Bun.spawn(
 		[
 			'ffprobe',
 			'-v', 'quiet',
 			'-select_streams', 'v:0',
-			'-show_entries', 'packet=pts_time,flags',
+			'-show_entries', 'packet=pts_time,flags:stream=bit_rate',
 			'-read_intervals', `${startTime.toFixed(3)}%${endTime.toFixed(3)}`,
-			'-of', 'csv=p=0',
+			'-of', 'json',
 			'-f', 'concat',
 			'-safe', '0',
 			'-i', concatPath
@@ -86,64 +94,35 @@ async function probeKeyframes(concatPath: string, startTime: number, endTime: nu
 
 	const stdout = await new Response(proc.stdout).text();
 	const code = await proc.exited;
-	if (code !== 0) return { firstKF: null, lastKF: null };
+	if (code !== 0) return defaultResult;
 
-	let firstKF: number | null = null;
-	let lastKF: number | null = null;
-
-	for (const line of stdout.split('\n')) {
-		const trimmed = line.trim();
-		if (!trimmed) continue;
-		// Format: pts_time,flags  e.g. "12.345,K__"
-		const parts = trimmed.split(',');
-		if (parts.length < 2) continue;
-		const pts = parseFloat(parts[0]);
-		const flags = parts[1];
-		if (isNaN(pts) || !flags.startsWith('K')) continue;
-
-		if (pts >= startTime && firstKF === null) firstKF = pts;
-		if (pts <= endTime) lastKF = pts;
+	let data: { packets?: Array<{ pts_time: string; flags: string }>; streams?: Array<{ bit_rate: string }> };
+	try {
+		data = JSON.parse(stdout);
+	} catch {
+		return defaultResult;
 	}
 
-	return { firstKF, lastKF };
-}
+	// Extract keyframes from packets
+	let firstKF: number | null = null;
+	let lastKF: number | null = null;
+	if (data.packets) {
+		for (const pkt of data.packets) {
+			const pts = parseFloat(pkt.pts_time);
+			if (isNaN(pts) || !pkt.flags?.startsWith('K')) continue;
+			if (pts >= startTime && firstKF === null) firstKF = pts;
+			if (pts <= endTime) lastKF = pts;
+		}
+	}
 
-interface StreamParams {
-	bitrate: number; // bps
-	profile: string;
-	level: string;
-}
+	// Extract bitrate from stream info
+	let bitrate = 6_000_000;
+	if (data.streams?.[0]?.bit_rate) {
+		const parsed = parseInt(data.streams[0].bit_rate, 10);
+		if (!isNaN(parsed) && parsed > 0) bitrate = parsed;
+	}
 
-async function probeStreamParams(concatPath: string): Promise<StreamParams | null> {
-	const proc = Bun.spawn(
-		[
-			'ffprobe',
-			'-v', 'quiet',
-			'-select_streams', 'v:0',
-			'-show_entries', 'stream=bit_rate,profile,level',
-			'-of', 'csv=p=0',
-			'-f', 'concat',
-			'-safe', '0',
-			'-i', concatPath
-		],
-		{ stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' }
-	);
-
-	const stdout = await new Response(proc.stdout).text();
-	const code = await proc.exited;
-	if (code !== 0) return null;
-
-	const line = stdout.trim().split('\n')[0];
-	if (!line) return null;
-	// Format: profile,level,bit_rate  e.g. "High,31,4000000"
-	const parts = line.split(',');
-	if (parts.length < 3) return null;
-
-	const profile = parts[0] || 'High';
-	const level = parts[1] || '31';
-	const bitrate = parseInt(parts[2], 10);
-
-	return { bitrate: isNaN(bitrate) ? 6_000_000 : bitrate, profile, level };
+	return { firstKF, lastKF, bitrate };
 }
 
 // --- Step 5: Consolidated ffmpeg arg builder ---
@@ -420,20 +399,21 @@ async function encodeClip(clipId: string): Promise<void> {
 		}
 
 		// --- Step 3: Smart cut ---
-		const kf = await probeKeyframes(concatPath, trimStart, trimStart + dur);
+		// Single ffprobe call for both keyframe positions and stream bitrate
+		const probe = await probeClipInfo(concatPath, trimStart, trimStart + dur);
 
 		// Minimum duration for smart cut to be worthwhile (~2 GOPs, ~4s at typical 2s GOP)
 		const MIN_SMART_CUT_DURATION = 4.0;
 		const canSmartCut =
-			kf.firstKF !== null &&
-			kf.lastKF !== null &&
-			kf.lastKF > kf.firstKF &&
+			probe.firstKF !== null &&
+			probe.lastKF !== null &&
+			probe.lastKF > probe.firstKF &&
 			dur >= MIN_SMART_CUT_DURATION;
 
 		// Check if both cut points land on keyframes (full copy)
 		const KF_TOLERANCE = 0.05; // 50ms tolerance for keyframe alignment
-		const startOnKF = kf.firstKF !== null && Math.abs(kf.firstKF - trimStart) < KF_TOLERANCE;
-		const endOnKF = kf.lastKF !== null && Math.abs(kf.lastKF - (trimStart + dur)) < KF_TOLERANCE;
+		const startOnKF = probe.firstKF !== null && Math.abs(probe.firstKF - trimStart) < KF_TOLERANCE;
+		const endOnKF = probe.lastKF !== null && Math.abs(probe.lastKF - (trimStart + dur)) < KF_TOLERANCE;
 
 		if (startOnKF && endOnKF) {
 			// Full copy — both cut points on keyframes
@@ -456,11 +436,10 @@ async function encodeClip(clipId: string): Promise<void> {
 			}
 		} else if (canSmartCut) {
 			// Smart cut — encode edges, copy middle
-			console.log(`[clip-encoder] ${clipId}: smart cut [${trimStart.toFixed(2)} → ${kf.firstKF!.toFixed(2)} | copy → ${kf.lastKF!.toFixed(2)} | → ${(trimStart + dur).toFixed(2)}]`);
+			console.log(`[clip-encoder] ${clipId}: smart cut [${trimStart.toFixed(2)} → ${probe.firstKF!.toFixed(2)} | copy → ${probe.lastKF!.toFixed(2)} | → ${(trimStart + dur).toFixed(2)}]`);
 
-			const streamParams = await probeStreamParams(concatPath);
 			// Edge bitrate = source bitrate × 1.2 to avoid visible seams
-			const edgeBitrate = streamParams ? Math.round(streamParams.bitrate * 1.2) : 6_000_000;
+			const edgeBitrate = Math.round(probe.bitrate * 1.2);
 
 			const leadPath = path.join(getClipsDir(), `${clipId}_lead.mp4`);
 			const bulkPath = path.join(getClipsDir(), `${clipId}_bulk.mp4`);
@@ -468,13 +447,13 @@ async function encodeClip(clipId: string): Promise<void> {
 			const tempFiles = [leadPath, bulkPath, trailPath];
 
 			try {
-				const hasLeading = kf.firstKF! - trimStart > KF_TOLERANCE;
-				const hasTrailing = (trimStart + dur) - kf.lastKF! > KF_TOLERANCE;
+				const hasLeading = probe.firstKF! - trimStart > KF_TOLERANCE;
+				const hasTrailing = (trimStart + dur) - probe.lastKF! > KF_TOLERANCE;
 				const partFiles: string[] = [];
 
 				// Leading edge: [trimStart → firstKF]
 				if (hasLeading) {
-					const leadDur = kf.firstKF! - trimStart;
+					const leadDur = probe.firstKF! - trimStart;
 					const leadArgs = buildEncodeArgs({
 						concatPath, seekStart: trimStart, duration: leadDur,
 						outputPath: leadPath, useNvenc, targetBitrate: edgeBitrate
@@ -484,11 +463,11 @@ async function encodeClip(clipId: string): Promise<void> {
 				}
 
 				// Bulk: stream copy [firstKF → lastKF]
-				const bulkDur = kf.lastKF! - kf.firstKF!;
+				const bulkDur = probe.lastKF! - probe.firstKF!;
 				if (bulkDur > 0) {
 					const bulkArgs = [
 						'-f', 'concat', '-safe', '0', '-i', concatPath,
-						'-ss', kf.firstKF!.toFixed(3),
+						'-ss', probe.firstKF!.toFixed(3),
 						'-t', bulkDur.toFixed(3),
 						'-map', '0:v:0', '-map', '0:a:0',
 						'-c', 'copy',
@@ -501,9 +480,9 @@ async function encodeClip(clipId: string): Promise<void> {
 
 				// Trailing edge: [lastKF → trimStart + dur]
 				if (hasTrailing) {
-					const trailDur = (trimStart + dur) - kf.lastKF!;
+					const trailDur = (trimStart + dur) - probe.lastKF!;
 					const trailArgs = buildEncodeArgs({
-						concatPath, seekStart: kf.lastKF!, duration: trailDur,
+						concatPath, seekStart: probe.lastKF!, duration: trailDur,
 						outputPath: trailPath, useNvenc, targetBitrate: edgeBitrate
 					});
 					await runFfmpeg(trailArgs, clipId);
