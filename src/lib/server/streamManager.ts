@@ -701,9 +701,10 @@ export function getTranscriptionsInRange(
 	id: string,
 	fromTime: number,
 	toTime: number,
-	query?: string
+	query?: string,
+	regex?: string
 ): Array<{ id: number; text: string; startTime: number; endTime: number }> {
-	return db.loadTranscriptionsInRange(id, fromTime, toTime, query);
+	return db.loadTranscriptionsInRange(id, fromTime, toTime, query, regex);
 }
 
 /**
@@ -714,9 +715,10 @@ export function getChatMessagesInRange(
 	fromTime: number,
 	toTime: number,
 	query?: string,
-	limit?: number
+	limit?: number,
+	regex?: string
 ): (ChatMessage & { id: number })[] {
-	return db.loadChatMessagesInRange(id, fromTime, toTime, query, limit);
+	return db.loadChatMessagesInRange(id, fromTime, toTime, query, limit, regex);
 }
 
 /**

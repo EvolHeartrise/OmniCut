@@ -1,5 +1,6 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import type { StreamInfo, ClipRegion, ChatMessage } from './types.js';
 import type { WordTimestamp } from './transcriber.js';
 
@@ -12,6 +13,7 @@ let Database: typeof import('bun:sqlite').Database;
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const DB_PATH = path.join(DATA_DIR, 'omnicut.db');
+const EXTENSIONS_DIR = path.join(DATA_DIR, 'extensions');
 
 let db: Database | null = null;
 
@@ -21,6 +23,32 @@ let stmtSaveChatMessage: Statement | null = null;
 let stmtSaveTranscription: Statement | null = null;
 let stmtSaveWord: Statement | null = null;
 let stmtSaveStream: Statement | null = null;
+
+/** Resolve the platform-specific regex0 extension path and load it. */
+function loadRegexExtension(database: Database): void {
+	const platform = os.platform();
+	const arch = os.arch();
+	let filename: string;
+	if (platform === 'win32') {
+		filename = 'regex0.dll';
+	} else if (platform === 'darwin') {
+		filename = arch === 'arm64' ? 'regex0-aarch64.dylib' : 'regex0-x86_64.dylib';
+	} else {
+		filename = 'regex0.so';
+	}
+	const extPath = path.join(EXTENSIONS_DIR, filename);
+	if (!fs.existsSync(extPath)) {
+		console.warn(`[persistence] sqlite-regex extension not found at ${extPath} — REGEXP will be unavailable`);
+		return;
+	}
+	try {
+		// loadExtension expects the path without the file extension
+		database.loadExtension(extPath.replace(/\.(dll|dylib|so)$/, ''));
+		console.log(`[persistence] Loaded sqlite-regex extension from ${filename}`);
+	} catch (err) {
+		console.warn(`[persistence] Failed to load sqlite-regex extension: ${err instanceof Error ? err.message : String(err)}`);
+	}
+}
 
 /**
  * Initialize the SQLite database, creating tables if they don't exist.
@@ -36,6 +64,9 @@ export async function initDatabase(): Promise<void> {
 	db.exec('PRAGMA journal_mode = WAL');
 	db.exec('PRAGMA synchronous = NORMAL');
 	db.exec('PRAGMA foreign_keys = ON');
+
+	// Load sqlite-regex extension for DB-side REGEXP support
+	loadRegexExtension(db);
 
 	db.exec(`
 		CREATE TABLE IF NOT EXISTS streams (
@@ -397,22 +428,24 @@ export function loadTranscriptionsInRange(
 	streamId: string,
 	fromTime: number,
 	toTime: number,
-	query?: string
+	query?: string,
+	regex?: string
 ): Array<{ id: number; text: string; startTime: number; endTime: number }> {
 	const d = getDb();
-	if (query) {
-		const rows = d
-			.query(
-				'SELECT id, text, start_time, end_time FROM transcriptions WHERE stream_id = ? AND end_time >= ? AND start_time <= ? AND text LIKE ? ORDER BY start_time'
-			)
-			.all(streamId, fromTime, toTime, `%${query}%`) as TranscriptionRow[];
-		return rows.map((r) => ({ id: r.id, text: r.text, startTime: r.start_time, endTime: r.end_time }));
+	const base = 'SELECT id, text, start_time, end_time FROM transcriptions WHERE stream_id = ? AND end_time >= ? AND start_time <= ?';
+	let sql: string;
+	let params: (string | number)[];
+	if (regex) {
+		sql = base + ' AND regexp(?, text) ORDER BY start_time';
+		params = [streamId, fromTime, toTime, regex];
+	} else if (query) {
+		sql = base + ' AND text LIKE ? ORDER BY start_time';
+		params = [streamId, fromTime, toTime, `%${query}%`];
+	} else {
+		sql = base + ' ORDER BY start_time';
+		params = [streamId, fromTime, toTime];
 	}
-	const rows = d
-		.query(
-			'SELECT id, text, start_time, end_time FROM transcriptions WHERE stream_id = ? AND end_time >= ? AND start_time <= ? ORDER BY start_time'
-		)
-		.all(streamId, fromTime, toTime) as TranscriptionRow[];
+	const rows = d.query(sql).all(...params) as TranscriptionRow[];
 	return rows.map((r) => ({ id: r.id, text: r.text, startTime: r.start_time, endTime: r.end_time }));
 }
 
@@ -492,7 +525,8 @@ export function loadChatMessagesInRange(
 	fromTime: number,
 	toTime: number,
 	query?: string,
-	limit?: number
+	limit?: number,
+	regex?: string
 ): (ChatMessage & { id: number })[] {
 	const d = getDb();
 	const cap = limit ?? 0;
@@ -505,21 +539,25 @@ export function loadChatMessagesInRange(
 		badges: r.badges ?? null,
 		twitchId: r.twitch_id
 	});
-	if (query) {
-		// When limited, fetch the LAST N messages in the range (most recent, near the playhead)
-		const sql =
-			cap > 0
-				? 'SELECT * FROM (SELECT id, username, text, timestamp, color, badges, twitch_id FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? AND text LIKE ? ORDER BY timestamp DESC LIMIT ?) ORDER BY timestamp'
-				: 'SELECT id, username, text, timestamp, color, badges, twitch_id FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? AND text LIKE ? ORDER BY timestamp';
-		const params =
-			cap > 0 ? [streamId, fromTime, toTime, `%${query}%`, cap] : [streamId, fromTime, toTime, `%${query}%`];
-		return (d.query(sql).all(...params) as ChatRow[]).map(mapRow);
+	const cols = 'id, username, text, timestamp, color, badges, twitch_id';
+	const base = `SELECT ${cols} FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ?`;
+	let filter: string;
+	let filterParams: (string | number)[];
+	if (regex) {
+		filter = ' AND regexp(?, text)';
+		filterParams = [streamId, fromTime, toTime, regex];
+	} else if (query) {
+		filter = ' AND text LIKE ?';
+		filterParams = [streamId, fromTime, toTime, `%${query}%`];
+	} else {
+		filter = '';
+		filterParams = [streamId, fromTime, toTime];
 	}
-	const sql =
-		cap > 0
-			? 'SELECT * FROM (SELECT id, username, text, timestamp, color, badges, twitch_id FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp DESC LIMIT ?) ORDER BY timestamp'
-			: 'SELECT id, username, text, timestamp, color, badges, twitch_id FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp';
-	const params = cap > 0 ? [streamId, fromTime, toTime, cap] : [streamId, fromTime, toTime];
+	// When limited, fetch the LAST N messages in the range (most recent, near the playhead)
+	const sql = cap > 0
+		? `SELECT * FROM (${base}${filter} ORDER BY timestamp DESC LIMIT ?) ORDER BY timestamp`
+		: `${base}${filter} ORDER BY timestamp`;
+	const params = cap > 0 ? [...filterParams, cap] : filterParams;
 	return (d.query(sql).all(...params) as ChatRow[]).map(mapRow);
 }
 

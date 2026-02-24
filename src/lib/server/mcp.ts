@@ -252,10 +252,14 @@ export function createMcpServer(): McpServer {
 			offset: z.number().optional().default(0).describe('Results to skip (pagination)')
 		},
 		async ({ type, ranges, query, badges, limit, offset }) => {
-			let regex: RegExp | null = null;
+			// sqlite-regex uses Rust's regex crate which is case-sensitive by default.
+			// Prepend (?i) to make the pattern case-insensitive, matching the old behaviour.
+			let regexPattern: string | undefined;
 			if (query) {
 				try {
-					regex = new RegExp(query, 'i');
+					// Validate the pattern by attempting to compile it
+					new RegExp(query, 'i');
+					regexPattern = `(?i)${query}`;
 				} catch (err) {
 					return {
 						isError: true,
@@ -274,9 +278,8 @@ export function createMcpServer(): McpServer {
 				const badgeSet = badges && badges.length > 0 ? new Set(badges) : null;
 				const results: Array<{ streamId: string; username: string; text: string; timestamp: number; badges?: string | null }> = [];
 				for (const range of ranges) {
-					const messages = getChatMessagesInRange(range.streamId, range.from, range.to);
+					const messages = getChatMessagesInRange(range.streamId, range.from, range.to, undefined, undefined, regexPattern);
 					for (const m of messages) {
-						if (regex && !regex.test(m.text)) continue;
 						if (badgeSet) {
 							const msgBadges = m.badges ? m.badges.split(',') : [];
 							if (!msgBadges.some((b) => badgeSet.has(b))) continue;
@@ -310,9 +313,8 @@ export function createMcpServer(): McpServer {
 						const s = getStream(range.streamId);
 						if (s) streamChannels.set(range.streamId, s.channel);
 					}
-					const entries = getTranscriptionsInRange(range.streamId, range.from, range.to);
+					const entries = getTranscriptionsInRange(range.streamId, range.from, range.to, undefined, regexPattern);
 					for (const e of entries) {
-						if (regex && !regex.test(e.text)) continue;
 						results.push({ streamId: range.streamId, text: e.text, startTime: e.startTime, endTime: e.endTime });
 					}
 				}
@@ -567,132 +569,141 @@ export function createMcpServer(): McpServer {
 	);
 
 	// ---------------------------------------------------------------------------
-	// Tool — upsert_clip  (mutating)
+	// Tool — upsert_clip  (mutating, supports batch)
 	// ---------------------------------------------------------------------------
+
+	const clipSchema = z.object({
+		id: z.string().optional().describe('Clip ID — omit to auto-generate'),
+		streamId: z.string().optional().describe('Stream ID (required for new clips)'),
+		startTime: z.number().optional().describe('Start time'),
+		endTime: z.number().optional().describe('End time'),
+		timeFormat: z
+			.enum(['master', 'local'])
+			.optional()
+			.default('master')
+			.describe('"master" (epoch) or "local" (stream-relative)'),
+		title: z.string().optional().describe('Clip title'),
+		notes: z.string().optional().describe('Clip notes')
+	});
+
+	type ClipInput = z.infer<typeof clipSchema>;
+
+	function upsertOneClip(input: ClipInput): { ok: true; id: string; action: string; duration: number; channel: string } | { ok: false; error: string } {
+		const { id, streamId, startTime, endTime, timeFormat, title, notes } = input;
+		const existing = id ? getAllClipRegions().find((c) => c.id === id) : undefined;
+
+		if (!id && !streamId) {
+			return { ok: false, error: 'streamId is required when creating a new clip.' };
+		}
+
+		const resolvedStreamId = streamId ?? existing?.streamId;
+		if (!resolvedStreamId) {
+			return { ok: false, error: 'streamId is required when creating a new clip.' };
+		}
+
+		const stream = getStream(resolvedStreamId);
+		if (!stream) {
+			return { ok: false, error: `Stream "${resolvedStreamId}" not found.` };
+		}
+
+		if (!existing && (startTime === undefined || endTime === undefined)) {
+			return { ok: false, error: 'startTime and endTime are required when creating a new clip.' };
+		}
+
+		let newStart = startTime ?? existing!.startTime;
+		let newEnd = endTime ?? existing!.endTime;
+
+		if (timeFormat === 'local' && (startTime !== undefined || endTime !== undefined)) {
+			const anchor = stream.startedAt / 1000;
+			if (startTime !== undefined) newStart = anchor + startTime;
+			if (endTime !== undefined) newEnd = anchor + endTime;
+		}
+
+		const streamStartEpoch = stream.startedAt / 1000;
+		const streamEndEpoch = stream.durationSeconds
+			? streamStartEpoch + stream.durationSeconds
+			: null;
+
+		if (newStart < streamStartEpoch) {
+			return { ok: false, error: `Clip startTime (${new Date(newStart * 1000).toISOString()}) is before stream start (${new Date(stream.startedAt).toISOString()}).` };
+		}
+		if (streamEndEpoch && newEnd > streamEndEpoch + 60) {
+			return { ok: false, error: `Clip endTime (${new Date(newEnd * 1000).toISOString()}) is after stream end (${new Date(streamEndEpoch * 1000).toISOString()}).` };
+		}
+
+		const clipData = {
+			streamId: resolvedStreamId,
+			startTime: newStart,
+			endTime: newEnd,
+			createdBy: (existing?.createdBy ?? 'ai') as 'human' | 'ai',
+			...(title !== undefined && { title }),
+			...(notes !== undefined && { notes })
+		};
+
+		let resolvedId: string;
+		if (existing) {
+			resolvedId = existing.id;
+			addClipRegion({ ...existing, ...clipData, id: resolvedId });
+		} else {
+			const created = createClipRegion(clipData);
+			resolvedId = created.id;
+		}
+
+		return {
+			ok: true,
+			id: resolvedId,
+			action: existing ? 'updated' : 'created',
+			duration: Math.round(newEnd - newStart),
+			channel: stream.channel
+		};
+	}
 
 	mcpServer.tool(
 		'upsert_clip',
 		'Create or update a clip. Provide streamId+startTime+endTime to create; omit to update existing fields.',
 		{
-			id: z.string().optional().describe('Clip ID — omit to auto-generate'),
-			streamId: z.string().optional().describe('Stream ID (required for new clips)'),
-			startTime: z.number().optional().describe('Start time'),
-			endTime: z.number().optional().describe('End time'),
-			timeFormat: z
-				.enum(['master', 'local'])
-				.optional()
-				.default('master')
-				.describe('"master" (epoch) or "local" (stream-relative)'),
-			title: z.string().optional().describe('Clip title'),
-			notes: z.string().optional().describe('Clip notes')
+			clips: z.array(clipSchema).min(1).describe('Clip(s) to create/update')
 		},
-		async ({ id, streamId, startTime, endTime, timeFormat, title, notes }) => {
-			const existing = id ? getAllClipRegions().find((c) => c.id === id) : undefined;
+		async (params) => {
+			const batch: ClipInput[] = params.clips;
 
-			// When updating, id is required
-			if (!id && !streamId) {
-				return {
-					isError: true,
-					content: [{ type: 'text' as const, text: 'streamId is required when creating a new clip.' }]
-				};
-			}
+			const results: string[] = [];
+			let created = 0;
+			let updated = 0;
+			let errors = 0;
 
-			// --- Resolve stream & times ---
-			const resolvedStreamId = streamId ?? existing?.streamId;
-			if (!resolvedStreamId) {
-				return {
-					isError: true,
-					content: [{ type: 'text' as const, text: 'streamId is required when creating a new clip.' }]
-				};
-			}
-
-			const stream = getStream(resolvedStreamId);
-			if (!stream) {
-				return {
-					isError: true,
-					content: [{ type: 'text' as const, text: `Stream "${resolvedStreamId}" not found.` }]
-				};
-			}
-
-			if (!existing && (startTime === undefined || endTime === undefined)) {
-				return {
-					isError: true,
-					content: [{ type: 'text' as const, text: 'startTime and endTime are required when creating a new clip.' }]
-				};
-			}
-
-			let newStart = startTime ?? existing!.startTime;
-			let newEnd = endTime ?? existing!.endTime;
-
-			if (timeFormat === 'local' && (startTime !== undefined || endTime !== undefined)) {
-				const anchor = stream.startedAt / 1000;
-				if (startTime !== undefined) newStart = anchor + startTime;
-				if (endTime !== undefined) newEnd = anchor + endTime;
-			}
-
-			// Validate clip timestamps fall within the stream's time range
-			const streamStartEpoch = stream.startedAt / 1000;
-			const streamEndEpoch = stream.durationSeconds
-				? streamStartEpoch + stream.durationSeconds
-				: null;
-
-			if (newStart < streamStartEpoch) {
-				return {
-					isError: true,
-					content: [{
-						type: 'text' as const,
-						text: `Clip startTime (${new Date(newStart * 1000).toISOString()}) is before this stream started (${new Date(stream.startedAt).toISOString()}). Wrong streamId?`
-					}]
-				};
-			}
-			if (streamEndEpoch && newEnd > streamEndEpoch + 60) {
-				return {
-					isError: true,
-					content: [{
-						type: 'text' as const,
-						text: `Clip endTime (${new Date(newEnd * 1000).toISOString()}) is after this stream ended (${new Date(streamEndEpoch * 1000).toISOString()}). Wrong streamId?`
-					}]
-				};
-			}
-
-			try {
-				const clipData = {
-					streamId: resolvedStreamId,
-					startTime: newStart,
-					endTime: newEnd,
-					createdBy: (existing?.createdBy ?? 'ai') as 'human' | 'ai',
-					...(title !== undefined && { title }),
-					...(notes !== undefined && { notes })
-				};
-
-				let resolvedId: string;
-				if (existing) {
-					resolvedId = existing.id;
-					addClipRegion({ ...existing, ...clipData, id: resolvedId });
-				} else {
-					const created = createClipRegion(clipData);
-					resolvedId = created.id;
+			for (let i = 0; i < batch.length; i++) {
+				try {
+					const result = upsertOneClip(batch[i]);
+					if (result.ok === true) {
+						if (result.action === 'created') created++;
+						else updated++;
+						results.push(`${result.action} ${result.id} (${result.duration}s on "${result.channel}")`);
+					} else {
+						errors++;
+						results.push(`[${i}] error: ${result.error}`);
+					}
+				} catch (err) {
+					errors++;
+					results.push(`[${i}] error: ${err instanceof Error ? err.message : String(err)}`);
 				}
-				const action = existing ? 'updated' : 'created';
-				return {
-					content: [
-						{
-							type: 'text' as const,
-							text: `Clip ${action}: ${resolvedId} (${Math.round(newEnd - newStart)}s on "${stream.channel}")`
-						}
-					]
-				};
-			} catch (err) {
-				return {
-					isError: true,
-					content: [
-						{
-							type: 'text' as const,
-							text: `Failed to upsert clip: ${err instanceof Error ? err.message : String(err)}`
-						}
-					]
-				};
 			}
+
+			const summary = [
+				created > 0 && `${created} created`,
+				updated > 0 && `${updated} updated`,
+				errors > 0 && `${errors} failed`
+			].filter(Boolean).join(', ');
+
+			return {
+				isError: errors > 0 && created === 0 && updated === 0,
+				content: [{
+					type: 'text' as const,
+					text: batch.length === 1
+						? (errors > 0 ? results[0] : `Clip ${results[0]}`)
+						: `${summary}\n${results.join('\n')}`
+				}]
+			};
 		}
 	);
 
@@ -702,7 +713,7 @@ export function createMcpServer(): McpServer {
 
 	mcpServer.tool(
 		'get_hotspots',
-		'Find peak moments by chat density. Accepts a single stream ID or an array. When multiple streams are provided, the top N hotspots are ranked across all streams combined.',
+		'Find peak moments by chat density. Accepts a single stream ID or an array. When multiple streams are provided, the top N hotspots are ranked across all streams combined. Each hotspot is a tuple: [streamId, channel, timeLocal, messageCount].',
 		{
 			streamId: z.union([z.string(), z.array(z.string())]).describe('Stream ID or array of IDs'),
 			bucketSeconds: z
@@ -726,7 +737,7 @@ export function createMcpServer(): McpServer {
 				};
 			}
 
-			const allBuckets: { streamId: string; channel: string; timeLocal: number; messageCount: number }[] = [];
+			const allBuckets: [string, string, number, number][] = [];
 
 			for (const id of ids) {
 				const stream = getStream(id)!;
@@ -735,11 +746,11 @@ export function createMcpServer(): McpServer {
 				if (from !== undefined) buckets = buckets.filter((b) => b.time >= from);
 				if (to !== undefined) buckets = buckets.filter((b) => b.time < to);
 				for (const b of buckets) {
-					allBuckets.push({ streamId: id, channel: stream.channel, timeLocal: b.time, messageCount: b.count });
+					allBuckets.push([id, stream.channel, b.time, b.count]);
 				}
 			}
 
-			allBuckets.sort((a, b) => b.messageCount - a.messageCount);
+			allBuckets.sort((a, b) => b[3] - a[3]);
 
 			const result = {
 				streamIds: ids,
