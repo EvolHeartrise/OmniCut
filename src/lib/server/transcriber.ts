@@ -18,7 +18,7 @@ const POOL_READY_TIMEOUT_MS = 60_000; // 1 minute max wait for pool readiness
 interface WorkerProc {
 	stdout: ReadableStream<Uint8Array>;
 	stderr: ReadableStream<Uint8Array>;
-	stdin: { write(data: string): number };
+	stdin: { write(data: string | Uint8Array): number };
 	exited: Promise<number>;
 	kill(): void;
 }
@@ -61,7 +61,8 @@ function deduplicateSentences(sentences: Sentence[]): Sentence[] {
 }
 
 interface QueueItem {
-	wavPath: string;
+	wavPath?: string;
+	pcmBuffer?: Uint8Array;
 	language: string | null;
 	task: string;
 	beamSize: number;
@@ -322,9 +323,17 @@ function processQueue(pool: Pool) {
 	const req = pool.queue.shift()!;
 	worker.busy = true;
 	workerResolvers.set(worker, { resolve: req.resolve, reject: req.reject });
-	const payload: Record<string, unknown> = { wav_path: req.wavPath, task: req.task, beam_size: req.beamSize };
+	const payload: Record<string, unknown> = { task: req.task, beam_size: req.beamSize };
+	if (req.pcmBuffer) {
+		payload.pcm_length = req.pcmBuffer.byteLength;
+	} else {
+		payload.wav_path = req.wavPath;
+	}
 	if (req.language) payload.language = req.language;
 	worker.proc.stdin.write(JSON.stringify(payload) + '\n');
+	if (req.pcmBuffer) {
+		worker.proc.stdin.write(req.pcmBuffer);
+	}
 
 	// Process more items if there are more idle workers
 	if (pool.queue.length > 0) {
@@ -334,7 +343,7 @@ function processQueue(pool: Pool) {
 
 function transcribeAudio(
 	pool: Pool,
-	wavPath: string,
+	audio: string | Uint8Array,
 	language: string | null,
 	beamSize: number = 1,
 	timeoutMs: number = QUEUE_ITEM_TIMEOUT_MS
@@ -374,7 +383,13 @@ function transcribeAudio(
 			reject(err);
 		};
 
-		pool.queue.push({ wavPath, language, task, beamSize, resolve: wrappedResolve, reject: wrappedReject });
+		const item: QueueItem = { language, task, beamSize, resolve: wrappedResolve, reject: wrappedReject };
+		if (typeof audio === 'string') {
+			item.wavPath = audio;
+		} else {
+			item.pcmBuffer = audio;
+		}
+		pool.queue.push(item);
 		processQueue(pool);
 	});
 }
@@ -430,6 +445,63 @@ async function extractAudio(recordingDir: string, segmentFiles: string[]): Promi
 		return null;
 	}
 	return wavPath;
+}
+
+/**
+ * Extract audio as raw PCM bytes in memory (for VOD pipelining).
+ * Returns a Uint8Array of s16le samples at 16kHz mono, or null on failure.
+ */
+async function extractAudioBuffer(recordingDir: string, segmentFiles: string[]): Promise<Uint8Array | null> {
+	// Unique concat list filename to avoid races during pipelining
+	const listPath = path.join(
+		recordingDir,
+		'_concat_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6) + '.txt'
+	);
+
+	const listContent = segmentFiles.map((s) => `file '${s}'`).join('\n');
+	fs.writeFileSync(listPath, listContent);
+
+	const proc = Bun.spawn(
+		[
+			'ffmpeg',
+			'-y',
+			'-f',
+			'concat',
+			'-safe',
+			'0',
+			'-i',
+			listPath,
+			'-vn',
+			'-ar',
+			'16000',
+			'-ac',
+			'1',
+			'-f',
+			's16le',
+			'pipe:1'
+		],
+		{
+			cwd: recordingDir,
+			stdin: 'ignore',
+			stdout: 'pipe',
+			stderr: 'pipe'
+		}
+	);
+
+	const [output, code] = await Promise.all([
+		new Response(proc.stdout).arrayBuffer(),
+		proc.exited
+	]);
+
+	try {
+		fs.unlinkSync(listPath);
+	} catch {}
+
+	if (code !== 0) {
+		console.warn(`[transcriber] PCM extraction failed (code ${code}) for ${recordingDir}`);
+		return null;
+	}
+	return new Uint8Array(output);
 }
 
 // --- Per-stream transcription tracking ---
@@ -674,29 +746,42 @@ async function doFullTranscription(job: VodJob): Promise<void> {
 		return;
 	}
 
-	// Process in batches to avoid creating enormous WAV files (a 35-hour recording
-	// would be ~3.76 GB as a single WAV, which can fail in ffmpeg or Whisper)
+	// Process in batches, pipelining: extract WAV for batch N+1 on disk while
+	// the GPU transcribes batch N. Only disk space is used, not RAM.
 	let totalSentences = 0;
 	let totalDuplicates = 0;
 	let pendingPartial: { text: string; startTime: number; endTime: number; words?: WordTimestamp[] } | null =
 		null;
 
+	const getBatchFiles = (idx: number) => {
+		const start = idx * VOD_BATCH_SIZE;
+		return segFiles.slice(start, Math.min(start + VOD_BATCH_SIZE, segFiles.length));
+	};
+
+	// Pre-extract batch 0
+	let pendingExtraction: Promise<string | null> = extractAudio(recordingDir, getBatchFiles(0));
+
 	for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
-		const batchStart = batchIdx * VOD_BATCH_SIZE;
-		const batchEnd = Math.min(batchStart + VOD_BATCH_SIZE, segFiles.length);
-		const batchFiles = segFiles.slice(batchStart, batchEnd);
+		const batchFiles = getBatchFiles(batchIdx);
 
-		// Compute time offset from the first segment's index
-		const firstSegIndex = parseInt(batchFiles[0].match(/\d+/)![0], 10);
-		const batchOffset = firstSegIndex * SEGMENT_DURATION;
+		// Await the extraction kicked off last iteration (or pre-loop for batch 0)
+		const wavPath = await pendingExtraction;
 
-		const wavPath = await extractAudio(recordingDir, batchFiles);
+		// Start extracting batch N+1 immediately (pipelines with GPU transcription below)
+		if (batchIdx + 1 < totalBatches) {
+			pendingExtraction = extractAudio(recordingDir, getBatchFiles(batchIdx + 1));
+		}
+
 		if (!wavPath) {
 			console.warn(
 				`[transcriber:vod] Audio extraction failed for batch ${batchIdx + 1}/${totalBatches}, skipping`
 			);
 			continue;
 		}
+
+		// Compute time offset from the first segment's index
+		const firstSegIndex = parseInt(batchFiles[0].match(/\d+/)![0], 10);
+		const batchOffset = firstSegIndex * SEGMENT_DURATION;
 
 		try {
 			const raw = await transcribeAudio(vodPool, wavPath, language, 5, VOD_QUEUE_ITEM_TIMEOUT_MS);
@@ -744,11 +829,9 @@ async function doFullTranscription(job: VodJob): Promise<void> {
 				pendingPartial = null;
 			}
 
-			if ((batchIdx + 1) % 10 === 0 || batchIdx === totalBatches - 1) {
-				console.log(
-					`[transcriber:vod] Stream ${streamId}: batch ${batchIdx + 1}/${totalBatches} (${totalSentences} sentences so far)`
-				);
-			}
+			console.log(
+				`[transcriber:vod] Stream ${streamId}: batch ${batchIdx + 1}/${totalBatches} (${totalSentences} sentences so far)`
+			);
 		} catch (err) {
 			console.warn(
 				`[transcriber:vod] Batch ${batchIdx + 1}/${totalBatches} failed for stream ${streamId}: ${err instanceof Error ? err.message : err}`

@@ -1,6 +1,6 @@
 """
 Long-running transcription worker for OmniCut.
-Loads Whisper models once, then processes WAV files streamed via stdin.
+Loads Whisper models once, then processes audio via stdin.
 
 Models:
   - small.en  — loaded eagerly; used for English streams (better accuracy)
@@ -13,9 +13,14 @@ Device:
 Protocol:
   - On startup, prints {"device": "cuda"|"cpu"} indicating which backend.
   - Prints {"ready": true} when the English model is loaded.
-  - Reads one JSON object per line from stdin:
-    {"wav_path": "...", "language": "ja", "task": "translate"}
-    language/task are optional; defaults to English transcription.
+  - Reads one JSON object per line from stdin (binary-safe via stdin.buffer).
+  - Two input modes:
+    1. File mode: {"wav_path": "...", "task": "transcribe", "beam_size": 1}
+    2. PCM mode:  {"pcm_length": 12345, "task": "transcribe", "beam_size": 5}
+       Immediately after the JSON line, sends `pcm_length` raw bytes of
+       s16le 16kHz mono PCM. The worker reads them, converts to float32,
+       and passes the numpy array directly to Whisper (no disk I/O).
+  - language/task are optional; defaults to English transcription.
   - Prints {"sentences": [{"text": "...", "start": 0.0, "end": 1.5}, ...]} JSON
     with per-sentence timestamps derived from word-level timestamps.
 """
@@ -23,6 +28,7 @@ Protocol:
 import sys
 import json
 import os
+import numpy as np
 
 def _add_cuda_dll_paths():
     """Add NVIDIA pip-installed CUDA library paths so CTranslate2 can find them."""
@@ -67,19 +73,47 @@ def main():
     batched_multi = None
     print(json.dumps({"ready": True}), flush=True)
 
-    for line in sys.stdin:
-        raw = line.strip()
+    stdin = sys.stdin.buffer  # binary mode for PCM support
+    while True:
+        raw_line = stdin.readline()
+        if not raw_line:
+            break  # EOF
+        raw = raw_line.strip()
         if not raw:
             continue
         try:
             req = json.loads(raw)
-            wav_path = req["wav_path"]
             language = req.get("language")
             task = req.get("task", "transcribe")
             beam_size = req.get("beam_size", 1)
+            pcm_length = req.get("pcm_length")
+            wav_path = req.get("wav_path")
         except (json.JSONDecodeError, KeyError):
             print(json.dumps({"sentences": [], "error": "invalid JSON input"}), flush=True)
             continue
+
+        # Read PCM binary data if specified
+        audio_input = None
+        if pcm_length is not None:
+            pcm_data = b""
+            remaining = pcm_length
+            while remaining > 0:
+                chunk = stdin.read(remaining)
+                if not chunk:
+                    break
+                pcm_data += chunk
+                remaining -= len(chunk)
+            if len(pcm_data) != pcm_length:
+                print(json.dumps({"sentences": [], "error": f"PCM read error: expected {pcm_length} bytes, got {len(pcm_data)}"}), flush=True)
+                continue
+            # Convert s16le PCM to float32 numpy array (what faster-whisper expects)
+            audio_input = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32) / 32768.0
+        elif wav_path:
+            audio_input = wav_path
+        else:
+            print(json.dumps({"sentences": [], "error": "missing wav_path or pcm_length"}), flush=True)
+            continue
+
         try:
             use_english = not language or language == "en"
             if use_english:
@@ -101,7 +135,7 @@ def main():
                 task=task,
                 language="en" if use_english else language,
             )
-            segments, _ = batched.transcribe(wav_path, batch_size=4, **transcribe_kwargs)
+            segments, _ = batched.transcribe(audio_input, batch_size=4, **transcribe_kwargs)
             # Collect all words across segments
             words = []
             for seg in segments:
