@@ -37,9 +37,10 @@ interface EncodeEntry {
 
 const encodeStatus = new Map<string, EncodeEntry>();
 const queue: string[] = [];
-const activeEncodes = new Map<string, { proc: Subprocess }>();
-const MAX_CONCURRENT_NVENC = 4;
+const activeEncodes = new Map<string, { proc: Subprocess | null }>();
+const MAX_CONCURRENT_NVENC = 2;
 const MAX_CONCURRENT_CPU = 1;
+let cachedNvenc: boolean | null = null;
 
 // Injected lookups — set via setLookups() from streamManager init
 let lookupClip: (id: string) => ClipRegion | undefined;
@@ -211,7 +212,7 @@ export function enqueueClipEncode(clipId: string): void {
 	// If actively encoding this clip, kill it — it'll be re-queued
 	const active = activeEncodes.get(clipId);
 	if (active) {
-		active.proc.kill();
+		active.proc?.kill();
 		activeEncodes.delete(clipId);
 	}
 
@@ -242,7 +243,7 @@ export function cancelClipEncode(clipId: string): void {
 	// Kill if actively encoding
 	const active = activeEncodes.get(clipId);
 	if (active) {
-		active.proc.kill();
+		active.proc?.kill();
 		activeEncodes.delete(clipId);
 		processQueue();
 	}
@@ -331,7 +332,7 @@ export function restoreEncodeState(clipIds: string[]): void {
  */
 export function shutdownEncoder(): void {
 	for (const [, { proc }] of activeEncodes) {
-		proc.kill();
+		proc?.kill();
 	}
 	activeEncodes.clear();
 	queue.length = 0;
@@ -340,14 +341,12 @@ export function shutdownEncoder(): void {
 // --- Internal ---
 
 function processQueue(): void {
-	const useNvencCached = detectNvenc();
-	// We can't synchronously know NVENC status, so use a safe default
-	// and let the actual encode function handle it properly.
-	// For concurrency limit, we check optimistically.
-	const maxConcurrent = MAX_CONCURRENT_NVENC; // worst-case is launching 4; if CPU, jobs are light enough
+	const maxConcurrent = cachedNvenc === false ? MAX_CONCURRENT_CPU : MAX_CONCURRENT_NVENC;
 
 	while (activeEncodes.size < maxConcurrent && queue.length > 0) {
 		const clipId = queue.shift()!;
+		// Reserve the slot immediately so the next iteration sees the correct size
+		activeEncodes.set(clipId, { proc: null });
 		encodeClip(clipId);
 	}
 }
@@ -414,6 +413,11 @@ async function encodeClip(clipId: string): Promise<void> {
 		const trimStart = Math.max(0, localStart - segGroupStart);
 
 		const useNvenc = await detectNvenc();
+		if (cachedNvenc === null) {
+			cachedNvenc = useNvenc;
+			// Now that we know the real limit, drain excess slots won't help
+			// (already launched), but future processQueue calls will be correct.
+		}
 
 		// --- Step 3: Smart cut ---
 		const kf = await probeKeyframes(concatPath, trimStart, trimStart + dur);
