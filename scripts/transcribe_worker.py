@@ -135,7 +135,7 @@ def main():
                 task=task,
                 language="en" if use_english else language,
             )
-            segments, _ = batched.transcribe(audio_input, batch_size=4, **transcribe_kwargs)
+            segments, _ = batched.transcribe(audio_input, batch_size=8, **transcribe_kwargs)
             # Collect all words across segments
             words = []
             for seg in segments:

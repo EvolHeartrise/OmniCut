@@ -397,26 +397,22 @@ function transcribeAudio(
 // --- Audio extraction (ffmpeg via Bun.spawn) ---
 
 async function extractAudio(recordingDir: string, segmentFiles: string[]): Promise<string | null> {
-	const listPath = path.join(recordingDir, '_concat.txt');
 	const wavPath = path.join(
 		recordingDir,
 		'_transcribe_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6) + '.wav'
 	);
 
-	// Write concat file list (relative filenames, ffmpeg runs with cwd=recordingDir)
-	const listContent = segmentFiles.map((s) => `file '${s}'`).join('\n');
-	fs.writeFileSync(listPath, listContent);
-
+	// Pipe raw .ts bytes into ffmpeg as a single continuous MPEG-TS stream.
+	// This avoids the concat demuxer's per-file probe overhead (open + format
+	// detection × thousands of segments) by letting ffmpeg probe once.
 	const proc = Bun.spawn(
 		[
 			'ffmpeg',
 			'-y',
 			'-f',
-			'concat',
-			'-safe',
-			'0',
+			'mpegts',
 			'-i',
-			listPath,
+			'pipe:0',
 			'-vn',
 			'-ar',
 			'16000',
@@ -428,17 +424,20 @@ async function extractAudio(recordingDir: string, segmentFiles: string[]): Promi
 		],
 		{
 			cwd: recordingDir,
-			stdin: 'ignore',
+			stdin: 'pipe',
 			stdout: 'pipe',
 			stderr: 'pipe'
 		}
 	);
 
-	const code = await proc.exited;
+	// Stream each .ts file into ffmpeg's stdin sequentially
+	for (const seg of segmentFiles) {
+		const data = await Bun.file(path.join(recordingDir, seg)).arrayBuffer();
+		proc.stdin.write(new Uint8Array(data));
+	}
+	proc.stdin.end();
 
-	try {
-		fs.unlinkSync(listPath);
-	} catch {}
+	const code = await proc.exited;
 
 	if (code !== 0) {
 		console.warn(`[transcriber] Audio extraction failed (code ${code}) for ${recordingDir}`);
