@@ -75,7 +75,11 @@ export async function exportVideo(
 		throw new Error('All clips failed to encode — nothing to export');
 	}
 
-	// Concat all pre-encoded clips with stream copy (near-instant)
+	// Probe first clip for resolution and framerate
+	const probe = await probeVideo(clipFiles[0]);
+	const needsUpscale = probe.height > 0 && probe.height < 1080;
+	const useNvenc = await detectNvenc();
+
 	const tempDir = path.join(EXPORTS_DIR, `temp_${Date.now()}`);
 	fs.mkdirSync(tempDir, { recursive: true });
 
@@ -88,22 +92,52 @@ export async function exportVideo(
 		const outputPath = path.join(EXPORTS_DIR, `${safeName}.mp4`);
 
 		const skipMsg = skipped > 0 ? ` (${skipped} skipped)` : '';
-		onProgress(`Concatenating ${clipFiles.length} clips into ${safeName}.mp4${skipMsg}`, clips.length, totalSteps);
+		const scaleLabel = needsUpscale ? `Upscaling ${probe.height}p → 1080p and encoding` : 'Encoding';
+		onProgress(`${scaleLabel} ${clipFiles.length} clips${skipMsg}`, clips.length, totalSteps);
 
-		// Fast concat — all clips are already encoded mp4s with consistent format
+		// Full re-encode: guarantees CFR, closed GOPs, and clean timestamps
+		// for YouTube compatibility. No stream copy — eliminates all sources of
+		// VFR, timestamp discontinuities, and AAC priming gaps.
+		const vf = needsUpscale ? 'scale=-2:1080:flags=lanczos,format=yuv420p' : 'format=yuv420p';
+		const fps = probe.fps > 0 ? probe.fps : 30;
+		const gop = Math.round(fps * 2); // 2-second keyframe interval
+
+		let videoArgs: string[];
+		if (useNvenc) {
+			videoArgs = [
+				'-vf', vf,
+				'-c:v', 'h264_nvenc',
+				'-preset', 'p4',
+				'-profile:v', 'high',
+				'-qp', '18',
+				'-rc-lookahead', '32',
+				'-bf', '2',
+				'-g', `${gop}`,
+				'-flags', '+cgop'
+			];
+		} else {
+			videoArgs = [
+				'-vf', vf,
+				'-c:v', 'libx264',
+				'-preset', 'medium',
+				'-profile:v', 'high',
+				'-crf', '18',
+				'-bf', '2',
+				'-g', `${gop}`,
+				'-flags', '+cgop'
+			];
+		}
+
 		await runFfmpeg([
-			'-f',
-			'concat',
-			'-safe',
-			'0',
-			'-i',
-			concatListPath,
-			'-c',
-			'copy',
-			'-movflags',
-			'+faststart',
-			'-y',
-			outputPath
+			'-fflags', '+genpts',
+			'-f', 'concat', '-safe', '0', '-i', concatListPath,
+			...videoArgs,
+			'-fps_mode', 'cfr',
+			'-r', `${fps}`,
+			'-af', 'aresample=async=1000:first_pts=0',
+			'-c:a', 'aac', '-ar', '48000', '-b:a', '192k',
+			'-movflags', '+faststart',
+			'-y', outputPath
 		], 1000);
 
 		onProgress(`Done — saved to ${outputPath}`, totalSteps, totalSteps);
@@ -114,6 +148,32 @@ export async function exportVideo(
 		} catch {
 			/* best effort */
 		}
+	}
+}
+
+/** Probe a video file's height and framerate. */
+async function probeVideo(filePath: string): Promise<{ height: number; fps: number }> {
+	try {
+		const proc = Bun.spawn(
+			['ffprobe', '-v', 'quiet', '-select_streams', 'v:0',
+				'-show_entries', 'stream=height,r_frame_rate', '-of', 'json', filePath],
+			{ stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' }
+		);
+		const stdout = await new Response(proc.stdout).text();
+		const code = await proc.exited;
+		if (code !== 0) return { height: 0, fps: 0 };
+		const data = JSON.parse(stdout);
+		const stream = data.streams?.[0];
+		const height = parseInt(stream?.height, 10) || 0;
+		// r_frame_rate is a fraction like "30/1" or "60000/1001"
+		let fps = 0;
+		if (stream?.r_frame_rate) {
+			const [num, den] = stream.r_frame_rate.split('/').map(Number);
+			if (den > 0) fps = Math.round(num / den);
+		}
+		return { height, fps };
+	} catch {
+		return { height: 0, fps: 0 };
 	}
 }
 

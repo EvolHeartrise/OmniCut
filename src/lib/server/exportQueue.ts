@@ -92,6 +92,27 @@ export function loadAllExports(): ExportRecord[] {
 	return db.loadAllExports();
 }
 
+/**
+ * Re-queue an existing export in place. Resets status to pending,
+ * cleans up any previous output file, and enqueues for processing.
+ */
+export function requeueExport(id: string): void {
+	const record = db.loadExport(id);
+	if (!record) throw new Error('Export not found');
+	if (activeExport?.exportId === id) {
+		throw new Error('Cannot re-queue an export that is currently in progress');
+	}
+	// Remove from queue if already pending
+	const idx = queue.indexOf(id);
+	if (idx !== -1) queue.splice(idx, 1);
+	// Clean up previous output
+	if (record.outputPath) cleanupFiles(record.outputPath);
+	// Reset status
+	db.updateExportStatus(id, 'pending', undefined, undefined);
+	broadcastExportStatus(id, 'pending');
+	queueExport(id);
+}
+
 export function deleteExport(id: string): void {
 	if (activeExport?.exportId === id) {
 		throw new Error('Cannot delete an export that is currently in progress');

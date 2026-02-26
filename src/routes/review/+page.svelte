@@ -13,12 +13,22 @@
 	import { getClipEncodeStatuses, getMultiStreamTranscriptions } from '$lib/streams.remote';
 	import { splitClipRegion } from '$lib/clipActions.js';
 	import { untrack } from 'svelte';
+	import { page } from '$app/state';
 
-	// --- Current clip under review (oldest AI clip) ---
+	// --- URL-targeted clip (e.g. /review?clip=123) ---
+	let urlClipId = $derived(page.url.searchParams.get('clip'));
+	let urlClip = $derived<ClipRegion | null>(
+		urlClipId ? $clipRegions.find((c) => c.id === urlClipId) ?? null : null
+	);
+
+	// --- AI review queue (oldest AI clip first) ---
 	let aiClips = $derived(
 		[...$clipRegions].filter((c) => c.createdBy === 'ai').sort((a, b) => a.startTime - b.startTime)
 	);
-	let currentClip = $derived<ClipRegion | null>(aiClips[0] ?? null);
+
+	// URL clip takes priority, otherwise fall back to AI queue
+	let currentClip = $derived<ClipRegion | null>(urlClip ?? aiClips[0] ?? null);
+	let isUrlMode = $derived(urlClip !== null);
 
 	// --- Delete confirmation ---
 	let deleteConfirmId = $state<string | null>(null);
@@ -712,9 +722,15 @@
 <main class="review-page">
 	{#if !currentClip}
 		<div class="empty-state">
-			<div class="empty-icon">&#10003;</div>
-			<p>No AI clips to review</p>
-			<p class="empty-hint">AI-created clips will appear here for your review</p>
+			{#if urlClipId}
+				<div class="empty-icon">?</div>
+				<p>Clip not found</p>
+				<p class="empty-hint">No clip with ID "{urlClipId}"</p>
+			{:else}
+				<div class="empty-icon">&#10003;</div>
+				<p>No AI clips to review</p>
+				<p class="empty-hint">AI-created clips will appear here for your review</p>
+			{/if}
 			{#if undoStack.length > 0}
 				<button class="btn-action btn-undo empty-undo" onclick={applyUndo} title="Undo (Ctrl+Z)">
 					&#8630; Undo<span class="undo-count">{undoStack.length}</span>
@@ -728,7 +744,13 @@
 		{@const badge = encodeStatusInfo(encStatus)}
 		{@const isEditing = editingId === clip.id}
 
-		<div class="review-counter">{aiClips.length} clip{aiClips.length !== 1 ? 's' : ''} to review</div>
+		<div class="review-counter">
+			{#if isUrlMode}
+				Editing clip {clip.id}
+			{:else}
+				{aiClips.length} clip{aiClips.length !== 1 ? 's' : ''} to review
+			{/if}
+		</div>
 
 		<div class="review-card">
 			<!-- Video preview -->
@@ -802,7 +824,7 @@
 				{:else}
 					<div class="clip-header">
 						<span class="clip-channel">{clipChannel(clip)}</span>
-						<span class="clip-badge ai">AI</span>
+						<span class="clip-badge" class:ai={clip.createdBy === 'ai'}>{clip.createdBy === 'ai' ? 'AI' : 'Human'}</span>
 						<span class="encode-badge {badge.cls}">{badge.label}</span>
 					</div>
 					<div class="clip-title">{clip.title || 'Untitled'}</div>
@@ -1047,6 +1069,11 @@
 		border-radius: 3px;
 		text-transform: uppercase;
 		letter-spacing: 0.03em;
+	}
+
+	.clip-badge {
+		background: #1e3a2e;
+		color: #4ade80;
 	}
 
 	.clip-badge.ai {

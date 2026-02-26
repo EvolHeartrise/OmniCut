@@ -143,6 +143,7 @@ function buildEncodeArgs(opts: EncodeOpts): string[] {
 
 	const input = [
 		...(useNvenc ? ['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'] : []),
+		'-fflags', '+genpts',
 		'-f', 'concat',
 		'-safe', '0',
 		'-i', concatPath,
@@ -171,7 +172,10 @@ function buildEncodeArgs(opts: EncodeOpts): string[] {
 	return [
 		...input,
 		...videoArgs,
+		'-fps_mode', 'cfr',
+		'-af', 'aresample=async=1000:first_pts=0',
 		'-c:a', 'aac',
+		'-ar', '48000',
 		'-b:a', '192k',
 		'-video_track_timescale', '90000',
 		'-movflags', '+faststart',
@@ -393,14 +397,17 @@ async function encodeClip(clipId: string): Promise<void> {
 		const endOnKF = probe.lastKF !== null && Math.abs(probe.lastKF - (trimStart + dur)) < KF_TOLERANCE;
 
 		if (startOnKF && endOnKF) {
-			// Full copy — both cut points on keyframes
-			console.log(`[clip-encoder] ${clipId}: full stream copy (both cuts on keyframes)`);
+			// Video copy + audio re-encode (clean up live-stream audio timestamps for YouTube)
+			console.log(`[clip-encoder] ${clipId}: stream copy video, re-encode audio (both cuts on keyframes)`);
 			const args = [
+				'-fflags', '+genpts',
 				'-f', 'concat', '-safe', '0', '-i', concatPath,
 				'-ss', trimStart.toFixed(3),
 				'-t', dur.toFixed(3),
 				'-map', '0:v:0', '-map', '0:a:0',
-				'-c', 'copy',
+				'-c:v', 'copy',
+				'-af', 'aresample=async=1000:first_pts=0',
+				'-c:a', 'aac', '-ar', '48000', '-b:a', '192k',
 				'-video_track_timescale', '90000',
 				'-movflags', '+faststart',
 				'-y', outputPath
@@ -440,15 +447,18 @@ async function encodeClip(clipId: string): Promise<void> {
 					partFiles.push(leadPath);
 				}
 
-				// Bulk: stream copy [firstKF → lastKF]
+				// Bulk: video copy + audio re-encode [firstKF → lastKF]
 				const bulkDur = probe.lastKF! - probe.firstKF!;
 				if (bulkDur > 0) {
 					const bulkArgs = [
+						'-fflags', '+genpts',
 						'-f', 'concat', '-safe', '0', '-i', concatPath,
 						'-ss', probe.firstKF!.toFixed(3),
 						'-t', bulkDur.toFixed(3),
 						'-map', '0:v:0', '-map', '0:a:0',
-						'-c', 'copy',
+						'-c:v', 'copy',
+						'-af', 'aresample=async=1000:first_pts=0',
+						'-c:a', 'aac', '-ar', '48000', '-b:a', '192k',
 						'-video_track_timescale', '90000',
 						'-movflags', '+faststart',
 						'-y', bulkPath
@@ -478,7 +488,10 @@ async function encodeClip(clipId: string): Promise<void> {
 					try {
 						const concatArgs = [
 							'-f', 'concat', '-safe', '0', '-i', partsConcatPath,
-							'-c', 'copy',
+							'-c:v', 'copy',
+							'-af', 'aresample=async=1000:first_pts=0',
+							'-c:a', 'aac', '-ar', '48000', '-b:a', '192k',
+							'-max_interleave_delta', '0',
 							'-movflags', '+faststart',
 							'-y', outputPath
 						];

@@ -2,7 +2,7 @@
 	import { onMount } from 'svelte';
 	import { page } from '$app/state';
 	import type { Snippet } from 'svelte';
-	import { refreshStreams, connectSSE, streams, transcriptPanelOpen, chatPanelOpen } from '$lib/stores/streams.js';
+	import { refreshStreams, connectSSE } from '$lib/stores/streams.js';
 
 	let { children }: { children: Snippet } = $props();
 
@@ -13,7 +13,6 @@
 	});
 
 	let pathname = $derived(page.url.pathname);
-	let isClipping = $derived(pathname === '/clipping');
 
 	const tabs = [
 		{ href: '/browse', label: 'Browse' },
@@ -22,6 +21,7 @@
 		{ href: '/clips', label: 'Clips' },
 		{ href: '/review', label: 'Review' },
 		{ href: '/exports', label: 'Exports' },
+		{ href: '/thumbnail', label: 'Thumbnail' },
 		{ href: '/upload', label: 'Upload' }
 	];
 </script>
@@ -37,22 +37,6 @@
 				<a class="mode-tab" class:active={pathname === tab.href} href={tab.href}>{tab.label}</a>
 			{/each}
 		</nav>
-		<div class="header-info">
-			<span class="stream-count">{$streams.length} streams</span>
-			{#if isClipping}
-				<button
-					class="btn-tool"
-					class:btn-tool-active={$transcriptPanelOpen}
-					onclick={() => ($transcriptPanelOpen = !$transcriptPanelOpen)}>Transcript</button
-				>
-				<button
-					class="btn-tool"
-					class:btn-tool-active={$chatPanelOpen}
-					onclick={() => ($chatPanelOpen = !$chatPanelOpen)}>Chat</button
-				>
-			{/if}
-			<span class="shortcut-hint">1-6: Focus | Esc: Unfocus | T (hold): Clip transcript | P: Transcript | C: Chat</span>
-		</div>
 	</header>
 
 	{@render children()}
@@ -92,14 +76,6 @@
 		gap: 8px;
 	}
 
-	.header-info {
-		display: flex;
-		align-items: center;
-		gap: 16px;
-		flex-shrink: 0;
-		margin-left: auto;
-	}
-
 	.mode-tabs {
 		display: flex;
 		gap: 2px;
@@ -132,46 +108,6 @@
 	.mode-tab.active {
 		background: #7c3aed;
 		color: #fff;
-	}
-
-	.stream-count {
-		font-size: 0.8rem;
-		color: #888;
-	}
-
-	.btn-tool {
-		background: #1a1a2e;
-		border: 1px solid #2a2a3e;
-		color: #aaa;
-		font-size: 0.7rem;
-		padding: 3px 10px;
-		border-radius: 4px;
-		cursor: pointer;
-		transition:
-			background 0.15s,
-			color 0.15s;
-	}
-
-	.btn-tool:hover {
-		background: #2a2a4e;
-		color: #ddd;
-	}
-
-	.btn-tool-active {
-		background: #7c3aed;
-		color: #fff;
-		border-color: #7c3aed;
-	}
-
-	.btn-tool-active:hover {
-		background: #6d28d9;
-		color: #fff;
-	}
-
-	.shortcut-hint {
-		font-size: 0.7rem;
-		color: #444;
-		font-family: monospace;
 	}
 
 	:global(.main-content) {

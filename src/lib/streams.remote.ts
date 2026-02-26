@@ -19,6 +19,7 @@ import {
 	getChatMessagesInRange as smGetChatMessagesInRange,
 	getTranscriptionsInRange as smGetTranscriptionsInRange,
 	createAndQueueExport,
+	requeueExport as smRequeueExport,
 	loadAllExports as smLoadAllExports,
 	loadExport as smLoadExport,
 	deleteExport as smDeleteExport,
@@ -417,12 +418,10 @@ export const getClipEncodeStatuses = query('unchecked', async (args: { clipIds: 
 	return smGetClipEncodeStatuses(args.clipIds);
 });
 
-/** Re-export an existing export (creates a new export with the same clips/title/description). */
+/** Re-export an existing export in place (resets status and re-queues). */
 export const reexportCmd = command('unchecked', async (args: { id: string }) => {
-	const existing = smLoadExport(args.id);
-	if (!existing) throw new Error('Export not found');
-	const record = createAndQueueExport(existing.clipIds, existing.title, existing.description);
-	return { exportId: record.id };
+	smRequeueExport(args.id);
+	return { exportId: args.id };
 });
 
 /** Delete an export by ID (removes DB record and output file). */
@@ -523,6 +522,96 @@ export const youtubeUploadCmd = command(
 export const youtubeDeleteUploadCmd = command('unchecked', async (args: { id: string }) => {
 	const { deleteUpload } = await import('$lib/server/youtubeUploadQueue.js');
 	deleteUpload(args.id);
+	return { success: true };
+});
+
+// ---------------------------------------------------------------------------
+// Queries — Thumbnails
+// ---------------------------------------------------------------------------
+
+/** Get thumbnail for an export. */
+export const getThumbnailByExportCmd = query('unchecked', async (args: { exportId: string }) => {
+	const { loadThumbnailByExport } = await import('$lib/server/persistence.js');
+	return { thumbnail: loadThumbnailByExport(args.exportId) };
+});
+
+/** Check if AI (Gemini) is configured. */
+export const isAIConfiguredCmd = query(async () => {
+	const { isAIConfigured } = await import('$lib/server/thumbnailStore.js');
+	return { configured: isAIConfigured() };
+});
+
+// ---------------------------------------------------------------------------
+// Commands — Thumbnails
+// ---------------------------------------------------------------------------
+
+/** Save a thumbnail PNG for an export. */
+export const saveThumbnailCmd = command('unchecked', async (args: {
+	exportId: string;
+	pngBase64: string;
+	width?: number;
+	height?: number;
+	layers?: Array<
+		| {
+			id: string; type: 'text';
+			text: string; x: number; y: number;
+			fontSize: number; fontFamily: string; color: string;
+			strokeColor?: string; strokeWidth?: number; rotation?: number; scaleX?: number; scaleY?: number;
+			cropX?: number; cropY?: number; cropW?: number; cropH?: number;
+			shadow?: { color: string; blur: number; offsetX: number; offsetY: number };
+		}
+		| {
+			id: string; type: 'image';
+			x: number; y: number;
+			rotation?: number; scaleX?: number; scaleY?: number;
+			opacity?: number;
+			cropX?: number; cropY?: number; cropW?: number; cropH?: number;
+			streamId?: string; timestamp?: number;
+			dataUrl?: string;
+			naturalWidth: number; naturalHeight: number;
+		}
+		| {
+			id: string; type: 'effect';
+			kind: 'blur' | 'ai';
+			blurRadius?: number;
+			prompt?: string;
+		}
+	>;
+}) => {
+	const { saveThumbnailFromPng } = await import('$lib/server/thumbnailStore.js');
+	const pngBuffer = Buffer.from(args.pngBase64, 'base64');
+	const record = saveThumbnailFromPng(args.exportId, pngBuffer, {
+		width: args.width,
+		height: args.height,
+		layers: args.layers
+	});
+	return record;
+});
+
+/** Enhance a thumbnail with AI (Gemini). */
+export const enhanceThumbnailCmd = command('unchecked', async (args: {
+	thumbnailId: string;
+	prompt: string;
+	conversationHistory?: Array<{ role: 'user' | 'model'; text?: string; imageBase64?: string }>;
+}) => {
+	const { enhanceWithAI } = await import('$lib/server/thumbnailStore.js');
+	return await enhanceWithAI(args.thumbnailId, args.prompt, args.conversationHistory);
+});
+
+/** Run Nano Banana Pro AI edit on a raw PNG (stateless, no disk I/O). */
+export const aiEditImageCmd = command('unchecked', async (args: {
+	pngBase64: string;
+	prompt: string;
+}) => {
+	const { aiEditImage } = await import('$lib/server/thumbnailStore.js');
+	const resultBase64 = await aiEditImage(args.pngBase64, args.prompt);
+	return { pngBase64: resultBase64 };
+});
+
+/** Delete a thumbnail. */
+export const deleteThumbnailCmd = command('unchecked', async (args: { id: string }) => {
+	const { deleteThumbnailById } = await import('$lib/server/thumbnailStore.js');
+	deleteThumbnailById(args.id);
 	return { success: true };
 });
 

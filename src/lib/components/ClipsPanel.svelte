@@ -572,6 +572,9 @@
 									<button class="btn-icon" onclick={() => openPreview(clip)} title="Preview">
 										{isPreviewing ? '✕' : '▶'}
 									</button>
+									<a class="btn-icon btn-review" href="/review?clip={clip.id}" title="Edit in Review">
+										&#9881;
+									</a>
 									<button class="btn-icon" onclick={() => startEdit(clip)} title="Edit"> &#9998; </button>
 									{#if clip.createdBy === 'ai'}
 										<button
@@ -952,6 +955,17 @@
 
 	.actions-gap {
 		width: 8px;
+	}
+
+	.btn-review {
+		color: #60a5fa;
+		border-color: #1e3a5f;
+		text-decoration: none;
+	}
+
+	.btn-review:hover {
+		background: #1e3a5f;
+		color: #60a5fa;
 	}
 
 	.btn-approve {

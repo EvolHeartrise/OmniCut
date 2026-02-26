@@ -7,7 +7,7 @@
 import { newUploadId } from '../ids.js';
 import * as db from './persistence.js';
 import type { YouTubeUploadRecord } from './persistence.js';
-import { uploadVideo, addToPlaylist } from './youtubeClient.js';
+import { uploadVideo, addToPlaylist, setThumbnail } from './youtubeClient.js';
 import { broadcastYouTubeUploadStatus } from './sseBroadcaster.js';
 
 // --- State ---
@@ -174,6 +174,20 @@ async function runUpload(uploadId: string): Promise<void> {
 			} catch (err) {
 				console.warn(`[youtube-upload] Failed to add video to playlist: ${err instanceof Error ? err.message : String(err)}`);
 			}
+		}
+
+		// Auto-set thumbnail if one exists for this export
+		try {
+			const thumbnail = db.loadThumbnailByExport(record.exportId);
+			if (thumbnail) {
+				const fs = await import('node:fs');
+				if (fs.existsSync(thumbnail.filePath)) {
+					await setThumbnail(record.accountId, videoId, thumbnail.filePath);
+					console.log(`[youtube-upload] Thumbnail set for video ${videoId}`);
+				}
+			}
+		} catch (err) {
+			console.warn(`[youtube-upload] Failed to set thumbnail: ${err instanceof Error ? err.message : String(err)}`);
 		}
 
 		db.updateYouTubeUploadStatus(uploadId, 'complete', 1, videoId);

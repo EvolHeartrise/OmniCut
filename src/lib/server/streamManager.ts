@@ -761,7 +761,7 @@ export function getStreamRecordingDir(id: string): string | null {
  * Export all clip regions as a single stitched video file (UI path).
  * Sorts clips by startTime and goes through the export queue for consistency.
  */
-export { createAndQueueExport, loadExport, loadAllExports, deleteExport } from './exportQueue.js';
+export { createAndQueueExport, requeueExport, loadExport, loadAllExports, deleteExport } from './exportQueue.js';
 
 // --- Shutdown ---
 
