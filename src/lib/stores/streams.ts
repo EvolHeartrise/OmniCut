@@ -11,8 +11,12 @@ import {
 	updateOffsetCmd,
 	createClipCmd,
 	updateClipCmd,
-	deleteClipCmd
+	deleteClipCmd,
+	saveCameraBoundsCmd,
+	getCameraBoundsCmd,
+	deleteCameraBoundsCmd
 } from '$lib/streams.remote';
+import type { CameraBoundsEntry } from '$lib/types.js';
 
 export type { ClipRegion };
 
@@ -82,10 +86,6 @@ export interface ExportLogEntry {
 	timestamp: number;
 }
 export const exportLog = writable<ExportLogEntry[]>([]);
-
-// Per-clip encoding status (fed by SSE clip-encode-status events)
-export type ClipEncodeStatus = 'pending' | 'encoding' | 'ready' | 'error';
-export const clipEncodeStatuses = writable<Record<string, ClipEncodeStatus>>({});
 
 // Export records status updates (fed by SSE export-status events)
 export interface ExportStatusEvent {
@@ -316,6 +316,35 @@ export async function deleteClipRegion(id: string) {
 }
 
 /**
+ * Save camera bounds for a channel at a specific timestamp.
+ */
+export async function saveCameraBounds(
+	channel: string,
+	timestamp: number,
+	camX: number,
+	camY: number,
+	camW: number,
+	camH: number
+): Promise<CameraBoundsEntry> {
+	return await saveCameraBoundsCmd({ channel, timestamp, camX, camY, camW, camH });
+}
+
+/**
+ * Resolve camera bounds for a channel at a timestamp (most recent entry at or before).
+ */
+export async function getCameraBounds(channel: string, timestamp: number): Promise<CameraBoundsEntry | null> {
+	const result = await getCameraBoundsCmd({ channel, timestamp });
+	return result.bounds;
+}
+
+/**
+ * Delete a camera bounds entry by ID.
+ */
+export async function removeCameraBounds(id: number): Promise<void> {
+	await deleteCameraBoundsCmd({ id });
+}
+
+/**
  * Connect to SSE endpoint for real-time updates.
  */
 export function connectSSE(): () => void {
@@ -334,6 +363,15 @@ export function connectSSE(): () => void {
 						return [...current, data.stream];
 					}
 				});
+			} else if (data.type === 'transcription') {
+				streams.update((current) => {
+					const idx = current.findIndex((s) => s.id === data.streamId);
+					if (idx >= 0) {
+						current[idx] = { ...current[idx], transcriptionCount: current[idx].transcriptionCount + 1 };
+						return [...current];
+					}
+					return current;
+				});
 			} else if (data.type === 'transcription-cleared') {
 				transcriptions.update((current) => {
 					const { [data.streamId]: _, ...rest } = current;
@@ -346,8 +384,6 @@ export function connectSSE(): () => void {
 					...log,
 					{ message: data.message, step: data.step, totalSteps: data.totalSteps, timestamp: Date.now() }
 				]);
-			} else if (data.type === 'clip-encode-status') {
-				clipEncodeStatuses.update((current) => ({ ...current, [data.clipId]: data.status }));
 			} else if (data.type === 'export-status') {
 				exportStatusEvents.update((events) => [
 					...events,

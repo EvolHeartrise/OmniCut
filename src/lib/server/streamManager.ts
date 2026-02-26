@@ -5,7 +5,6 @@ import { startCapture, fetchStreamMeta, fetchVodMeta, type CaptureHandle } from 
 import { startTranscription, stopTranscription, transcribeFullRecording, shutdownTranscriber } from './transcriber.js';
 import { startChatCollection } from './chatCollector.js';
 import { startVodChatFetch, extractVideoId, extractDouyuRoomId } from './vodChatFetcher.js';
-import { detectNvenc } from './exporter.js';
 import type { StreamInfo, ChatMessage } from './types.js';
 import * as db from './persistence.js';
 import {
@@ -29,13 +28,6 @@ import {
 	getClipRegion,
 	getClipRegionCount
 } from './clipManager.js';
-import {
-	setLookups,
-	restoreEncodeState,
-	shutdownEncoder,
-	getClipEncodeStatus as clipEncodeStatusLookup
-} from './clipEncoder.js';
-import type { ClipEncodeStatus } from './clipEncoder.js';
 import {
 	createAndQueueExport,
 	restoreExportQueue,
@@ -188,20 +180,6 @@ export async function initStreamManager(): Promise<void> {
 	for (const [, handle] of captures) {
 		initCounts(handle.info.id);
 	}
-
-	// Wire up clip encoder lookups (avoids circular imports)
-	setLookups(
-		(clipId) => getClipRegion(clipId),
-		(streamId) => {
-			const handle = captures.get(streamId);
-			return handle ? handle.info : null;
-		},
-		detectNvenc
-	);
-
-	// Restore pre-encoded clip state from disk
-	const allClipIds = getAllClipRegions().map((c) => c.id);
-	restoreEncodeState(allClipIds);
 
 	// Mark any incomplete exports from a previous session as error
 	restoreExportQueue();
@@ -690,22 +668,6 @@ export function updateStreamOffset(id: string, offset: number): boolean {
 // --- Clip regions (delegated to clipManager.ts) ---
 export { addClipRegion, createClipRegion, removeClipRegion, getAllClipRegions } from './clipManager.js';
 
-// --- Clip encoding status (delegated to clipEncoder.ts) ---
-export { getClipEncodeStatus, getEncodedClipPath } from './clipEncoder.js';
-export type { ClipEncodeStatus } from './clipEncoder.js';
-
-/**
- * Get encode statuses for multiple clip IDs at once.
- */
-export function getClipEncodeStatuses(clipIds: string[]): Record<string, ClipEncodeStatus> {
-	const result: Record<string, ClipEncodeStatus> = {};
-	for (const id of clipIds) {
-		const status = clipEncodeStatusLookup(id);
-		if (status) result[id] = status;
-	}
-	return result;
-}
-
 export function getTranscriptionsInRange(
 	id: string,
 	fromTime: number,
@@ -771,7 +733,6 @@ export { createAndQueueExport, requeueExport, loadExport, loadAllExports, delete
 export function shutdownAll() {
 	shutdownUploadQueue();
 	shutdownExportQueue();
-	shutdownEncoder();
 	shutdownTranscriber();
 	for (const [, handle] of captures) {
 		handle.stopChat?.();

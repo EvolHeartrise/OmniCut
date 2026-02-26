@@ -1,6 +1,6 @@
-import type { ClipRegion } from '../types.js';
+import type { ClipRegion, CameraBoundsEntry } from '../types.js';
 
-export type { ClipRegion };
+export type { ClipRegion, CameraBoundsEntry };
 
 export interface StreamInfo {
 	id: string;

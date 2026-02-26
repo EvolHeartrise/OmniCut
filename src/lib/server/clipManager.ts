@@ -1,13 +1,11 @@
 /**
  * Clip region management module.
  * In-memory store of clip regions backed by SQLite persistence.
- * Triggers clip encoding on add/update and cancellation on remove.
  */
 
 import type { ClipRegion } from './types.js';
 import * as db from './persistence.js';
 import { broadcastClipRegionsChanged } from './sseBroadcaster.js';
-import { enqueueClipEncode, cancelClipEncode } from './clipEncoder.js';
 
 // In-memory store of clip regions keyed by ID (hot cache; persisted to SQLite)
 const clipRegionsStore = new Map<string, ClipRegion>();
@@ -39,16 +37,12 @@ export function createClipRegion(data: Omit<ClipRegion, 'id'>): ClipRegion {
 	const region: ClipRegion = { id, ...data };
 	clipRegionsStore.set(id, region);
 	broadcastClipRegionsChanged(getAllClipRegions());
-	if (region.createdBy !== 'ai') {
-		enqueueClipEncode(id);
-	}
 	return region;
 }
 
 /**
  * Add or update a clip region (upsert by ID).
  * Validates that startTime < endTime.
- * Triggers clip encoding (or re-encoding if times changed).
  */
 export function addClipRegion(region: ClipRegion): void {
 	if (region.startTime >= region.endTime) {
@@ -57,31 +51,17 @@ export function addClipRegion(region: ClipRegion): void {
 		);
 	}
 
-	const existing = clipRegionsStore.get(region.id);
-	const timesChanged =
-		!existing ||
-		existing.startTime !== region.startTime ||
-		existing.endTime !== region.endTime ||
-		existing.streamId !== region.streamId;
-	const wasApproved = existing?.createdBy === 'ai' && region.createdBy !== 'ai';
-
 	clipRegionsStore.set(region.id, region);
 	db.saveClipRegion(region);
 	broadcastClipRegionsChanged(getAllClipRegions());
-
-	if (region.createdBy !== 'ai' && (timesChanged || wasApproved)) {
-		enqueueClipEncode(region.id);
-	}
 }
 
 /**
  * Remove a clip region by ID.
- * Cancels any pending/active encode and deletes the encoded file.
  */
 export function removeClipRegion(id: string): boolean {
 	if (!clipRegionsStore.delete(id)) return false;
 	db.deleteClipRegion(id);
-	cancelClipEncode(id);
 	broadcastClipRegionsChanged(getAllClipRegions());
 	return true;
 }

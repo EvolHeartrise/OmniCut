@@ -6,14 +6,18 @@
 		clipRegions,
 		saveClipRegion,
 		deleteClipRegion,
-		clipEncodeStatuses,
+		saveCameraBounds,
+		getCameraBounds,
+		removeCameraBounds,
 		type ClipRegion
 	} from '$lib/stores/streams.js';
+	import type { CameraBoundsEntry } from '$lib/types.js';
 	import { formatDuration, createHlsConfig } from '$lib/utils.js';
-	import { getClipEncodeStatuses, getMultiStreamTranscriptions } from '$lib/streams.remote';
+	import { getMultiStreamTranscriptions } from '$lib/streams.remote';
 	import { splitClipRegion } from '$lib/clipActions.js';
 	import { untrack } from 'svelte';
 	import { page } from '$app/state';
+	import CameraRegionOverlay from '$lib/components/CameraRegionOverlay.svelte';
 
 	// --- URL-targeted clip (e.g. /review?clip=123) ---
 	let urlClipId = $derived(page.url.searchParams.get('clip'));
@@ -38,7 +42,9 @@
 	type ReviewUndoEntry =
 		| { type: 'update-region'; before: ClipRegion }
 		| { type: 'delete-region'; region: ClipRegion }
-		| { type: 'split-region'; original: ClipRegion; createdIds: [string, string] };
+		| { type: 'split-region'; original: ClipRegion; createdIds: [string, string] }
+		| { type: 'set-cam-bounds'; before: CameraBoundsEntry | null }
+		| { type: 'delete-cam-bounds'; before: CameraBoundsEntry };
 
 	let undoStack = $state<ReviewUndoEntry[]>([]);
 	function pushUndo(entry: ReviewUndoEntry) {
@@ -69,6 +75,21 @@
 				clipRegions.update((regions) => [...regions, entry.original]);
 				saveClipRegion(entry.original);
 				break;
+			case 'set-cam-bounds':
+				// Undo cam bounds set → restore previous bounds (or delete if none)
+				if (entry.before) {
+					saveCameraBounds(entry.before.channel, entry.before.timestamp, entry.before.camX, entry.before.camY, entry.before.camW, entry.before.camH);
+					resolvedCamBounds = entry.before;
+				} else if (resolvedCamBounds) {
+					removeCameraBounds(resolvedCamBounds.id);
+					resolvedCamBounds = null;
+				}
+				break;
+			case 'delete-cam-bounds':
+				// Undo cam bounds delete → restore
+				saveCameraBounds(entry.before.channel, entry.before.timestamp, entry.before.camX, entry.before.camY, entry.before.camW, entry.before.camH);
+				resolvedCamBounds = entry.before;
+				break;
 		}
 	}
 
@@ -90,6 +111,10 @@
 
 	// --- Transcription regions ---
 	let transcriptionRegions = $state<Array<{ startFrac: number; endFrac: number; text: string }>>([]);
+
+	// --- Camera region ---
+	let camRegionActive = $state(false);
+	let resolvedCamBounds = $state<CameraBoundsEntry | null>(null);
 
 	// --- Waveform ---
 	const WAVEFORM_BINS = 800;
@@ -132,20 +157,6 @@
 		return { localStart: clip.startTime - anchor + offset, localEnd: clip.endTime - anchor + offset };
 	}
 
-	function encodeStatusInfo(status: string | undefined): { label: string; cls: string } {
-		switch (status) {
-			case 'ready':
-				return { label: 'Encoded', cls: 'badge-ready' };
-			case 'encoding':
-				return { label: 'Encoding...', cls: 'badge-encoding' };
-			case 'pending':
-				return { label: 'Pending', cls: 'badge-pending' };
-			case 'error':
-				return { label: 'Error', cls: 'badge-error' };
-			default:
-				return { label: 'Unknown', cls: 'badge-unknown' };
-		}
-	}
 
 	// --- Player setup ---
 	function setupPlayer(clip: ClipRegion) {
@@ -221,17 +232,9 @@
 		waveformPeaks = new Float32Array(WAVEFORM_BINS);
 		editingId = null;
 		deleteConfirmId = null;
+		camRegionActive = false;
 		// Wait for DOM
 		requestAnimationFrame(() => setupPlayer(clip));
-	});
-
-	// Fetch encode statuses
-	$effect(() => {
-		const clip = currentClip;
-		if (!clip) return;
-		getClipEncodeStatuses({ clipIds: [clip.id] })
-			.then((statuses) => clipEncodeStatuses.update((c) => ({ ...c, ...statuses })))
-			.catch(() => {});
 	});
 
 	// Fetch transcription regions for current clip
@@ -263,6 +266,27 @@
 			})
 			.catch(() => {
 				transcriptionRegions = [];
+			});
+	});
+
+	// Fetch camera bounds when clip changes
+	$effect(() => {
+		const clip = currentClip;
+		if (!clip) {
+			resolvedCamBounds = null;
+			return;
+		}
+		const stream = $streams.find((s) => s.id === clip.streamId);
+		if (!stream) {
+			resolvedCamBounds = null;
+			return;
+		}
+		getCameraBounds(stream.channel, clip.startTime)
+			.then((bounds) => {
+				resolvedCamBounds = bounds;
+			})
+			.catch(() => {
+				resolvedCamBounds = null;
 			});
 	});
 
@@ -592,6 +616,48 @@
 		return currentClip.startTime + progress * clipDur;
 	}
 
+	// Live update during drag (local state only, no server save)
+	let preDragCamSnapshot: CameraBoundsEntry | null | undefined = undefined;
+
+	function handleCamRegionChange(region: { camX: number; camY: number; camW: number; camH: number }) {
+		if (!currentClip) return;
+		// Capture pre-drag state on first change of a drag gesture
+		if (preDragCamSnapshot === undefined) preDragCamSnapshot = resolvedCamBounds ? { ...resolvedCamBounds } : null;
+		// Update local state for immediate visual feedback
+		const stream = $streams.find((s) => s.id === currentClip!.streamId);
+		resolvedCamBounds = {
+			id: resolvedCamBounds?.id ?? 0,
+			channel: stream?.channel ?? '',
+			timestamp: currentClip!.startTime,
+			camX: region.camX,
+			camY: region.camY,
+			camW: region.camW,
+			camH: region.camH
+		};
+	}
+
+	// Persist on drag end
+	function handleCamRegionSave(region: { camX: number; camY: number; camW: number; camH: number }) {
+		if (!currentClip) return;
+		const stream = $streams.find((s) => s.id === currentClip!.streamId);
+		if (!stream) return;
+		if (preDragCamSnapshot !== undefined) {
+			pushUndo({ type: 'set-cam-bounds', before: preDragCamSnapshot });
+			preDragCamSnapshot = undefined;
+		}
+		saveCameraBounds(stream.channel, currentClip!.startTime, region.camX, region.camY, region.camW, region.camH)
+			.then((entry) => {
+				resolvedCamBounds = entry;
+			});
+	}
+
+	function clearCamRegion() {
+		if (!currentClip || !resolvedCamBounds) return;
+		pushUndo({ type: 'delete-cam-bounds', before: { ...resolvedCamBounds } });
+		removeCameraBounds(resolvedCamBounds.id);
+		resolvedCamBounds = null;
+	}
+
 	async function splitAtPlayhead() {
 		if (!currentClip) return;
 		const mt = getMasterTimeAtPlayhead();
@@ -681,6 +747,9 @@
 			case 'S':
 				splitAtPlayhead();
 				break;
+			case 'c':
+				camRegionActive = !camRegionActive;
+				break;
 		}
 	}
 
@@ -740,8 +809,6 @@
 	{:else}
 		{@const clip = currentClip}
 		{@const dur = clip.endTime - clip.startTime}
-		{@const encStatus = $clipEncodeStatuses[clip.id]}
-		{@const badge = encodeStatusInfo(encStatus)}
 		{@const isEditing = editingId === clip.id}
 
 		<div class="review-counter">
@@ -757,6 +824,16 @@
 			<div class="video-container">
 				<!-- svelte-ignore a11y_media_has_caption -->
 				<video bind:this={videoEl} ontimeupdate={handleTimeUpdate} playsinline class="review-video"></video>
+				<CameraRegionOverlay
+					{videoEl}
+					camX={resolvedCamBounds?.camX}
+					camY={resolvedCamBounds?.camY}
+					camW={resolvedCamBounds?.camW}
+					camH={resolvedCamBounds?.camH}
+					active={camRegionActive}
+					onchange={handleCamRegionChange}
+					onsave={handleCamRegionSave}
+				/>
 				<div class="video-controls">
 					<div class="timeline-row">
 						<button class="btn-ctl" onclick={togglePlay}>
@@ -825,7 +902,9 @@
 					<div class="clip-header">
 						<span class="clip-channel">{clipChannel(clip)}</span>
 						<span class="clip-badge" class:ai={clip.createdBy === 'ai'}>{clip.createdBy === 'ai' ? 'AI' : 'Human'}</span>
-						<span class="encode-badge {badge.cls}">{badge.label}</span>
+						{#if resolvedCamBounds != null}
+							<span class="cam-badge">CAM</span>
+						{/if}
 					</div>
 					<div class="clip-title">{clip.title || 'Untitled'}</div>
 					{#if clip.notes}
@@ -860,6 +939,23 @@
 					<button class="btn-action btn-edit" onclick={() => startEdit(clip)}>
 						<span class="action-icon">&#9998;</span> Edit
 					</button>
+					<button
+						class="btn-action btn-camera"
+						class:cam-active={camRegionActive}
+						onclick={() => (camRegionActive = !camRegionActive)}
+						title="Toggle camera region (C)"
+					>
+						{#if resolvedCamBounds != null}
+							{camRegionActive ? 'Done' : 'Edit Camera'}
+						{:else}
+							Set Camera
+						{/if}
+					</button>
+					{#if resolvedCamBounds != null && camRegionActive}
+						<button class="btn-action btn-cam-clear" onclick={clearCamRegion}>
+							Clear
+						</button>
+					{/if}
 					{#if undoStack.length > 0}
 						<button class="btn-action btn-undo" onclick={applyUndo} title="Undo (Ctrl+Z)">
 							&#8630; Undo<span class="undo-count">{undoStack.length}</span>
@@ -925,6 +1021,7 @@
 
 	/* Video */
 	.video-container {
+		position: relative;
 		background: #000;
 		flex: 1;
 		min-height: 0;
@@ -1120,34 +1217,6 @@
 		color: #888;
 	}
 
-	.encode-badge {
-		font-size: 0.6rem;
-		padding: 1px 6px;
-		border-radius: 3px;
-		font-weight: 500;
-	}
-
-	.badge-ready {
-		background: rgba(22, 163, 74, 0.15);
-		color: #4ade80;
-	}
-	.badge-encoding {
-		background: rgba(234, 179, 8, 0.15);
-		color: #fbbf24;
-	}
-	.badge-pending {
-		background: rgba(100, 100, 100, 0.15);
-		color: #999;
-	}
-	.badge-error {
-		background: rgba(220, 38, 38, 0.15);
-		color: #f87171;
-	}
-	.badge-unknown {
-		background: rgba(80, 80, 80, 0.15);
-		color: #666;
-	}
-
 	/* Actions */
 	.review-actions {
 		display: flex;
@@ -1305,5 +1374,36 @@
 	}
 	.btn-cancel:hover {
 		background: #3a3a5a;
+	}
+
+	.cam-badge {
+		font-size: 0.6rem;
+		font-weight: 600;
+		padding: 1px 6px;
+		border-radius: 3px;
+		background: rgba(168, 85, 247, 0.2);
+		color: #a855f7;
+		text-transform: uppercase;
+		letter-spacing: 0.03em;
+	}
+
+	.btn-camera {
+		color: #a855f7;
+		border-color: #3a2a5a;
+	}
+	.btn-camera:hover {
+		background: #3a2a5a;
+	}
+	.btn-camera.cam-active {
+		background: #3a2a5a;
+		border-color: #a855f7;
+	}
+
+	.btn-cam-clear {
+		color: #f87171;
+		border-color: #3a1a1a;
+	}
+	.btn-cam-clear:hover {
+		background: #3a1a1a;
 	}
 </style>

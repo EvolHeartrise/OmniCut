@@ -1,24 +1,30 @@
+/**
+ * Standard (16:9) video exporter.
+ * Encodes clips directly from raw HLS segments on disk — no pre-encoded intermediates.
+ */
+
 import * as path from 'node:path';
 import * as fs from 'node:fs';
-import type { ClipRegion } from './types.js';
-import {
-	enqueueClipEncode,
-	getClipEncodeStatus,
-	getEncodedClipPath,
-	waitForClipReady,
-	ffmpegConcatEscape
-} from './clipEncoder.js';
+import type { ClipRegion, StreamInfo } from './types.js';
+import { parseRelevantSegments, ffmpegConcatEscape, buildConcatContent } from './hlsUtils.js';
 import { runFfmpeg } from './ffmpeg.js';
 
 const EXPORTS_DIR = path.resolve(process.env.EXPORTS_DIR || path.join(process.cwd(), 'exports'));
 
+/** Resolved stream info needed for encoding a clip from raw segments. */
+export interface StreamLookup {
+	recordingDir: string;
+	startedAt: number;
+	offset: number;
+}
+
 /**
  * Export all clip regions as a single stitched video file.
- * Uses pre-encoded clip MP4s from the clip encoder queue.
- * If any clips are not yet ready, enqueues them and waits.
+ * Encodes each clip directly from the raw HLS segments on disk.
  */
 export async function exportVideo(
 	clips: ClipRegion[],
+	streamMap: Map<string, StreamLookup>,
 	filename: string,
 	onProgress: (message: string, step: number, totalSteps: number) => void
 ): Promise<{ outputPath: string }> {
@@ -28,117 +34,123 @@ export async function exportVideo(
 
 	fs.mkdirSync(EXPORTS_DIR, { recursive: true });
 
-	const totalSteps = clips.length + 1; // wait steps + concat
-
+	const totalSteps = clips.length + 1; // per-clip encode + final concat
 	onProgress(`Starting export: ${clips.length} clips`, 0, totalSteps);
 
-	// Ensure all clips are queued for encoding
-	for (const clip of clips) {
-		const status = getClipEncodeStatus(clip.id);
-		if (!status || status === 'error') {
-			enqueueClipEncode(clip.id);
-		}
-	}
-
-	// Wait for all clips to finish encoding (skip failures)
-	const clipFiles: string[] = [];
-	let skipped = 0;
-	for (let i = 0; i < clips.length; i++) {
-		const clip = clips[i];
-		const dur = clip.endTime - clip.startTime;
-
-		let encodedPath = getEncodedClipPath(clip.id);
-		if (!encodedPath) {
-			onProgress(`Waiting for clip ${i + 1}/${clips.length} to finish encoding (${dur.toFixed(1)}s)`, i, totalSteps);
-			const finalStatus = await waitForClipReady(clip.id);
-			if (finalStatus === 'error') {
-				console.warn(`Export: skipping clip ${i + 1}/${clips.length} (encode failed)`);
-				onProgress(`Skipping clip ${i + 1}/${clips.length} (encode failed)`, i, totalSteps);
-				skipped++;
-				continue;
-			}
-			encodedPath = getEncodedClipPath(clip.id);
-		} else {
-			onProgress(`Using pre-encoded clip ${i + 1}/${clips.length} (${dur.toFixed(1)}s)`, i, totalSteps);
-		}
-
-		if (!encodedPath) {
-			console.warn(`Export: skipping clip ${i + 1}/${clips.length} (no encoded file)`);
-			onProgress(`Skipping clip ${i + 1}/${clips.length} (no encoded file)`, i, totalSteps);
-			skipped++;
-			continue;
-		}
-		clipFiles.push(encodedPath);
-	}
-
-	if (clipFiles.length === 0) {
-		throw new Error('All clips failed to encode — nothing to export');
-	}
-
-	// Probe first clip for resolution and framerate
-	const probe = await probeVideo(clipFiles[0]);
-	const needsUpscale = probe.height > 0 && probe.height < 1080;
 	const useNvenc = await detectNvenc();
-
 	const tempDir = path.join(EXPORTS_DIR, `temp_${Date.now()}`);
 	fs.mkdirSync(tempDir, { recursive: true });
 
 	try {
-		const concatListPath = path.join(tempDir, 'concat.txt');
-		const concatContent = clipFiles.map((f) => ffmpegConcatEscape(f)).join('\n');
-		fs.writeFileSync(concatListPath, concatContent);
+		const clipFiles: string[] = [];
+		let skipped = 0;
+
+		for (let i = 0; i < clips.length; i++) {
+			const clip = clips[i];
+			const stream = streamMap.get(clip.streamId);
+			if (!stream) {
+				console.warn(`Export: skipping clip ${i + 1}/${clips.length} — stream ${clip.streamId} not found`);
+				onProgress(`Skipping clip ${i + 1}/${clips.length} (stream not found)`, i, totalSteps);
+				skipped++;
+				continue;
+			}
+
+			const dur = clip.endTime - clip.startTime;
+			onProgress(`Encoding clip ${i + 1}/${clips.length} (${dur.toFixed(1)}s)`, i, totalSteps);
+
+			const anchor = stream.startedAt / 1000;
+			const localStart = clip.startTime - anchor + stream.offset;
+			const localEnd = clip.endTime - anchor + stream.offset;
+			const playlistPath = path.join(stream.recordingDir, 'playlist.m3u8');
+
+			const segments = parseRelevantSegments(playlistPath, stream.recordingDir, localStart, localEnd);
+			if (segments.length === 0) {
+				console.warn(`Export: skipping clip ${i + 1}/${clips.length} — no segments`);
+				onProgress(`Skipping clip ${i + 1}/${clips.length} (no segments)`, i, totalSteps);
+				skipped++;
+				continue;
+			}
+
+			const concatPath = path.join(tempDir, `clip_${i}.concat.txt`);
+			fs.writeFileSync(concatPath, buildConcatContent(segments));
+
+			const trimStart = Math.max(0, localStart - segments[0].startTime);
+			const outFile = path.join(tempDir, `clip_${i}.mp4`);
+
+			// Probe first segment for resolution/fps
+			const probe = i === 0 ? await probeVideo(segments[0].file) : null;
+
+			let videoArgs: string[];
+			if (useNvenc) {
+				videoArgs = [
+					'-vf', 'format=yuv420p',
+					'-c:v', 'h264_nvenc',
+					'-preset', 'p4',
+					'-profile:v', 'high',
+					'-qp', '18',
+					'-rc-lookahead', '32',
+					'-bf', '2'
+				];
+			} else {
+				videoArgs = [
+					'-vf', 'format=yuv420p',
+					'-c:v', 'libx264',
+					'-preset', 'medium',
+					'-profile:v', 'high',
+					'-crf', '18',
+					'-bf', '2'
+				];
+			}
+
+			await runFfmpeg([
+				'-fflags', '+genpts',
+				'-f', 'concat', '-safe', '0', '-i', concatPath,
+				'-ss', trimStart.toFixed(3),
+				'-t', dur.toFixed(3),
+				'-map', '0:v:0', '-map', '0:a:0',
+				...videoArgs,
+				'-fps_mode', 'cfr',
+				'-c:a', 'aac', '-ar', '48000', '-b:a', '192k',
+				'-video_track_timescale', '90000',
+				'-movflags', '+faststart',
+				'-y', outFile
+			], 2000);
+
+			clipFiles.push(outFile);
+
+			// Probe first encoded clip for resolution info (for upscale check)
+			if (i === 0 && probe) {
+				// Store for potential upscale in final concat pass
+				(clipFiles as any).__probe = probe;
+			}
+		}
+
+		if (clipFiles.length === 0) {
+			throw new Error('All clips failed to encode — nothing to export');
+		}
 
 		const safeName = path.basename(filename).replace(/[<>:"/\\|?*]/g, '_');
 		const outputPath = path.join(EXPORTS_DIR, `${safeName}.mp4`);
 
-		const skipMsg = skipped > 0 ? ` (${skipped} skipped)` : '';
-		const scaleLabel = needsUpscale ? `Upscaling ${probe.height}p → 1080p and encoding` : 'Encoding';
-		onProgress(`${scaleLabel} ${clipFiles.length} clips${skipMsg}`, clips.length, totalSteps);
-
-		// Full re-encode: guarantees CFR, closed GOPs, and clean timestamps
-		// for YouTube compatibility. No stream copy — eliminates all sources of
-		// VFR, timestamp discontinuities, and AAC priming gaps.
-		const vf = needsUpscale ? 'scale=-2:1080:flags=lanczos,format=yuv420p' : 'format=yuv420p';
-		const fps = probe.fps > 0 ? probe.fps : 30;
-		const gop = Math.round(fps * 2); // 2-second keyframe interval
-
-		let videoArgs: string[];
-		if (useNvenc) {
-			videoArgs = [
-				'-vf', vf,
-				'-c:v', 'h264_nvenc',
-				'-preset', 'p4',
-				'-profile:v', 'high',
-				'-qp', '18',
-				'-rc-lookahead', '32',
-				'-bf', '2',
-				'-g', `${gop}`,
-				'-flags', '+cgop'
-			];
+		if (clipFiles.length === 1) {
+			// Single clip — just move it
+			fs.renameSync(clipFiles[0], outputPath);
 		} else {
-			videoArgs = [
-				'-vf', vf,
-				'-c:v', 'libx264',
-				'-preset', 'medium',
-				'-profile:v', 'high',
-				'-crf', '18',
-				'-bf', '2',
-				'-g', `${gop}`,
-				'-flags', '+cgop'
-			];
-		}
+			const skipMsg = skipped > 0 ? ` (${skipped} skipped)` : '';
+			onProgress(`Concatenating ${clipFiles.length} clips${skipMsg}`, clips.length, totalSteps);
 
-		await runFfmpeg([
-			'-fflags', '+genpts',
-			'-f', 'concat', '-safe', '0', '-i', concatListPath,
-			...videoArgs,
-			'-fps_mode', 'cfr',
-			'-r', `${fps}`,
-			'-af', 'aresample=async=1000:first_pts=0',
-			'-c:a', 'aac', '-ar', '48000', '-b:a', '192k',
-			'-movflags', '+faststart',
-			'-y', outputPath
-		], 1000);
+			// Concat with stream copy — all clips are encoded with identical settings
+			const concatListPath = path.join(tempDir, 'final_concat.txt');
+			fs.writeFileSync(concatListPath, clipFiles.map((f) => ffmpegConcatEscape(f)).join('\n'));
+
+			await runFfmpeg([
+				'-fflags', '+genpts',
+				'-f', 'concat', '-safe', '0', '-i', concatListPath,
+				'-c', 'copy',
+				'-movflags', '+faststart',
+				'-y', outputPath
+			], 1000);
+		}
 
 		onProgress(`Done — saved to ${outputPath}`, totalSteps, totalSteps);
 		return { outputPath };
@@ -151,29 +163,29 @@ export async function exportVideo(
 	}
 }
 
-/** Probe a video file's height and framerate. */
-async function probeVideo(filePath: string): Promise<{ height: number; fps: number }> {
+/** Probe a video file's width, height, and framerate. */
+export async function probeVideo(filePath: string): Promise<{ width: number; height: number; fps: number }> {
 	try {
 		const proc = Bun.spawn(
 			['ffprobe', '-v', 'quiet', '-select_streams', 'v:0',
-				'-show_entries', 'stream=height,r_frame_rate', '-of', 'json', filePath],
+				'-show_entries', 'stream=width,height,r_frame_rate', '-of', 'json', filePath],
 			{ stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' }
 		);
 		const stdout = await new Response(proc.stdout).text();
 		const code = await proc.exited;
-		if (code !== 0) return { height: 0, fps: 0 };
+		if (code !== 0) return { width: 0, height: 0, fps: 0 };
 		const data = JSON.parse(stdout);
 		const stream = data.streams?.[0];
+		const width = parseInt(stream?.width, 10) || 0;
 		const height = parseInt(stream?.height, 10) || 0;
-		// r_frame_rate is a fraction like "30/1" or "60000/1001"
 		let fps = 0;
 		if (stream?.r_frame_rate) {
 			const [num, den] = stream.r_frame_rate.split('/').map(Number);
 			if (den > 0) fps = Math.round(num / den);
 		}
-		return { height, fps };
+		return { width, height, fps };
 	} catch {
-		return { height: 0, fps: 0 };
+		return { width: 0, height: 0, fps: 0 };
 	}
 }
 
@@ -186,31 +198,13 @@ export async function detectNvenc(): Promise<boolean> {
 		const proc = Bun.spawn(
 			[
 				'ffmpeg',
-				'-f',
-				'lavfi',
-				'-i',
-				'nullsrc=s=64x64:d=0.1',
-				'-f',
-				'lavfi',
-				'-i',
-				'anullsrc=d=0.1',
-				'-c:v',
-				'h264_nvenc',
-				'-preset',
-				'p4',
-				'-qp',
-				'18',
-				'-c:a',
-				'aac',
-				'-f',
-				'null',
-				'-'
+				'-f', 'lavfi', '-i', 'nullsrc=s=64x64:d=0.1',
+				'-f', 'lavfi', '-i', 'anullsrc=d=0.1',
+				'-c:v', 'h264_nvenc', '-preset', 'p4', '-qp', '18',
+				'-c:a', 'aac',
+				'-f', 'null', '-'
 			],
-			{
-				stdin: 'ignore',
-				stdout: 'pipe',
-				stderr: 'pipe'
-			}
+			{ stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' }
 		);
 
 		const code = await proc.exited;

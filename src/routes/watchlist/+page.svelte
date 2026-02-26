@@ -1,13 +1,13 @@
 <script lang="ts">
-	import DiscoveryBrowser from '$lib/components/DiscoveryBrowser.svelte';
+	import AddStreamBar from '$lib/components/AddStreamBar.svelte';
 </script>
 
-<main class="browse-content">
-	<DiscoveryBrowser />
+<main class="watchlist-content">
+	<AddStreamBar />
 </main>
 
 <style>
-	.browse-content {
+	.watchlist-content {
 		flex: 1;
 		min-height: 0;
 		overflow: hidden;

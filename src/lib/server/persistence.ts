@@ -1,7 +1,7 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
-import type { StreamInfo, ClipRegion, ChatMessage } from './types.js';
+import type { StreamInfo, ClipRegion, ChatMessage, CameraBoundsEntry } from './types.js';
 import type { WordTimestamp } from './transcriber.js';
 
 // bun:sqlite is a Bun-native module. We use a lazy import because Vite's SSR
@@ -200,6 +200,19 @@ export async function initDatabase(): Promise<void> {
 			FOREIGN KEY (export_id) REFERENCES exports(id) ON DELETE CASCADE
 		);
 
+		CREATE TABLE IF NOT EXISTS channel_camera_bounds (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			channel TEXT NOT NULL,
+			timestamp REAL NOT NULL,
+			cam_x REAL NOT NULL,
+			cam_y REAL NOT NULL,
+			cam_w REAL NOT NULL,
+			cam_h REAL NOT NULL,
+			UNIQUE(channel, timestamp)
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_cam_bounds_channel_time ON channel_camera_bounds(channel, timestamp);
+
 		-- Purge old-format thumbnail rows (schema changed to unified layer system)
 		DELETE FROM thumbnails;
 
@@ -223,6 +236,41 @@ export async function initDatabase(): Promise<void> {
 			FOREIGN KEY (account_id) REFERENCES youtube_accounts(id)
 		);
 	`);
+
+	// Idempotent schema migrations — add columns if they don't exist
+	const migrations = [
+		'ALTER TABLE clip_regions ADD COLUMN cam_x REAL',
+		'ALTER TABLE clip_regions ADD COLUMN cam_y REAL',
+		'ALTER TABLE clip_regions ADD COLUMN cam_w REAL',
+		'ALTER TABLE clip_regions ADD COLUMN cam_h REAL',
+		"ALTER TABLE exports ADD COLUMN format TEXT NOT NULL DEFAULT 'standard'"
+	];
+	for (const sql of migrations) {
+		try { db.exec(sql); } catch { /* column already exists */ }
+	}
+
+	// Migrate existing clip cam fields into channel_camera_bounds (one-time)
+	try {
+		const migrated = db.query(
+			`SELECT COUNT(*) as cnt FROM channel_camera_bounds`
+		).get() as { cnt: number };
+		if (migrated.cnt === 0) {
+			// Copy cam fields from clip_regions (join with streams to get channel)
+			db.exec(`
+				INSERT OR IGNORE INTO channel_camera_bounds (channel, timestamp, cam_x, cam_y, cam_w, cam_h)
+				SELECT s.channel, cr.start_time, cr.cam_x, cr.cam_y, cr.cam_w, cr.cam_h
+				FROM clip_regions cr
+				JOIN streams s ON s.id = cr.stream_id
+				WHERE cr.cam_x IS NOT NULL AND cr.cam_y IS NOT NULL AND cr.cam_w IS NOT NULL AND cr.cam_h IS NOT NULL
+			`);
+			const count = (db.query('SELECT changes() as n').get() as { n: number }).n;
+			if (count > 0) {
+				console.log(`[persistence] Migrated ${count} clip camera bounds to channel_camera_bounds table`);
+			}
+		}
+	} catch (err) {
+		console.warn('[persistence] Camera bounds migration error:', err instanceof Error ? err.message : String(err));
+	}
 
 	// Prepare hot-path statements for better performance
 	stmtSaveChatMessage = db.prepare(
@@ -321,6 +369,7 @@ interface ExportRow {
 	error: string | null;
 	created_at: number;
 	completed_at: number | null;
+	format: string;
 }
 
 export interface ExportRecord {
@@ -333,6 +382,7 @@ export interface ExportRecord {
 	error?: string;
 	createdAt: number;
 	completedAt?: number;
+	format: 'standard' | 'mobile_short';
 }
 
 interface HeatmapRow {
@@ -668,6 +718,78 @@ export function loadAllClipRegions(): ClipRegion[] {
 	}));
 }
 
+// --- Channel Camera Bounds ---
+
+interface CameraBoundsRow {
+	id: number;
+	channel: string;
+	timestamp: number;
+	cam_x: number;
+	cam_y: number;
+	cam_w: number;
+	cam_h: number;
+}
+
+function mapCameraBoundsRow(r: CameraBoundsRow): CameraBoundsEntry {
+	return {
+		id: r.id,
+		channel: r.channel,
+		timestamp: r.timestamp,
+		camX: r.cam_x,
+		camY: r.cam_y,
+		camW: r.cam_w,
+		camH: r.cam_h
+	};
+}
+
+/** Resolve camera bounds for a channel at a given timestamp (most recent entry at or before the timestamp). */
+export function resolveCameraBounds(channel: string, timestamp: number): CameraBoundsEntry | null {
+	const d = getDb();
+	const row = d.query(
+		'SELECT * FROM channel_camera_bounds WHERE channel = ? AND timestamp <= ? ORDER BY timestamp DESC LIMIT 1'
+	).get(channel.toLowerCase(), timestamp) as CameraBoundsRow | null;
+	return row ? mapCameraBoundsRow(row) : null;
+}
+
+/** Save (upsert) camera bounds for a channel at a specific timestamp. */
+export function saveCameraBounds(
+	channel: string,
+	timestamp: number,
+	camX: number,
+	camY: number,
+	camW: number,
+	camH: number
+): CameraBoundsEntry {
+	const d = getDb();
+	d.run(
+		`INSERT INTO channel_camera_bounds (channel, timestamp, cam_x, cam_y, cam_w, cam_h)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(channel, timestamp) DO UPDATE SET
+			cam_x = excluded.cam_x, cam_y = excluded.cam_y,
+			cam_w = excluded.cam_w, cam_h = excluded.cam_h`,
+		[channel.toLowerCase(), timestamp, camX, camY, camW, camH]
+	);
+	const row = d.query(
+		'SELECT * FROM channel_camera_bounds WHERE channel = ? AND timestamp = ?'
+	).get(channel.toLowerCase(), timestamp) as CameraBoundsRow;
+	return mapCameraBoundsRow(row);
+}
+
+/** Delete a camera bounds entry by ID. */
+export function deleteCameraBounds(id: number): void {
+	const d = getDb();
+	d.run('DELETE FROM channel_camera_bounds WHERE id = ?', [id]);
+}
+
+/** Load all camera bounds entries for a channel, ordered by timestamp. */
+export function loadCameraBoundsForChannel(channel: string): CameraBoundsEntry[] {
+	const d = getDb();
+	const rows = d.query(
+		'SELECT * FROM channel_camera_bounds WHERE channel = ? ORDER BY timestamp'
+	).all(channel.toLowerCase()) as CameraBoundsRow[];
+	return rows.map(mapCameraBoundsRow);
+}
+
 // --- Ignored Channels ---
 
 export function addIgnoredChannel(login: string): void {
@@ -741,8 +863,8 @@ export function removeFromWatchlist(login: string, platform: string): void {
 export function saveExport(record: ExportRecord): void {
 	const d = getDb();
 	d.run(
-		`INSERT INTO exports (id, title, description, clip_ids, status, output_path, error, created_at, completed_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO exports (id, title, description, clip_ids, status, output_path, error, created_at, completed_at, format)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		[
 			record.id,
 			record.title,
@@ -752,7 +874,8 @@ export function saveExport(record: ExportRecord): void {
 			record.outputPath ?? null,
 			record.error ?? null,
 			record.createdAt,
-			record.completedAt ?? null
+			record.completedAt ?? null,
+			record.format ?? 'standard'
 		]
 	);
 }
@@ -814,7 +937,8 @@ function mapExportRow(r: ExportRow): ExportRecord {
 		...(r.output_path && { outputPath: r.output_path }),
 		...(r.error && { error: r.error }),
 		createdAt: r.created_at,
-		...(r.completed_at != null && { completedAt: r.completed_at })
+		...(r.completed_at != null && { completedAt: r.completed_at }),
+		format: (r.format || 'standard') as ExportRecord['format']
 	};
 }
 

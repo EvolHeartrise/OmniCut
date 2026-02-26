@@ -22,8 +22,7 @@ import {
 	requeueExport as smRequeueExport,
 	loadAllExports as smLoadAllExports,
 	loadExport as smLoadExport,
-	deleteExport as smDeleteExport,
-	getClipEncodeStatuses as smGetClipEncodeStatuses
+	deleteExport as smDeleteExport
 } from '$lib/server/streamManager.js';
 import {
 	addIgnoredChannel,
@@ -33,7 +32,11 @@ import {
 	saveChannelSettings,
 	loadWatchlist as dbLoadWatchlist,
 	addToWatchlist as dbAddToWatchlist,
-	removeFromWatchlist as dbRemoveFromWatchlist
+	removeFromWatchlist as dbRemoveFromWatchlist,
+	saveCameraBounds as dbSaveCameraBounds,
+	resolveCameraBounds as dbResolveCameraBounds,
+	deleteCameraBounds as dbDeleteCameraBounds,
+	loadCameraBoundsForChannel as dbLoadCameraBoundsForChannel
 } from '$lib/server/persistence.js';
 import {
 	twitchGql,
@@ -48,7 +51,7 @@ import {
 	type BrowseStreamEdge,
 	type VideoEdge
 } from '$lib/server/twitchApi.js';
-import type { ChannelInfo, VodInfo } from '$lib/types.js';
+import type { ChannelInfo, VodInfo, CameraBoundsEntry } from '$lib/types.js';
 
 // ---------------------------------------------------------------------------
 // Queries — Stream & Media Data
@@ -349,6 +352,42 @@ export const deleteClipCmd = command('unchecked', async (args: { id: string }) =
 });
 
 // ---------------------------------------------------------------------------
+// Commands & Queries — Channel Camera Bounds
+// ---------------------------------------------------------------------------
+
+/** Save camera bounds for a channel at a specific timestamp. */
+export const saveCameraBoundsCmd = command(
+	'unchecked',
+	async (args: { channel: string; timestamp: number; camX: number; camY: number; camW: number; camH: number }): Promise<CameraBoundsEntry> => {
+		return dbSaveCameraBounds(args.channel, args.timestamp, args.camX, args.camY, args.camW, args.camH);
+	}
+);
+
+/** Resolve camera bounds for a channel at a timestamp (most recent entry at or before). */
+export const getCameraBoundsCmd = query(
+	'unchecked',
+	async (args: { channel: string; timestamp: number }): Promise<{ bounds: CameraBoundsEntry | null }> => {
+		return { bounds: dbResolveCameraBounds(args.channel, args.timestamp) };
+	}
+);
+
+/** Delete a camera bounds entry by ID. */
+export const deleteCameraBoundsCmd = command(
+	'unchecked',
+	async (args: { id: number }) => {
+		dbDeleteCameraBounds(args.id);
+	}
+);
+
+/** Load all camera bounds entries for a channel. */
+export const loadCameraBoundsForChannelCmd = query(
+	'unchecked',
+	async (args: { channel: string }): Promise<{ bounds: CameraBoundsEntry[] }> => {
+		return { bounds: dbLoadCameraBoundsForChannel(args.channel) };
+	}
+);
+
+// ---------------------------------------------------------------------------
 // Commands — Channel Settings & Watchlist
 // ---------------------------------------------------------------------------
 
@@ -397,7 +436,7 @@ export const exportVideoCmd = command('unchecked', async (args: { filename: stri
 	}
 	// Sort by startTime for the UI export path
 	const sortedIds = [...clips].sort((a, b) => a.startTime - b.startTime).map((c) => c.id);
-	const record = createAndQueueExport(sortedIds, args.filename.trim());
+	const record = createAndQueueExport(sortedIds, args.filename.trim(), undefined, undefined);
 	return { success: true, exportId: record.id };
 });
 
@@ -411,11 +450,6 @@ export const getExportCmd = query('unchecked', async (args: { id: string }) => {
 	const record = smLoadExport(args.id);
 	if (!record) throw new Error('Export not found');
 	return record;
-});
-
-/** Get encode statuses for a list of clip IDs. */
-export const getClipEncodeStatuses = query('unchecked', async (args: { clipIds: string[] }) => {
-	return smGetClipEncodeStatuses(args.clipIds);
 });
 
 /** Re-export an existing export in place (resets status and re-queues). */
@@ -616,13 +650,13 @@ export const deleteThumbnailCmd = command('unchecked', async (args: { id: string
 });
 
 /** Export selected clips by IDs (in order). */
-export const exportSelectedClipsCmd = command('unchecked', async (args: { clipIds: string[]; title: string }) => {
+export const exportSelectedClipsCmd = command('unchecked', async (args: { clipIds: string[]; title: string; format?: 'standard' | 'mobile_short' }) => {
 	if (!args.clipIds || args.clipIds.length === 0) {
 		throw new Error('No clips selected');
 	}
 	if (!args.title?.trim()) {
 		throw new Error('Title is required');
 	}
-	const record = createAndQueueExport(args.clipIds, args.title.trim());
+	const record = createAndQueueExport(args.clipIds, args.title.trim(), undefined, args.format);
 	return { success: true, exportId: record.id };
 });

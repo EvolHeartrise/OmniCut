@@ -26,8 +26,8 @@ import {
 	getStreamRecordingDir
 } from './streamManager.js';
 
-import { extractFrame } from './clipEncoder.js';
-import { loadWatchlist, loadWordTimestamps } from './persistence.js';
+import { extractFrame, extractFrameCropped } from './hlsUtils.js';
+import { loadWatchlist, loadWordTimestamps, saveCameraBounds, resolveCameraBounds } from './persistence.js';
 
 import {
 	fetchTwitchChannel,
@@ -702,6 +702,38 @@ export function createMcpServer(): McpServer {
 	);
 
 	// ---------------------------------------------------------------------------
+	// Tool — set_camera_bounds  (mutating)
+	// ---------------------------------------------------------------------------
+
+	mcpServer.tool(
+		'set_camera_bounds',
+		'Set webcam camera bounds for a channel at a specific timestamp. Bounds are stored per-channel and resolved by time when needed.',
+		{
+			channel: z.string().describe('Channel login (case-insensitive)'),
+			timestamp: z.number().describe('Master time (epoch seconds) when these bounds apply'),
+			camX: z.number().min(0).max(1).describe('Camera region left edge (normalized 0-1)'),
+			camY: z.number().min(0).max(1).describe('Camera region top edge (normalized 0-1)'),
+			camW: z.number().min(0).max(1).describe('Camera region width (normalized 0-1)'),
+			camH: z.number().min(0).max(1).describe('Camera region height (normalized 0-1)')
+		},
+		async ({ channel, timestamp, camX, camY, camW, camH }) => {
+			const entry = saveCameraBounds(channel, timestamp, camX, camY, camW, camH);
+			return {
+				content: [{
+					type: 'text' as const,
+					text: JSON.stringify({
+						success: true,
+						id: entry.id,
+						channel: entry.channel,
+						timestamp: entry.timestamp,
+						message: `Camera bounds saved for "${entry.channel}" at ${new Date(timestamp * 1000).toISOString()}`
+					})
+				}]
+			};
+		}
+	);
+
+	// ---------------------------------------------------------------------------
 	// Tool — get_hotspots  (chat density)
 	// ---------------------------------------------------------------------------
 
@@ -851,9 +883,14 @@ export function createMcpServer(): McpServer {
 			clipIds: z.array(z.string()).min(1),
 			title: z.string().describe('Used as filename'),
 			description: z.string().optional(),
-			chronological: z.boolean().optional().default(false)
+			chronological: z.boolean().optional().default(false),
+			format: z
+				.enum(['standard', 'mobile_short'])
+				.optional()
+				.default('standard')
+				.describe('"standard" (16:9) or "mobile_short" (9:16 vertical with gameplay + webcam)')
 		},
-		async ({ clipIds, title, description, chronological }) => {
+		async ({ clipIds, title, description, chronological, format }) => {
 			try {
 				let finalClipIds = clipIds;
 				if (chronological) {
@@ -866,7 +903,8 @@ export function createMcpServer(): McpServer {
 						return ca.startTime - cb.startTime;
 					});
 				}
-				const record = createAndQueueExport(finalClipIds, title, description);
+				const record = createAndQueueExport(finalClipIds, title, description, format);
+				const formatLabel = format === 'mobile_short' ? ' (9:16 vertical)' : '';
 				return {
 					content: [
 						{
@@ -874,7 +912,7 @@ export function createMcpServer(): McpServer {
 							text: JSON.stringify({
 								success: true,
 								exportId: record.id,
-								message: `Export "${title}" queued with ${finalClipIds.length} clip(s)${chronological ? ' (sorted chronologically)' : ''}. Use get_exports to check status.`
+								message: `Export "${title}" queued with ${finalClipIds.length} clip(s)${chronological ? ' (sorted chronologically)' : ''}${formatLabel}. Use get_exports to check status.`
 							})
 						}
 					]
@@ -929,7 +967,7 @@ export function createMcpServer(): McpServer {
 
 	mcpServer.tool(
 		'get_screenshot',
-		'Capture a JPEG frame from a stream at a given timestamp.',
+		'Capture a JPEG frame from a stream at a given timestamp. Use region "camera" to crop to the channel\'s webcam camera bounds (resolved from channel_camera_bounds table).',
 		{
 			streamId: z.string(),
 			timestamp: z.number(),
@@ -937,9 +975,14 @@ export function createMcpServer(): McpServer {
 				.enum(['master', 'local'])
 				.optional()
 				.default('local')
-				.describe('"local" (stream-relative, default) or "master" (epoch)')
+				.describe('"local" (stream-relative, default) or "master" (epoch)'),
+			region: z
+				.enum(['full', 'camera'])
+				.optional()
+				.default('full')
+				.describe('"full" (entire frame, default) or "camera" (crop to channel\'s webcam region)')
 		},
-		async ({ streamId, timestamp, timeFormat }) => {
+		async ({ streamId, timestamp, timeFormat, region }) => {
 			const stream = getStream(streamId);
 			if (!stream) {
 				return {
@@ -973,8 +1016,25 @@ export function createMcpServer(): McpServer {
 				};
 			}
 
+			// Resolve camera crop filter if requested
+			let cropFilter: string | null = null;
+			if (region === 'camera') {
+				// Resolve bounds from channel table using stream's channel + timestamp
+				const cam = resolveCameraBounds(stream.channel, timestamp);
+				if (!cam) {
+					return {
+						isError: true,
+						content: [{ type: 'text' as const, text: `No camera bounds set for channel "${stream.channel}". Use set_camera_bounds first.` }]
+					};
+				}
+				// Build crop filter using normalized coords — ffmpeg crop uses iw/ih expressions
+				cropFilter = `crop=iw*${cam.camW.toFixed(6)}:ih*${cam.camH.toFixed(6)}:iw*${cam.camX.toFixed(6)}:ih*${cam.camY.toFixed(6)}`;
+			}
+
 			try {
-				const buffer = await extractFrame(recordingDir, localTs);
+				const buffer = cropFilter
+					? await extractFrameCropped(recordingDir, localTs, cropFilter)
+					: await extractFrame(recordingDir, localTs);
 				return {
 					content: [
 						{

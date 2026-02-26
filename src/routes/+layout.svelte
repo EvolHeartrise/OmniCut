@@ -16,6 +16,7 @@
 
 	const tabs = [
 		{ href: '/browse', label: 'Browse' },
+		{ href: '/watchlist', label: 'Watchlist' },
 		{ href: '/library', label: 'Library' },
 		{ href: '/clipping', label: 'Clipping' },
 		{ href: '/clips', label: 'Clips' },

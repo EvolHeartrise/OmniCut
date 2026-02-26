@@ -1,5 +1,4 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
 	import Hls from 'hls.js';
 	import {
 		streams,
@@ -7,11 +6,11 @@
 		clipRegions,
 		saveClipRegion,
 		deleteClipRegion,
-		clipEncodeStatuses,
 		type ClipRegion
 	} from '$lib/stores/streams.js';
 	import { formatDuration, createHlsConfig } from '$lib/utils.js';
-	import { getClipEncodeStatuses, exportSelectedClipsCmd } from '$lib/streams.remote';
+	import { exportSelectedClipsCmd, loadCameraBoundsForChannelCmd } from '$lib/streams.remote';
+	import type { CameraBoundsEntry } from '$lib/types.js';
 
 	// --- Filter state ---
 	let filterChannel = $state<string>('');
@@ -42,10 +41,57 @@
 	let previewDuration = $state('0:00');
 	let isSeeking = $state(false);
 
+	// --- Channel camera bounds (loaded per-channel for CAM badge + export warnings) ---
+	let channelBoundsMap = $state<Record<string, CameraBoundsEntry[]>>({});
+
+	/** Resolve camera bounds for a clip (find most recent entry at or before clip.startTime). */
+	function resolveClipCamBounds(clip: ClipRegion): CameraBoundsEntry | null {
+		const stream = $streams.find((s) => s.id === clip.streamId);
+		if (!stream) return null;
+		const entries = channelBoundsMap[stream.channel];
+		if (!entries || entries.length === 0) return null;
+		// entries are sorted by timestamp ascending — find last one <= clip.startTime
+		let best: CameraBoundsEntry | null = null;
+		for (const e of entries) {
+			if (e.timestamp <= clip.startTime) best = e;
+			else break;
+		}
+		return best;
+	}
+
+	// Load camera bounds for all relevant channels when clips change
+	$effect(() => {
+		const channels = new Set<string>();
+		for (const clip of $clipRegions) {
+			const stream = $streams.find((s) => s.id === clip.streamId);
+			if (stream) channels.add(stream.channel);
+		}
+		for (const ch of channels) {
+			if (!(ch in channelBoundsMap)) {
+				loadCameraBoundsForChannelCmd({ channel: ch })
+					.then((result) => {
+						channelBoundsMap = { ...channelBoundsMap, [ch]: result.bounds };
+					})
+					.catch(() => {});
+			}
+		}
+	});
+
 	// --- Export creation ---
 	let exportTitle = $state('');
+	let exportFormat = $state<'standard' | 'mobile_short'>('standard');
 	let exporting = $state(false);
 	let exportResult = $state<{ success: boolean; message: string } | null>(null);
+
+	// Count selected clips missing cam regions (relevant for mobile_short)
+	let missingCamCount = $derived.by(() => {
+		if (exportFormat !== 'mobile_short') return 0;
+		let count = 0;
+		for (const clip of filteredClips) {
+			if (selectedIds.has(clip.id) && !resolveClipCamBounds(clip)) count++;
+		}
+		return count;
+	});
 
 	// Unique channels for the filter dropdown
 	let uniqueChannels = $derived.by(() => {
@@ -101,22 +147,6 @@
 		}
 		return total;
 	});
-
-	// Fetch initial clip encode statuses
-	onMount(() => {
-		fetchEncodeStatuses();
-	});
-
-	async function fetchEncodeStatuses() {
-		const ids = $clipRegions.map((c) => c.id);
-		if (ids.length === 0) return;
-		try {
-			const statuses = await getClipEncodeStatuses({ clipIds: ids });
-			clipEncodeStatuses.update((current) => ({ ...current, ...statuses }));
-		} catch {
-			// Ignore errors
-		}
-	}
 
 	// --- Selection helpers ---
 	function toggleSelect(id: string) {
@@ -349,7 +379,7 @@
 		exporting = true;
 		exportResult = null;
 		try {
-			const data = await exportSelectedClipsCmd({ clipIds: selectedClipIds, title });
+			const data = await exportSelectedClipsCmd({ clipIds: selectedClipIds, title, format: exportFormat });
 			exportResult = { success: true, message: `Export "${title}" queued (ID: ${data.exportId})` };
 			exportTitle = '';
 		} catch (err) {
@@ -400,21 +430,6 @@
 		};
 	});
 
-	// Helper: get encode status badge info
-	function encodeStatusInfo(status: string | undefined): { label: string; cls: string } {
-		switch (status) {
-			case 'ready':
-				return { label: 'Encoded', cls: 'badge-ready' };
-			case 'encoding':
-				return { label: 'Encoding...', cls: 'badge-encoding' };
-			case 'pending':
-				return { label: 'Pending', cls: 'badge-pending' };
-			case 'error':
-				return { label: 'Error', cls: 'badge-error' };
-			default:
-				return { label: 'Unknown', cls: 'badge-unknown' };
-		}
-	}
 
 	function clipChannel(clip: ClipRegion): string {
 		const stream = $streams.find((s) => s.id === clip.streamId);
@@ -491,10 +506,17 @@
 								if (e.key === 'Enter') createExport();
 							}}
 						/>
+						<select class="format-select" bind:value={exportFormat}>
+							<option value="standard">Standard (16:9)</option>
+							<option value="mobile_short">Mobile Short (9:16)</option>
+						</select>
 						<button class="btn-export" onclick={createExport} disabled={exporting || selectedIds.size === 0}>
 							{exporting ? 'Queueing...' : `Export ${selectedIds.size} clips`}
 						</button>
 					</div>
+					{#if missingCamCount > 0}
+						<span class="cam-warning">{missingCamCount} clip{missingCamCount !== 1 ? 's' : ''} missing camera region</span>
+					{/if}
 				{/if}
 			</div>
 
@@ -516,8 +538,6 @@
 			{:else}
 				{#each filteredClips as clip (clip.id)}
 					{@const dur = clip.endTime - clip.startTime}
-					{@const encStatus = $clipEncodeStatuses[clip.id]}
-					{@const badge = encodeStatusInfo(encStatus)}
 					{@const isEditing = editingId === clip.id}
 					{@const isPreviewing = previewClip?.id === clip.id}
 					<div class="clip-item" class:selected={selectedIds.has(clip.id)} class:previewing={isPreviewing}>
@@ -555,6 +575,9 @@
 										{#if clip.createdBy === 'ai'}
 											<span class="clip-badge ai">AI</span>
 										{/if}
+										{#if resolveClipCamBounds(clip)}
+											<span class="clip-badge cam">CAM</span>
+										{/if}
 									</div>
 									{#if clip.notes}
 										<div class="clip-notes">{clip.notes}</div>
@@ -562,7 +585,6 @@
 									<div class="clip-details">
 										<span class="clip-time">{clipDate(clip.startTime)}</span>
 										<span class="clip-dur">{formatDuration(dur)}</span>
-										<span class="encode-badge {badge.cls}">{badge.label}</span>
 									</div>
 								{/if}
 							</div>
@@ -751,6 +773,27 @@
 		border-color: #7c3aed;
 	}
 
+	.format-select {
+		background: #1a1a2e;
+		border: 1px solid #2a2a4a;
+		color: #e0e0ff;
+		font-size: 0.75rem;
+		padding: 4px 8px;
+		border-radius: 4px;
+		outline: none;
+	}
+
+	.format-select:focus {
+		border-color: #7c3aed;
+	}
+
+	.cam-warning {
+		font-size: 0.65rem;
+		color: #fbbf24;
+		margin-left: auto;
+		white-space: nowrap;
+	}
+
 	.btn-export {
 		background: #7c3aed;
 		border: none;
@@ -868,6 +911,11 @@
 		color: #60a5fa;
 	}
 
+	.clip-badge.cam {
+		background: rgba(168, 85, 247, 0.2);
+		color: #a855f7;
+	}
+
 	.clip-notes {
 		font-size: 0.7rem;
 		color: #777;
@@ -894,38 +942,6 @@
 		color: #888;
 		font-variant-numeric: tabular-nums;
 		font-family: monospace;
-	}
-
-	.encode-badge {
-		font-size: 0.6rem;
-		padding: 1px 6px;
-		border-radius: 3px;
-		font-weight: 500;
-	}
-
-	.badge-ready {
-		background: rgba(22, 163, 74, 0.15);
-		color: #4ade80;
-	}
-
-	.badge-encoding {
-		background: rgba(234, 179, 8, 0.15);
-		color: #fbbf24;
-	}
-
-	.badge-pending {
-		background: rgba(100, 100, 100, 0.15);
-		color: #999;
-	}
-
-	.badge-error {
-		background: rgba(220, 38, 38, 0.15);
-		color: #f87171;
-	}
-
-	.badge-unknown {
-		background: rgba(80, 80, 80, 0.15);
-		color: #666;
 	}
 
 	.clip-actions {

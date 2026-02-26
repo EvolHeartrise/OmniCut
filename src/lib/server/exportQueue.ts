@@ -1,16 +1,18 @@
 /**
  * Export queue module.
  * Sequential FIFO queue for video exports — one active export at a time
- * to avoid FFmpeg/disk I/O contention with the clip encoder.
+ * to avoid FFmpeg/disk I/O contention.
  */
 
 import { newExportId } from '../ids.js';
 import { getClipRegion } from './clipManager.js';
-import { exportVideo } from './exporter.js';
+import { exportVideo, type StreamLookup } from './exporter.js';
+import { exportVerticalVideo, type VerticalClip } from './verticalExporter.js';
 import { cleanupFiles } from './fsUtils.js';
 import * as db from './persistence.js';
 import type { ExportRecord } from './persistence.js';
 import { broadcastExportStatus } from './sseBroadcaster.js';
+import { getStream, getStreamRecordingDir } from './streamManager.js';
 
 // --- State ---
 
@@ -23,7 +25,7 @@ let activeExport: { exportId: string } | null = null;
  * Create and enqueue a new export. Returns the ExportRecord.
  * Validates that all clip IDs exist before creating.
  */
-export function createAndQueueExport(clipIds: string[], title: string, description?: string): ExportRecord {
+export function createAndQueueExport(clipIds: string[], title: string, description?: string, format?: 'standard' | 'mobile_short'): ExportRecord {
 	// Validate all clip IDs exist
 	const missing: string[] = [];
 	for (const clipId of clipIds) {
@@ -42,7 +44,8 @@ export function createAndQueueExport(clipIds: string[], title: string, descripti
 		...(description && { description }),
 		clipIds,
 		status: 'pending',
-		createdAt: Math.floor(Date.now() / 1000)
+		createdAt: Math.floor(Date.now() / 1000),
+		format: format ?? 'standard'
 	};
 
 	db.saveExport(record);
@@ -159,11 +162,49 @@ async function runExport(exportId: string): Promise<void> {
 	broadcastExportStatus(exportId, 'exporting');
 
 	try {
-		const { outputPath } = await exportVideo(clips, exportId, () => {});
+		// Build stream lookup map for all clips
+		const streamMap = new Map<string, StreamLookup>();
+		for (const clip of clips) {
+			if (streamMap.has(clip.streamId)) continue;
+			const stream = getStream(clip.streamId);
+			const recordingDir = getStreamRecordingDir(clip.streamId);
+			if (stream && recordingDir) {
+				streamMap.set(clip.streamId, {
+					recordingDir,
+					startedAt: stream.startedAt,
+					offset: stream.offset
+				});
+			}
+		}
+
+		let outputPath: string;
+		if (record.format === 'mobile_short') {
+			// Resolve camera bounds from channel table for each clip
+			const verticalClips: VerticalClip[] = [];
+			for (const clip of clips) {
+				const stream = getStream(clip.streamId);
+				if (!stream) {
+					console.warn(`[export-queue] Skipping clip ${clip.id} — stream not found`);
+					continue;
+				}
+				const cam = db.resolveCameraBounds(stream.channel, clip.startTime);
+				if (!cam) {
+					console.warn(`[export-queue] Skipping clip ${clip.id} — no camera bounds for ${stream.channel}`);
+					continue;
+				}
+				verticalClips.push({ clip, cam });
+			}
+			if (verticalClips.length === 0) {
+				throw new Error('No clips have camera bounds set — cannot create vertical export');
+			}
+			({ outputPath } = await exportVerticalVideo(verticalClips, streamMap, exportId, () => {}));
+		} else {
+			({ outputPath } = await exportVideo(clips, streamMap, exportId, () => {}));
+		}
 
 		db.updateExportStatus(exportId, 'ready', outputPath);
 		broadcastExportStatus(exportId, 'ready', outputPath);
-		console.log(`[export-queue] Export "${record.title}" complete → ${outputPath}`);
+		console.log(`[export-queue] Export "${record.title}" (${record.format}) complete → ${outputPath}`);
 	} catch (err: unknown) {
 		const message = err instanceof Error ? err.message : String(err);
 		db.updateExportStatus(exportId, 'error', undefined, message);

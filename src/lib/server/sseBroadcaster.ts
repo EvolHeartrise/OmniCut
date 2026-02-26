@@ -139,14 +139,6 @@ export function broadcastClipRegionsChanged(
 	broadcast(JSON.stringify({ type: 'clip-regions-changed', clipRegions }));
 }
 
-export function broadcastClipEncodeStatus(
-	clipId: string,
-	status: 'pending' | 'encoding' | 'ready' | 'error',
-	error?: string
-) {
-	broadcast(JSON.stringify({ type: 'clip-encode-status', clipId, status, ...(error && { error }) }));
-}
-
 export function broadcastExportStatus(exportId: string, status: string, outputPath?: string, error?: string) {
 	broadcast(
 		JSON.stringify({

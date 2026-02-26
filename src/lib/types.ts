@@ -9,6 +9,17 @@ export interface ClipRegion {
 	notes?: string; // longer description/context
 }
 
+/** Per-channel camera bounds at a point in time. */
+export interface CameraBoundsEntry {
+	id: number;
+	channel: string;
+	timestamp: number; // master time (epoch seconds)
+	camX: number; // normalized 0-1
+	camY: number;
+	camW: number;
+	camH: number;
+}
+
 /** VOD info returned by the channel vods API. */
 export interface VodInfo {
 	id: string;

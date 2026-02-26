@@ -1,12 +1,12 @@
 import type { RequestHandler } from './$types.js';
 import { getStreamRecordingDir } from '$lib/server/streamManager.js';
-import { extractFrame } from '$lib/server/clipEncoder.js';
+import { extractFrame } from '$lib/server/hlsUtils.js';
 
 /**
  * GET /api/frame/:streamId?t=<local_seconds>
  *
  * Extracts a single JPEG frame from an HLS recording at the given local timestamp.
- * Reuses extractFrame() from clipEncoder.
+ * Reuses extractFrame() from hlsUtils.
  */
 export const GET: RequestHandler = async ({ params, url }) => {
 	const streamId = params.streamId;
