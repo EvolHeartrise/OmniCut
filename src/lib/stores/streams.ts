@@ -96,6 +96,16 @@ export interface ExportStatusEvent {
 }
 export const exportStatusEvents = writable<ExportStatusEvent[]>([]);
 
+// YouTube upload status updates (fed by SSE youtube-upload-status events)
+export interface YouTubeUploadStatusEvent {
+	uploadId: string;
+	status: string;
+	progress?: number;
+	youtubeVideoId?: string;
+	error?: string;
+}
+export const youtubeUploadEvents = writable<YouTubeUploadStatusEvent[]>([]);
+
 // Master timeline control: streams react to seq changes
 export const masterControl = writable<{
 	action: 'seek' | 'play' | 'pause' | 'step';
@@ -345,6 +355,17 @@ export function connectSSE(): () => void {
 						exportId: data.exportId,
 						status: data.status,
 						outputPath: data.outputPath,
+						error: data.error
+					}
+				]);
+			} else if (data.type === 'youtube-upload-status') {
+				youtubeUploadEvents.update((events) => [
+					...events,
+					{
+						uploadId: data.uploadId,
+						status: data.status,
+						progress: data.progress,
+						youtubeVideoId: data.youtubeVideoId,
 						error: data.error
 					}
 				]);

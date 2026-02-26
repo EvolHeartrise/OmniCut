@@ -432,6 +432,100 @@ export const deleteExportCmd = command('unchecked', async (args: { id: string })
 	return { success: true };
 });
 
+// ---------------------------------------------------------------------------
+// Queries — YouTube
+// ---------------------------------------------------------------------------
+
+/** YouTube integration status and connected accounts. */
+export const youtubeStatus = query(async () => {
+	const { isConfigured } = await import('$lib/server/youtubeClient.js');
+	const { loadAllYouTubeAccounts } = await import('$lib/server/persistence.js');
+	return {
+		configured: isConfigured(),
+		accounts: loadAllYouTubeAccounts().map((a) => ({
+			id: a.id,
+			channelId: a.channelId,
+			channelName: a.channelName,
+			channelThumbnail: a.channelThumbnail
+		}))
+	};
+});
+
+/** Fetch YouTube video categories. */
+export const youtubeCategories = query('unchecked', async (args: { regionCode?: string }) => {
+	const { getVideoCategories } = await import('$lib/server/youtubeClient.js');
+	return { categories: await getVideoCategories(args.regionCode) };
+});
+
+/** Fetch YouTube playlists for a specific account. */
+export const youtubePlaylists = query('unchecked', async (args: { accountId: string }) => {
+	const { getUserPlaylists } = await import('$lib/server/youtubeClient.js');
+	return { playlists: await getUserPlaylists(args.accountId) };
+});
+
+/** List all YouTube uploads. */
+export const youtubeUploads = query(async () => {
+	const { loadAllUploads } = await import('$lib/server/youtubeUploadQueue.js');
+	return { uploads: loadAllUploads() };
+});
+
+/** List YouTube uploads for a specific export. */
+export const youtubeUploadsByExport = query('unchecked', async (args: { exportId: string }) => {
+	const { loadUploadsByExport } = await import('$lib/server/youtubeUploadQueue.js');
+	return { uploads: loadUploadsByExport(args.exportId) };
+});
+
+// ---------------------------------------------------------------------------
+// Commands — YouTube
+// ---------------------------------------------------------------------------
+
+/** Get the YouTube OAuth URL for connecting a new account. */
+export const youtubeAuthUrlCmd = query(async () => {
+	const { getAuthUrl, isConfigured } = await import('$lib/server/youtubeClient.js');
+	if (!isConfigured()) throw new Error('YouTube integration not configured');
+	return { url: getAuthUrl() };
+});
+
+/** Remove a connected YouTube account. */
+export const youtubeRemoveAccountCmd = command('unchecked', async (args: { accountId: string }) => {
+	const { deleteYouTubeAccount } = await import('$lib/server/persistence.js');
+	deleteYouTubeAccount(args.accountId);
+	return { success: true };
+});
+
+/** Queue a YouTube upload. */
+export const youtubeUploadCmd = command(
+	'unchecked',
+	async (args: {
+		exportId: string;
+		accountId: string;
+		title: string;
+		description?: string;
+		privacy: string;
+		tags?: string[];
+		categoryId?: string;
+		playlistId?: string;
+	}) => {
+		const { createAndQueueUpload } = await import('$lib/server/youtubeUploadQueue.js');
+		const record = createAndQueueUpload(args.exportId, args.accountId, {
+			title: args.title,
+			description: args.description,
+			privacy: args.privacy,
+			tags: args.tags,
+			categoryId: args.categoryId,
+			playlistId: args.playlistId
+		});
+		return { uploadId: record.id };
+	}
+);
+
+/** Delete a YouTube upload record. */
+export const youtubeDeleteUploadCmd = command('unchecked', async (args: { id: string }) => {
+	const { deleteUpload } = await import('$lib/server/youtubeUploadQueue.js');
+	deleteUpload(args.id);
+	return { success: true };
+});
+
 /** Export selected clips by IDs (in order). */
 export const exportSelectedClipsCmd = command('unchecked', async (args: { clipIds: string[]; title: string }) => {
 	if (!args.clipIds || args.clipIds.length === 0) {

@@ -21,7 +21,8 @@
 		{ href: '/clipping', label: 'Clipping' },
 		{ href: '/clips', label: 'Clips' },
 		{ href: '/review', label: 'Review' },
-		{ href: '/exports', label: 'Exports' }
+		{ href: '/exports', label: 'Exports' },
+		{ href: '/upload', label: 'Upload' }
 	];
 </script>
 

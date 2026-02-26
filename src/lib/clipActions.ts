@@ -14,9 +14,16 @@ export async function splitClipRegion(
 
 	deleteClipRegion(clip.id);
 
+	const shared = {
+		streamId: clip.streamId,
+		createdBy: clip.createdBy,
+		title: clip.title,
+		notes: clip.notes
+	};
+
 	const [firstHalf, secondHalf] = await Promise.all([
-		createClipRegion({ streamId: clip.streamId, startTime: clip.startTime, endTime: splitTime }),
-		createClipRegion({ streamId: clip.streamId, startTime: splitTime, endTime: clip.endTime })
+		createClipRegion({ ...shared, startTime: clip.startTime, endTime: splitTime }),
+		createClipRegion({ ...shared, startTime: splitTime, endTime: clip.endTime })
 	]);
 
 	// No local store update needed — SSE broadcast handles it

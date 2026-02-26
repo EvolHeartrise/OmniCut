@@ -433,6 +433,9 @@
 										{isPreviewing ? '\u2715' : '\u25B6'}
 									</button>
 								{/if}
+								{#if exp.status === 'ready'}
+									<a class="btn-upload" href="/upload?export={exp.id}">Upload</a>
+								{/if}
 								{#if exp.status === 'ready' || exp.status === 'error'}
 									<button class="btn-reexport" onclick={() => handleReexport(exp.id)}>Re-export</button>
 									<button class="btn-delete" onclick={() => handleDelete(exp.id)}>Delete</button>
@@ -587,6 +590,22 @@
 	.btn-preview:hover {
 		background: #3a3a5a;
 		color: #fff;
+	}
+
+	.btn-upload {
+		background: rgba(124, 58, 237, 0.15);
+		border: 1px solid rgba(124, 58, 237, 0.3);
+		color: #a78bfa;
+		font-size: 0.65rem;
+		padding: 2px 8px;
+		border-radius: 3px;
+		cursor: pointer;
+		text-decoration: none;
+	}
+
+	.btn-upload:hover {
+		background: rgba(124, 58, 237, 0.25);
+		color: #c4b5fd;
 	}
 
 	.btn-reexport {

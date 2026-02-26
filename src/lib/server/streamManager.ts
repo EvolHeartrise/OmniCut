@@ -43,6 +43,7 @@ import {
 	loadExport,
 	loadAllExports
 } from './exportQueue.js';
+import { restoreUploadQueue, shutdownUploadQueue } from './youtubeUploadQueue.js';
 
 const RECORDINGS_DIR = path.resolve(process.env.RECORDINGS_DIR || path.join(process.cwd(), 'recordings'));
 
@@ -204,6 +205,9 @@ export async function initStreamManager(): Promise<void> {
 
 	// Mark any incomplete exports from a previous session as error
 	restoreExportQueue();
+
+	// Mark any incomplete YouTube uploads from a previous session as error
+	restoreUploadQueue();
 
 	// Resume chat downloads for Twitch VODs that didn't finish
 	let chatResumed = 0;
@@ -765,6 +769,7 @@ export { createAndQueueExport, loadExport, loadAllExports, deleteExport } from '
  * Clean up all captures on shutdown.
  */
 export function shutdownAll() {
+	shutdownUploadQueue();
 	shutdownExportQueue();
 	shutdownEncoder();
 	shutdownTranscriber();

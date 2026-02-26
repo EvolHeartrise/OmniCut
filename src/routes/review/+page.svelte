@@ -10,8 +10,9 @@
 		type ClipRegion
 	} from '$lib/stores/streams.js';
 	import { formatDuration, createHlsConfig } from '$lib/utils.js';
-	import { getClipEncodeStatuses } from '$lib/streams.remote';
+	import { getClipEncodeStatuses, getMultiStreamTranscriptions } from '$lib/streams.remote';
 	import { splitClipRegion } from '$lib/clipActions.js';
+	import { untrack } from 'svelte';
 
 	// --- Current clip under review (oldest AI clip) ---
 	let aiClips = $derived(
@@ -77,9 +78,14 @@
 	let loadedClipId = $state<string | null>(null);
 	let playbackRate = $state(1);
 
+	// --- Transcription regions ---
+	let transcriptionRegions = $state<Array<{ startFrac: number; endFrac: number; text: string }>>([]);
+
 	// --- Waveform ---
 	const WAVEFORM_BINS = 800;
-	let waveformCanvas = $state<HTMLCanvasElement | null>(null);
+	let waveformBgCanvas = $state<HTMLCanvasElement | null>(null);
+	let waveformFgCanvas = $state<HTMLCanvasElement | null>(null);
+	let waveformSeekEl = $state<HTMLElement | null>(null);
 	let waveformPeaks = new Float32Array(WAVEFORM_BINS);
 	let waveformActive = false;
 	let isDraggingWaveform = $state(false);
@@ -153,6 +159,7 @@
 				.play()
 				.then(() => {
 					playing = true;
+					startWaveformLoop();
 				})
 				.catch(() => {});
 		};
@@ -217,6 +224,38 @@
 			.catch(() => {});
 	});
 
+	// Fetch transcription regions for current clip
+	$effect(() => {
+		const clip = currentClip;
+		if (!clip) {
+			transcriptionRegions = [];
+			return;
+		}
+		// untrack store reads so SSE stream-update events don't re-trigger this effect
+		const bounds = untrack(() => getClipLocalBounds(clip));
+		if (!bounds) {
+			transcriptionRegions = [];
+			return;
+		}
+		const { localStart, localEnd } = bounds;
+		const clipDur = localEnd - localStart;
+		if (clipDur <= 0) {
+			transcriptionRegions = [];
+			return;
+		}
+		getMultiStreamTranscriptions({ ranges: [{ streamId: clip.streamId, from: localStart, to: localEnd }] })
+			.then((entries) => {
+				transcriptionRegions = entries.map((e) => ({
+					startFrac: Math.max(0, (e.startTime - localStart) / clipDur),
+					endFrac: Math.min(1, (e.endTime - localStart) / clipDur),
+					text: e.text
+				}));
+			})
+			.catch(() => {
+				transcriptionRegions = [];
+			});
+	});
+
 	// Clamp playback to clip bounds
 	function handleTimeUpdate() {
 		if (!videoEl || !currentClip) return;
@@ -265,9 +304,14 @@
 
 	function togglePlay() {
 		if (!videoEl) return;
-		if (playing) videoEl.pause();
-		else videoEl.play().catch(() => {});
-		playing = !playing;
+		if (playing) {
+			videoEl.pause();
+			playing = false;
+		} else {
+			videoEl.play().catch(() => {});
+			playing = true;
+			startWaveformLoop();
+		}
 	}
 
 	// --- Actions ---
@@ -332,69 +376,66 @@
 		if (videoEl) videoEl.playbackRate = playbackRate;
 	}
 
-	function drawWaveform() {
-		const canvas = waveformCanvas;
-		if (!canvas) return;
-		const ctx = canvas.getContext('2d');
-		if (!ctx) return;
+	/** Draw static waveform bars on both canvases (called only when peaks change). */
+	function drawStaticWaveform() {
+		const bg = waveformBgCanvas;
+		const fg = waveformFgCanvas;
+		if (!bg || !fg) return;
+		const bgCtx = bg.getContext('2d');
+		const fgCtx = fg.getContext('2d');
+		if (!bgCtx || !fgCtx) return;
 
 		const dpr = window.devicePixelRatio || 1;
-		const rect = canvas.getBoundingClientRect();
+		const rect = bg.getBoundingClientRect();
 		const w = rect.width;
 		const h = rect.height;
+		const pw = Math.round(w * dpr);
+		const ph = Math.round(h * dpr);
 
-		if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
-			canvas.width = Math.round(w * dpr);
-			canvas.height = Math.round(h * dpr);
+		for (const [canvas, ctx] of [[bg, bgCtx], [fg, fgCtx]] as const) {
+			if (canvas.width !== pw || canvas.height !== ph) {
+				canvas.width = pw;
+				canvas.height = ph;
+			}
+			ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+			ctx.clearRect(0, 0, w, h);
 		}
-		ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-		ctx.clearRect(0, 0, w, h);
 
-		// Find peak for normalisation
 		let maxPeak = 0;
 		for (let i = 0; i < WAVEFORM_BINS; i++) {
 			if (waveformPeaks[i] > maxPeak) maxPeak = waveformPeaks[i];
 		}
-		if (maxPeak < 0.001) maxPeak = 1; // avoid div-by-zero
+		if (maxPeak < 0.001) maxPeak = 1;
 
 		const barW = w / WAVEFORM_BINS;
 		const halfH = h / 2;
-		const playBin = Math.floor(progress * WAVEFORM_BINS);
 
-		// Center line for empty regions
-		ctx.strokeStyle = '#1a1a2e';
-		ctx.lineWidth = 1;
-		ctx.beginPath();
-		ctx.moveTo(0, halfH);
-		ctx.lineTo(w, halfH);
-		ctx.stroke();
+		// Center line (bg only)
+		bgCtx.strokeStyle = '#1a1a2e';
+		bgCtx.lineWidth = 1;
+		bgCtx.beginPath();
+		bgCtx.moveTo(0, halfH);
+		bgCtx.lineTo(w, halfH);
+		bgCtx.stroke();
 
-		// Draw bars
+		// Draw bars: bg = unplayed color, fg = played color
+		bgCtx.fillStyle = '#2a2a4a';
+		fgCtx.fillStyle = '#7c3aed';
 		for (let i = 0; i < WAVEFORM_BINS; i++) {
 			const amp = waveformPeaks[i] / maxPeak;
 			const barH = Math.max(1, amp * (halfH - 2));
 			const x = i * barW;
-			ctx.fillStyle = i <= playBin ? '#7c3aed' : '#2a2a4a';
-			ctx.fillRect(x, halfH - barH, barW - 0.5, barH * 2);
+			bgCtx.fillRect(x, halfH - barH, barW - 0.5, barH * 2);
+			fgCtx.fillRect(x, halfH - barH, barW - 0.5, barH * 2);
 		}
-
-		// Playhead
-		const px = progress * w;
-		ctx.save();
-		ctx.shadowColor = '#7c3aed';
-		ctx.shadowBlur = 6;
-		ctx.strokeStyle = '#ffffff';
-		ctx.lineWidth = 2;
-		ctx.beginPath();
-		ctx.moveTo(px, 0);
-		ctx.lineTo(px, h);
-		ctx.stroke();
-		ctx.restore();
 	}
 
+	let rafId: number | null = null;
+
+	/** rAF loop: only updates progress/currentTime (no canvas drawing). */
 	function waveformLoop() {
+		rafId = null;
 		if (!waveformActive) return;
-		// Update progress every frame for smooth playhead
 		if (!isSeeking && videoEl && currentClip) {
 			const bounds = getClipLocalBounds(currentClip);
 			if (bounds) {
@@ -404,15 +445,22 @@
 				currentTime = fmtTime(elapsed);
 			}
 		}
-		drawWaveform();
-		requestAnimationFrame(waveformLoop);
+		if (playing || isDraggingWaveform) {
+			rafId = requestAnimationFrame(waveformLoop);
+		}
+	}
+
+	/** Start the continuous rAF loop (playing / dragging). */
+	function startWaveformLoop() {
+		if (rafId != null) return;
+		rafId = requestAnimationFrame(waveformLoop);
 	}
 
 	// --- Waveform pointer handlers ---
 	function waveformSeekFromEvent(e: PointerEvent) {
-		const canvas = waveformCanvas;
-		if (!canvas) return;
-		const rect = canvas.getBoundingClientRect();
+		const el = waveformSeekEl;
+		if (!el) return;
+		const rect = el.getBoundingClientRect();
 		const x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
 		progress = x;
 		if (currentClip) {
@@ -425,8 +473,9 @@
 		if (e.button !== 0) return;
 		isDraggingWaveform = true;
 		isSeeking = true;
-		(e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
+		(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
 		waveformSeekFromEvent(e);
+		startWaveformLoop();
 	}
 
 	function handleWaveformPointerMove(e: PointerEvent) {
@@ -438,7 +487,6 @@
 		if (!isDraggingWaveform) return;
 		isDraggingWaveform = false;
 		waveformSeekFromEvent(e);
-		// Commit seek
 		if (videoEl && currentClip) {
 			const bounds = getClipLocalBounds(currentClip);
 			if (bounds) {
@@ -494,6 +542,7 @@
 					peaks[bin] = Math.sqrt(sum / (end - start));
 				}
 				waveformPeaks = peaks;
+				drawStaticWaveform();
 			})
 			.catch(() => {});
 	}
@@ -520,17 +569,17 @@
 
 		// Rescan waveform for new boundaries
 		waveformPeaks = new Float32Array(WAVEFORM_BINS);
+		drawStaticWaveform();
 		stopWaveformScan();
 		startWaveformScan(updated);
 	}
 
 	function getMasterTimeAtPlayhead(): number | null {
-		if (!videoEl || !currentClip) return null;
-		const stream = $streams.find((s) => s.id === currentClip!.streamId);
-		if (!stream) return null;
-		const offset = $syncOffsets[currentClip!.streamId] || 0;
-		const anchor = stream.startedAt / 1000;
-		return videoEl.currentTime + anchor - offset;
+		if (!currentClip) return null;
+		// Derive from progress (the visual playhead position) rather than
+		// videoEl.currentTime, which lags behind after HLS keyframe seeks.
+		const clipDur = currentClip.endTime - currentClip.startTime;
+		return currentClip.startTime + progress * clipDur;
 	}
 
 	async function splitAtPlayhead() {
@@ -625,13 +674,18 @@
 		}
 	}
 
-	// Waveform animation loop lifecycle
+	// Waveform lifecycle
 	$effect(() => {
-		if (waveformCanvas) {
+		if (waveformBgCanvas && waveformFgCanvas) {
 			waveformActive = true;
-			waveformLoop();
+			drawStaticWaveform();
+			if (playing) startWaveformLoop();
 			return () => {
 				waveformActive = false;
+				if (rafId != null) {
+					cancelAnimationFrame(rafId);
+					rafId = null;
+				}
 			};
 		}
 	});
@@ -644,6 +698,10 @@
 				hls = null;
 			}
 			waveformActive = false;
+			if (rafId != null) {
+				cancelAnimationFrame(rafId);
+				rafId = null;
+			}
 			stopWaveformScan();
 		};
 	});
@@ -682,14 +740,28 @@
 						<button class="btn-ctl" onclick={togglePlay}>
 							{playing ? '⏸' : '▶'}
 						</button>
-						<div class="waveform-seek">
+						<!-- svelte-ignore a11y_no_static_element_interactions -->
+						<div
+							class="waveform-seek"
+							bind:this={waveformSeekEl}
+							onpointerdown={handleWaveformPointerDown}
+							onpointermove={handleWaveformPointerMove}
+							onpointerup={handleWaveformPointerUp}
+						>
+							<canvas bind:this={waveformBgCanvas} class="waveform-canvas"></canvas>
 							<canvas
-								bind:this={waveformCanvas}
-								class="waveform-canvas"
-								onpointerdown={handleWaveformPointerDown}
-								onpointermove={handleWaveformPointerMove}
-								onpointerup={handleWaveformPointerUp}
+								bind:this={waveformFgCanvas}
+								class="waveform-canvas waveform-fg"
+								style="clip-path: inset(0 {(1 - progress) * 100}% 0 0)"
 							></canvas>
+							{#each transcriptionRegions as region}
+								<div
+									class="transcript-region"
+									style="left: {region.startFrac * 100}%; width: {(region.endFrac - region.startFrac) * 100}%"
+									title={region.text}
+								></div>
+							{/each}
+							<div class="waveform-playhead" style="left: {progress * 100}%"></div>
 						</div>
 					</div>
 					<div class="transport-row">
@@ -740,6 +812,8 @@
 					<div class="clip-details">
 						<span>{clipDate(clip.startTime)}</span>
 						<span class="clip-dur">{formatDuration(dur)}</span>
+						<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+						<span class="clip-id" onclick={() => copyClipId(clip.id)} title="Click to copy">{clip.id}</span>
 					</div>
 				{/if}
 			</div>
@@ -769,7 +843,6 @@
 							&#8630; Undo<span class="undo-count">{undoStack.length}</span>
 						</button>
 					{/if}
-					<button class="btn-action btn-copy" onclick={() => copyClipId(clip.id)}> ID </button>
 				</div>
 			{/if}
 		</div>
@@ -859,11 +932,14 @@
 
 	.timeline-row .btn-ctl {
 		border-radius: 0;
-		padding: 0 14px;
+		padding: 0;
+		width: 44px;
 		flex-shrink: 0;
+		text-align: center;
 	}
 
 	.waveform-seek {
+		position: relative;
 		height: 64px;
 		cursor: pointer;
 		touch-action: none;
@@ -871,10 +947,36 @@
 		min-width: 0;
 	}
 
+	.transcript-region {
+		position: absolute;
+		top: 0;
+		bottom: 0;
+		background: rgba(56, 189, 248, 0.15);
+		border-left: 1px solid rgba(56, 189, 248, 0.3);
+		pointer-events: none;
+	}
+
 	.waveform-canvas {
 		display: block;
 		width: 100%;
 		height: 100%;
+	}
+
+	.waveform-fg {
+		position: absolute;
+		top: 0;
+		left: 0;
+	}
+
+	.waveform-playhead {
+		position: absolute;
+		top: 0;
+		bottom: 0;
+		width: 2px;
+		background: #fff;
+		box-shadow: 0 0 6px #7c3aed;
+		pointer-events: none;
+		transform: translateX(-1px);
 	}
 
 	.transport-row {
@@ -976,6 +1078,18 @@
 	.clip-dur {
 		font-variant-numeric: tabular-nums;
 		font-family: monospace;
+		color: #888;
+	}
+
+	.clip-id {
+		margin-left: auto;
+		font-family: monospace;
+		font-size: 0.7rem;
+		color: #555;
+		cursor: pointer;
+	}
+
+	.clip-id:hover {
 		color: #888;
 	}
 

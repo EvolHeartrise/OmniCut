@@ -158,3 +158,22 @@ export function broadcastExportStatus(exportId: string, status: string, outputPa
 		})
 	);
 }
+
+export function broadcastYouTubeUploadStatus(
+	uploadId: string,
+	status: string,
+	progress?: number,
+	youtubeVideoId?: string,
+	error?: string
+) {
+	broadcast(
+		JSON.stringify({
+			type: 'youtube-upload-status',
+			uploadId,
+			status,
+			...(progress != null && { progress }),
+			...(youtubeVideoId && { youtubeVideoId }),
+			...(error && { error })
+		})
+	);
+}

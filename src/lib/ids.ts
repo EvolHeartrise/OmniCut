@@ -1,3 +1,5 @@
 import { nanoid } from 'nanoid';
 
 export const newExportId = () => nanoid(12);
+export const newUploadId = () => nanoid(12);
+export const newYouTubeAccountId = () => nanoid(12);

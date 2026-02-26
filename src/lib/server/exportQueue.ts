@@ -137,11 +137,8 @@ async function runExport(exportId: string): Promise<void> {
 	db.updateExportStatus(exportId, 'exporting');
 	broadcastExportStatus(exportId, 'exporting');
 
-	// Derive filename from title
-	const safeName = record.title.replace(/[<>:"/\\|?*]/g, '_').slice(0, 100);
-
 	try {
-		const { outputPath } = await exportVideo(clips, safeName, () => {});
+		const { outputPath } = await exportVideo(clips, exportId, () => {});
 
 		db.updateExportStatus(exportId, 'ready', outputPath);
 		broadcastExportStatus(exportId, 'ready', outputPath);

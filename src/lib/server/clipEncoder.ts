@@ -173,6 +173,7 @@ function buildEncodeArgs(opts: EncodeOpts): string[] {
 		...videoArgs,
 		'-c:a', 'aac',
 		'-b:a', '192k',
+		'-video_track_timescale', '90000',
 		'-movflags', '+faststart',
 		'-y',
 		outputPath
@@ -400,6 +401,7 @@ async function encodeClip(clipId: string): Promise<void> {
 				'-t', dur.toFixed(3),
 				'-map', '0:v:0', '-map', '0:a:0',
 				'-c', 'copy',
+				'-video_track_timescale', '90000',
 				'-movflags', '+faststart',
 				'-y', outputPath
 			];
@@ -447,6 +449,7 @@ async function encodeClip(clipId: string): Promise<void> {
 						'-t', bulkDur.toFixed(3),
 						'-map', '0:v:0', '-map', '0:a:0',
 						'-c', 'copy',
+						'-video_track_timescale', '90000',
 						'-movflags', '+faststart',
 						'-y', bulkPath
 					];

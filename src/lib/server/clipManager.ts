@@ -39,7 +39,9 @@ export function createClipRegion(data: Omit<ClipRegion, 'id'>): ClipRegion {
 	const region: ClipRegion = { id, ...data };
 	clipRegionsStore.set(id, region);
 	broadcastClipRegionsChanged(getAllClipRegions());
-	enqueueClipEncode(id);
+	if (region.createdBy !== 'ai') {
+		enqueueClipEncode(id);
+	}
 	return region;
 }
 
@@ -55,19 +57,19 @@ export function addClipRegion(region: ClipRegion): void {
 		);
 	}
 
-	// Check if this is an update with changed times — invalidate and re-encode
 	const existing = clipRegionsStore.get(region.id);
 	const timesChanged =
 		!existing ||
 		existing.startTime !== region.startTime ||
 		existing.endTime !== region.endTime ||
 		existing.streamId !== region.streamId;
+	const wasApproved = existing?.createdBy === 'ai' && region.createdBy !== 'ai';
 
 	clipRegionsStore.set(region.id, region);
 	db.saveClipRegion(region);
 	broadcastClipRegionsChanged(getAllClipRegions());
 
-	if (timesChanged) {
+	if (region.createdBy !== 'ai' && (timesChanged || wasApproved)) {
 		enqueueClipEncode(region.id);
 	}
 }
