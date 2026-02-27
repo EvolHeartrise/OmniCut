@@ -4,15 +4,16 @@
 	import { youtubeUploadEvents } from '$lib/stores/streams.js';
 	import {
 		youtubeStatus,
-		youtubeAuthUrlCmd,
+		youtubeAuthUrl,
 		youtubeRemoveAccountCmd,
 		youtubeCategories,
 		youtubePlaylists,
 		youtubeUploads,
 		youtubeUploadCmd,
 		youtubeDeleteUploadCmd,
-		listExportsCmd,
-		getThumbnailByExportCmd
+		listExports,
+		getThumbnailByExport,
+		getThumbnailByVideo
 	} from '$lib/streams.remote';
 
 	// --- Types ---
@@ -28,6 +29,7 @@
 		title: string;
 		description?: string;
 		clipIds: string[];
+		videoId?: string;
 		status: 'pending' | 'exporting' | 'ready' | 'error';
 		outputPath?: string;
 		createdAt: number;
@@ -136,7 +138,7 @@
 
 	async function refreshExports() {
 		try {
-			const data = await listExportsCmd();
+			const data = await listExports();
 			exports = data.exports;
 		} catch (err) {
 			console.error('Failed to fetch exports:', err);
@@ -154,7 +156,7 @@
 
 	async function connectAccount() {
 		try {
-			const data = await youtubeAuthUrlCmd();
+			const data = await youtubeAuthUrl();
 			window.open(data.url, 'youtube-auth', 'width=600,height=700');
 		} catch (err) {
 			console.error('Failed to get auth URL:', err);
@@ -181,15 +183,25 @@
 			title = exp.title;
 			description = exp.description ?? '';
 		}
-		// Fetch thumbnail for this export
+		// Fetch thumbnail — try video first (if export has videoId), then fall back to export
 		thumbnailId = null;
 		thumbnailUrl = null;
-		getThumbnailByExportCmd({ exportId }).then((data) => {
-			if (data.thumbnail) {
-				thumbnailId = data.thumbnail.id;
-				thumbnailUrl = `/api/thumbnail/${data.thumbnail.id}`;
+		const tryVideoThumbnail = exp?.videoId
+			? getThumbnailByVideo({ videoId: exp.videoId }).then((data) => data.thumbnail).catch(() => null)
+			: Promise.resolve(null);
+		tryVideoThumbnail.then((videoThumb) => {
+			if (videoThumb) {
+				thumbnailId = videoThumb.id;
+				thumbnailUrl = `/api/thumbnail/${videoThumb.id}`;
+			} else {
+				getThumbnailByExport({ exportId }).then((data) => {
+					if (data.thumbnail) {
+						thumbnailId = data.thumbnail.id;
+						thumbnailUrl = `/api/thumbnail/${data.thumbnail.id}`;
+					}
+				}).catch(() => {});
 			}
-		}).catch(() => {});
+		});
 	}
 
 	// Fetch categories on mount (once)

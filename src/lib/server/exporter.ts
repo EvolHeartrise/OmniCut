@@ -5,7 +5,8 @@
 
 import * as path from 'node:path';
 import * as fs from 'node:fs';
-import type { ClipRegion, StreamInfo } from './types.js';
+import type { ClipRegion, ClipEntry } from '../types.js';
+import type { StreamInfo } from './types.js';
 import { parseRelevantSegments, ffmpegConcatEscape, buildConcatContent } from './hlsUtils.js';
 import { runFfmpeg } from './ffmpeg.js';
 
@@ -26,7 +27,8 @@ export async function exportVideo(
 	clips: ClipRegion[],
 	streamMap: Map<string, StreamLookup>,
 	filename: string,
-	onProgress: (message: string, step: number, totalSteps: number) => void
+	onProgress: (message: string, step: number, totalSteps: number) => void,
+	clipEntries?: (ClipEntry | undefined)[]
 ): Promise<{ outputPath: string }> {
 	if (clips.length === 0) {
 		throw new Error('No clip regions to export');
@@ -47,6 +49,7 @@ export async function exportVideo(
 
 		for (let i = 0; i < clips.length; i++) {
 			const clip = clips[i];
+			const entry = clipEntries?.[i];
 			const stream = streamMap.get(clip.streamId);
 			if (!stream) {
 				console.warn(`Export: skipping clip ${i + 1}/${clips.length} — stream ${clip.streamId} not found`);
@@ -55,12 +58,25 @@ export async function exportVideo(
 				continue;
 			}
 
-			const dur = clip.endTime - clip.startTime;
+			// Apply trim offsets from clip entry
+			const trimStartOffset = entry?.trimStart ?? 0;
+			const trimEndOffset = entry?.trimEnd ?? 0;
+			const effectiveStart = clip.startTime + trimStartOffset;
+			const effectiveEnd = clip.endTime - trimEndOffset;
+			const speed = entry?.speed ?? 1;
+
+			if (effectiveEnd <= effectiveStart) {
+				console.warn(`Export: skipping clip ${i + 1}/${clips.length} — trim makes duration ≤ 0`);
+				skipped++;
+				continue;
+			}
+
+			const dur = effectiveEnd - effectiveStart;
 			onProgress(`Encoding clip ${i + 1}/${clips.length} (${dur.toFixed(1)}s)`, i, totalSteps);
 
 			const anchor = stream.startedAt / 1000;
-			const localStart = clip.startTime - anchor + stream.offset;
-			const localEnd = clip.endTime - anchor + stream.offset;
+			const localStart = effectiveStart - anchor + stream.offset;
+			const localEnd = effectiveEnd - anchor + stream.offset;
 			const playlistPath = path.join(stream.recordingDir, 'playlist.m3u8');
 
 			const segments = parseRelevantSegments(playlistPath, stream.recordingDir, localStart, localEnd);
@@ -77,13 +93,29 @@ export async function exportVideo(
 			const trimStart = Math.max(0, localStart - segments[0].startTime);
 			const outFile = path.join(tempDir, `clip_${i}.mp4`);
 
-			// Probe first segment for resolution/fps
-			const probe = i === 0 ? await probeVideo(segments[0].file) : null;
+			// Build video filter chain
+			const vFilters: string[] = [];
+			if (speed !== 1) {
+				vFilters.push(`setpts=PTS/${speed}`);
+			}
+			vFilters.push('format=yuv420p');
+
+			// Build audio filter chain
+			const aFilters: string[] = [];
+			if (speed !== 1) {
+				// atempo only supports 0.5-2.0 range, chain multiple for wider range
+				let remaining = speed;
+				const parts: string[] = [];
+				while (remaining > 2.0) { parts.push('atempo=2.0'); remaining /= 2.0; }
+				while (remaining < 0.5) { parts.push('atempo=0.5'); remaining /= 0.5; }
+				parts.push(`atempo=${remaining.toFixed(4)}`);
+				aFilters.push(...parts);
+			}
 
 			let videoArgs: string[];
 			if (useNvenc) {
 				videoArgs = [
-					'-vf', 'format=yuv420p',
+					'-vf', vFilters.join(','),
 					'-c:v', 'h264_nvenc',
 					'-preset', 'p4',
 					'-profile:v', 'high',
@@ -93,7 +125,7 @@ export async function exportVideo(
 				];
 			} else {
 				videoArgs = [
-					'-vf', 'format=yuv420p',
+					'-vf', vFilters.join(','),
 					'-c:v', 'libx264',
 					'-preset', 'medium',
 					'-profile:v', 'high',
@@ -101,6 +133,10 @@ export async function exportVideo(
 					'-bf', '2'
 				];
 			}
+
+			const audioArgs = aFilters.length > 0
+				? ['-af', aFilters.join(','), '-c:a', 'aac', '-ar', '48000', '-b:a', '192k']
+				: ['-c:a', 'aac', '-ar', '48000', '-b:a', '192k'];
 
 			await runFfmpeg([
 				'-fflags', '+genpts',
@@ -110,19 +146,13 @@ export async function exportVideo(
 				'-map', '0:v:0', '-map', '0:a:0',
 				...videoArgs,
 				'-fps_mode', 'cfr',
-				'-c:a', 'aac', '-ar', '48000', '-b:a', '192k',
+				...audioArgs,
 				'-video_track_timescale', '90000',
 				'-movflags', '+faststart',
 				'-y', outFile
 			], 2000);
 
 			clipFiles.push(outFile);
-
-			// Probe first encoded clip for resolution info (for upscale check)
-			if (i === 0 && probe) {
-				// Store for potential upscale in final concat pass
-				(clipFiles as any).__probe = probe;
-			}
 		}
 
 		if (clipFiles.length === 0) {

@@ -6,8 +6,9 @@
 	import ThumbnailAIPanel from './ThumbnailAIPanel.svelte';
 	import {
 		saveThumbnailCmd,
-		getThumbnailByExportCmd,
-		isAIConfiguredCmd,
+		getThumbnailByExport,
+		getThumbnailByVideo,
+		isAIConfigured,
 		aiEditImageCmd
 	} from '$lib/streams.remote';
 
@@ -80,6 +81,7 @@
 	let layers = $state<Layer[]>([]);
 	let imageElements = $state(new Map<string, HTMLImageElement>());
 	let currentExportId = $state<string | null>(null);
+	let currentVideoId = $state<string | null>(null);
 	let saving = $state(false);
 	let saveMessage = $state<string | null>(null);
 	let existingThumbnailId = $state<string | null>(null);
@@ -111,6 +113,7 @@
 	let preAiLayers = $state<Layer[] | null>(null);
 
 	let preselectedExportId = $derived(page.url.searchParams.get('export'));
+	let preselectedVideoId = $derived(page.url.searchParams.get('video'));
 
 	// Redraw canvas whenever state changes
 	$effect(() => {
@@ -129,7 +132,7 @@
 
 	onMount(async () => {
 		try {
-			const { configured } = await isAIConfiguredCmd();
+			const { configured } = await isAIConfigured();
 			aiConfigured = configured;
 		} catch { /* ignore */ }
 	});
@@ -637,9 +640,40 @@
 		}
 	}
 
+	function handleVideoSelected(videoId: string) {
+		currentVideoId = videoId;
+		loadExistingThumbnailByVideo(videoId);
+	}
+
+	async function loadExistingThumbnailByVideo(videoId: string) {
+		try {
+			const { thumbnail } = await getThumbnailByVideo({ videoId });
+			if (thumbnail) {
+				existingThumbnailId = thumbnail.id;
+				if (thumbnail.layers) {
+					layers = thumbnail.layers;
+					for (const layer of layers) {
+						if (layer.type === 'image') {
+							rehydrateImageLayer(layer);
+						} else if (layer.type === 'effect' && layer.kind === 'ai' && layer.aiResultBase64) {
+							rehydrateAIEffect(layer);
+						}
+					}
+				} else {
+					existingThumbnailId = thumbnail.id;
+				}
+			} else {
+				existingThumbnailId = null;
+				layers = [];
+			}
+		} catch {
+			existingThumbnailId = null;
+		}
+	}
+
 	async function loadExistingThumbnail(exportId: string) {
 		try {
-			const { thumbnail } = await getThumbnailByExportCmd({ exportId });
+			const { thumbnail } = await getThumbnailByExport({ exportId });
 			if (thumbnail) {
 				existingThumbnailId = thumbnail.id;
 				if (thumbnail.layers) {
@@ -1113,7 +1147,7 @@
 	// --- Save ---
 
 	async function handleSave() {
-		if (!canvasEl || !currentExportId) return;
+		if (!canvasEl || (!currentExportId && !currentVideoId)) return;
 		saving = true;
 		saveMessage = null;
 
@@ -1140,7 +1174,8 @@
 				: undefined;
 
 			await saveThumbnailCmd({
-				exportId: currentExportId,
+				exportId: currentExportId || '',
+				videoId: currentVideoId ?? undefined,
 				pngBase64: base64,
 				width: WIDTH,
 				height: HEIGHT,
@@ -1188,8 +1223,10 @@
 	<div class="builder-left">
 		<ThumbnailFramePicker
 			preselectedExportId={preselectedExportId}
+			preselectedVideoId={preselectedVideoId}
 			onFrameSelected={handleFrameSelected}
 			onExportSelected={handleExportSelected}
+			onVideoSelected={handleVideoSelected}
 		/>
 	</div>
 
@@ -1217,7 +1254,7 @@
 			></canvas>
 		</div>
 		<div class="canvas-actions">
-			<button class="btn-save" onclick={handleSave} disabled={saving || !currentExportId}>
+			<button class="btn-save" onclick={handleSave} disabled={saving || (!currentExportId && !currentVideoId)}>
 				{saving ? 'Saving...' : 'Save Thumbnail'}
 			</button>
 			{#if saveMessage}
@@ -1225,7 +1262,7 @@
 			{/if}
 		</div>
 
-		{#if currentExportId && existingThumbnailId}
+		{#if (currentExportId || currentVideoId) && existingThumbnailId}
 			<ThumbnailAIPanel
 				thumbnailId={existingThumbnailId}
 				{aiConfigured}

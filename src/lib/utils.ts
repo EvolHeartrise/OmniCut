@@ -1,4 +1,29 @@
 import type Hls from 'hls.js';
+import type { ClipRegion } from '$lib/types.js';
+
+/** Compute clip-local start/end from master times using stream anchor and sync offset. */
+export function getClipLocalBounds(
+	clip: ClipRegion,
+	stream: { startedAt: number } | undefined,
+	syncOffset: number
+): { localStart: number; localEnd: number } | null {
+	if (!stream) return null;
+	const anchor = stream.startedAt / 1000;
+	return {
+		localStart: clip.startTime - anchor + syncOffset,
+		localEnd: clip.endTime - anchor + syncOffset
+	};
+}
+
+/** Format epoch seconds as a short locale date string (e.g. "Jan 5, 02:30 PM"). */
+export function formatEpochDate(epoch: number): string {
+	return new Date(epoch * 1000).toLocaleString(undefined, {
+		month: 'short',
+		day: 'numeric',
+		hour: '2-digit',
+		minute: '2-digit'
+	});
+}
 
 /** Format seconds as m:ss. */
 export function formatDuration(sec: number): string {
@@ -104,4 +129,36 @@ export function createHlsConfig(isLive: boolean): Partial<ConstructorParameters<
 		maxMaxBufferLength: 600,
 		...(isLive ? { liveSyncDurationCount: 3 } : {})
 	};
+}
+
+/**
+ * Set up an HLS player on a video element. Handles HLS.js setup with fallback
+ * to native playback. Returns the HLS instance (or null for native).
+ */
+export function setupHls(
+	HlsCtor: typeof Hls,
+	videoEl: HTMLVideoElement,
+	url: string,
+	seekTo: number,
+	onReady: () => void
+): Hls | null {
+	if (HlsCtor.isSupported()) {
+		const h = new HlsCtor(createHlsConfig(false));
+		h.loadSource(url);
+		h.attachMedia(videoEl);
+		h.on(HlsCtor.Events.MANIFEST_PARSED, () => {
+			videoEl.currentTime = seekTo;
+			onReady();
+		});
+		h.on(HlsCtor.Events.ERROR, (_event, data) => {
+			if (data.fatal && data.type === HlsCtor.ErrorTypes.MEDIA_ERROR) {
+				h.recoverMediaError();
+			}
+		});
+		return h;
+	}
+	videoEl.src = url;
+	videoEl.currentTime = seekTo;
+	onReady();
+	return null;
 }

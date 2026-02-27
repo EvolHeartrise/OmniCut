@@ -1,5 +1,6 @@
 <script lang="ts">
 	import Hls from 'hls.js';
+	import { goto } from '$app/navigation';
 	import {
 		streams,
 		syncOffsets,
@@ -8,13 +9,14 @@
 		deleteClipRegion,
 		type ClipRegion
 	} from '$lib/stores/streams.js';
-	import { formatDuration, createHlsConfig } from '$lib/utils.js';
-	import { exportSelectedClipsCmd, loadCameraBoundsForChannelCmd } from '$lib/streams.remote';
+	import { formatDuration, formatEpochDate, getClipLocalBounds, setupHls } from '$lib/utils.js';
+	import { exportSelectedClipsCmd, createVideoCmd, loadCameraBoundsForChannel } from '$lib/streams.remote';
 	import type { CameraBoundsEntry } from '$lib/types.js';
 
 	// --- Filter state ---
 	let filterChannel = $state<string>('');
 	let filterCreator = $state<'' | 'ai' | 'human'>('');
+	let filterFavourite = $state(false);
 	let filterAfter = $state('');
 	let filterBefore = $state('');
 
@@ -41,12 +43,15 @@
 	let previewDuration = $state('0:00');
 	let isSeeking = $state(false);
 
+	// --- Stream lookup map (avoids O(n²) .find() in filters/deriveds) ---
+	let streamMap = $derived(new Map($streams.map((s) => [s.id, s])));
+
 	// --- Channel camera bounds (loaded per-channel for CAM badge + export warnings) ---
 	let channelBoundsMap = $state<Record<string, CameraBoundsEntry[]>>({});
 
 	/** Resolve camera bounds for a clip (find most recent entry at or before clip.startTime). */
 	function resolveClipCamBounds(clip: ClipRegion): CameraBoundsEntry | null {
-		const stream = $streams.find((s) => s.id === clip.streamId);
+		const stream = streamMap.get(clip.streamId);
 		if (!stream) return null;
 		const entries = channelBoundsMap[stream.channel];
 		if (!entries || entries.length === 0) return null;
@@ -63,12 +68,12 @@
 	$effect(() => {
 		const channels = new Set<string>();
 		for (const clip of $clipRegions) {
-			const stream = $streams.find((s) => s.id === clip.streamId);
+			const stream = streamMap.get(clip.streamId);
 			if (stream) channels.add(stream.channel);
 		}
 		for (const ch of channels) {
 			if (!(ch in channelBoundsMap)) {
-				loadCameraBoundsForChannelCmd({ channel: ch })
+				loadCameraBoundsForChannel({ channel: ch })
 					.then((result) => {
 						channelBoundsMap = { ...channelBoundsMap, [ch]: result.bounds };
 					})
@@ -77,10 +82,11 @@
 		}
 	});
 
-	// --- Export creation ---
+	// --- Video & Export creation ---
 	let exportTitle = $state('');
-	let exportFormat = $state<'standard' | 'mobile_short'>('standard');
+	let exportFormat = $state<'standard' | 'mobile_short' | 'chat_overlay'>('standard');
 	let exporting = $state(false);
+	let creatingVideo = $state(false);
 	let exportResult = $state<{ success: boolean; message: string } | null>(null);
 
 	// Count selected clips missing cam regions (relevant for mobile_short)
@@ -97,7 +103,7 @@
 	let uniqueChannels = $derived.by(() => {
 		const channels = new Set<string>();
 		for (const clip of $clipRegions) {
-			const stream = $streams.find((s) => s.id === clip.streamId);
+			const stream = streamMap.get(clip.streamId);
 			if (stream) channels.add(stream.channel);
 		}
 		return [...channels].sort();
@@ -109,15 +115,17 @@
 
 		// Filter by channel
 		if (filterChannel) {
-			clips = clips.filter((c) => {
-				const stream = $streams.find((s) => s.id === c.streamId);
-				return stream?.channel === filterChannel;
-			});
+			clips = clips.filter((c) => streamMap.get(c.streamId)?.channel === filterChannel);
 		}
 
 		// Filter by creator
 		if (filterCreator) {
 			clips = clips.filter((c) => (c.createdBy ?? 'human') === filterCreator);
+		}
+
+		// Filter by favourite
+		if (filterFavourite) {
+			clips = clips.filter((c) => c.favourite);
 		}
 
 		// Filter by time (ISO date strings → epoch seconds)
@@ -195,6 +203,13 @@
 		saveClipRegion(updated);
 	}
 
+	// --- Toggle favourite ---
+	function toggleFavourite(clip: ClipRegion) {
+		const updated = { ...clip, favourite: !clip.favourite };
+		clipRegions.update((regions) => regions.map((r) => (r.id === updated.id ? updated : r)));
+		saveClipRegion(updated);
+	}
+
 	// --- Delete (double-press) ---
 	function handleDelete(id: string) {
 		if (deleteConfirmId === id) {
@@ -233,7 +248,7 @@
 		previewProgress = 0;
 		previewCurrentTime = '0:00';
 		const clipDur = clip.endTime - clip.startTime;
-		previewDuration = formatTime(clipDur);
+		previewDuration = formatDuration(clipDur);
 
 		// Wait for DOM to render the video element
 		requestAnimationFrame(() => {
@@ -243,8 +258,8 @@
 
 	function setupPreviewPlayer(clip: ClipRegion) {
 		if (!previewVideoEl) return;
-		const stream = $streams.find((s) => s.id === clip.streamId);
-		if (!stream) return;
+		const bounds = clipLocalBounds(clip);
+		if (!bounds) return;
 
 		if (previewHls) {
 			previewHls.destroy();
@@ -252,38 +267,10 @@
 		}
 
 		const url = `/hls/${clip.streamId}/playlist.m3u8`;
-		const offset = $syncOffsets[clip.streamId] || 0;
-		const anchor = stream.startedAt / 1000;
-		const localStart = clip.startTime - anchor + offset;
 
-		const autoPlay = () => {
-			previewVideoEl!
-				.play()
-				.then(() => {
-					previewPlaying = true;
-				})
-				.catch(() => {});
-		};
-
-		if (Hls.isSupported()) {
-			const h = new Hls(createHlsConfig(false));
-			previewHls = h;
-			h.loadSource(url);
-			h.attachMedia(previewVideoEl);
-			h.on(Hls.Events.MANIFEST_PARSED, () => {
-				previewVideoEl!.currentTime = localStart;
-				autoPlay();
-			});
-			h.on(Hls.Events.ERROR, (_event, data) => {
-				if (data.fatal && data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-					h.recoverMediaError();
-				}
-			});
-		} else {
-			previewVideoEl.src = url;
-			previewVideoEl.currentTime = localStart;
-			autoPlay();
-		}
+		previewHls = setupHls(Hls, previewVideoEl, url, bounds.localStart, () => {
+			previewVideoEl!.play().then(() => { previewPlaying = true; }).catch(() => {});
+		});
 	}
 
 	function closePreview() {
@@ -305,25 +292,15 @@
 		previewPlaying = !previewPlaying;
 	}
 
-	function getClipLocalBounds(clip: ClipRegion): { localStart: number; localEnd: number } | null {
-		const stream = $streams.find((s) => s.id === clip.streamId);
-		if (!stream) return null;
-		const offset = $syncOffsets[clip.streamId] || 0;
-		const anchor = stream.startedAt / 1000;
-		return { localStart: clip.startTime - anchor + offset, localEnd: clip.endTime - anchor + offset };
+	function clipLocalBounds(clip: ClipRegion) {
+		return getClipLocalBounds(clip, streamMap.get(clip.streamId), $syncOffsets[clip.streamId] || 0);
 	}
 
-	function formatTime(seconds: number): string {
-		const s = Math.max(0, Math.floor(seconds));
-		const m = Math.floor(s / 60);
-		const sec = s % 60;
-		return `${m}:${sec.toString().padStart(2, '0')}`;
-	}
 
 	// Clamp preview playback to clip bounds + update progress
 	function handlePreviewTimeUpdate() {
 		if (!previewVideoEl || !previewClip) return;
-		const bounds = getClipLocalBounds(previewClip);
+		const bounds = clipLocalBounds(previewClip);
 		if (!bounds) return;
 		const { localStart, localEnd } = bounds;
 		const clipDur = localEnd - localStart;
@@ -337,9 +314,9 @@
 		} else if (!isSeeking) {
 			const elapsed = previewVideoEl.currentTime - localStart;
 			previewProgress = clipDur > 0 ? Math.max(0, Math.min(1, elapsed / clipDur)) : 0;
-			previewCurrentTime = formatTime(elapsed);
+			previewCurrentTime = formatDuration(elapsed);
 		}
-		previewDuration = formatTime(clipDur);
+		previewDuration = formatDuration(clipDur);
 	}
 
 	function handleSeekInput(e: Event) {
@@ -347,10 +324,10 @@
 		const value = +(e.target as HTMLInputElement).value;
 		previewProgress = value;
 		if (previewClip) {
-			const bounds = getClipLocalBounds(previewClip);
+			const bounds = clipLocalBounds(previewClip);
 			if (bounds) {
 				const elapsed = value * (bounds.localEnd - bounds.localStart);
-				previewCurrentTime = formatTime(elapsed);
+				previewCurrentTime = formatDuration(elapsed);
 			}
 		}
 	}
@@ -360,7 +337,7 @@
 			isSeeking = false;
 			return;
 		}
-		const bounds = getClipLocalBounds(previewClip);
+		const bounds = clipLocalBounds(previewClip);
 		if (!bounds) {
 			isSeeking = false;
 			return;
@@ -370,9 +347,25 @@
 		isSeeking = false;
 	}
 
-	// --- Export ---
+	// --- Create Video ---
+	async function createVideo() {
+		const selectedClipIds = filteredClips.filter((c) => selectedIds.has(c.id)).map((c) => c.id);
+		if (selectedClipIds.length === 0) return;
+		const title = exportTitle.trim() || `Video ${new Date().toISOString().slice(0, 16)}`;
+		creatingVideo = true;
+		exportResult = null;
+		try {
+			const video = await createVideoCmd({ clipIds: selectedClipIds, title, format: exportFormat });
+			goto(`/videos/${video.id}`);
+		} catch (err) {
+			exportResult = { success: false, message: err instanceof Error ? err.message : 'Failed to create video' };
+		} finally {
+			creatingVideo = false;
+		}
+	}
+
+	// --- Quick Export (legacy one-click path) ---
 	async function createExport() {
-		// Get selected clips in order from the filtered list
 		const selectedClipIds = filteredClips.filter((c) => selectedIds.has(c.id)).map((c) => c.id);
 		if (selectedClipIds.length === 0) return;
 		const title = exportTitle.trim() || `Export ${new Date().toISOString().slice(0, 16)}`;
@@ -393,11 +386,11 @@
 	$effect(() => {
 		const clip = previewClip;
 		if (!clip || !previewVideoEl) return;
-		const bounds = getClipLocalBounds(clip);
+		const bounds = clipLocalBounds(clip);
 		if (!bounds) return;
 		const { localStart, localEnd } = bounds;
 		const clipDur = localEnd - localStart;
-		previewDuration = formatTime(clipDur);
+		previewDuration = formatDuration(clipDur);
 
 		// If the video's current position is now outside the new bounds, re-clamp
 		if (previewVideoEl.currentTime >= localEnd) {
@@ -416,7 +409,7 @@
 			// Recalculate progress within new bounds
 			const elapsed = previewVideoEl.currentTime - localStart;
 			previewProgress = clipDur > 0 ? Math.max(0, Math.min(1, elapsed / clipDur)) : 0;
-			previewCurrentTime = formatTime(elapsed);
+			previewCurrentTime = formatDuration(elapsed);
 		}
 	});
 
@@ -432,17 +425,7 @@
 
 
 	function clipChannel(clip: ClipRegion): string {
-		const stream = $streams.find((s) => s.id === clip.streamId);
-		return stream?.channel || 'unknown';
-	}
-
-	function clipDate(epoch: number): string {
-		return new Date(epoch * 1000).toLocaleString(undefined, {
-			month: 'short',
-			day: 'numeric',
-			hour: '2-digit',
-			minute: '2-digit'
-		});
+		return streamMap.get(clip.streamId)?.channel || 'unknown';
 	}
 </script>
 
@@ -468,6 +451,12 @@
 				<option value="human">Human</option>
 			</select>
 		</label>
+		<button
+			class="filter-fav-btn"
+			class:active={filterFavourite}
+			onclick={() => (filterFavourite = !filterFavourite)}
+			title="Show favourites only"
+		>&#9733;</button>
 		<!-- svelte-ignore a11y_label_has_associated_control -->
 		<label class="filter-group">
 			<span class="filter-label">After</span>
@@ -501,17 +490,21 @@
 							type="text"
 							class="export-title-input"
 							bind:value={exportTitle}
-							placeholder="Export title..."
+							placeholder="Title..."
 							onkeydown={(e) => {
-								if (e.key === 'Enter') createExport();
+								if (e.key === 'Enter') createVideo();
 							}}
 						/>
 						<select class="format-select" bind:value={exportFormat}>
 							<option value="standard">Standard (16:9)</option>
 							<option value="mobile_short">Mobile Short (9:16)</option>
+							<option value="chat_overlay">Chat Overlay (transparent)</option>
 						</select>
-						<button class="btn-export" onclick={createExport} disabled={exporting || selectedIds.size === 0}>
-							{exporting ? 'Queueing...' : `Export ${selectedIds.size} clips`}
+						<button class="btn-create-video" onclick={createVideo} disabled={creatingVideo || selectedIds.size === 0}>
+							{creatingVideo ? 'Creating...' : `Create Video`}
+						</button>
+						<button class="btn-quick-export" onclick={createExport} disabled={exporting || selectedIds.size === 0} title="Create video and immediately queue export">
+							{exporting ? 'Queueing...' : `Quick Export`}
 						</button>
 					</div>
 					{#if missingCamCount > 0}
@@ -572,6 +565,9 @@
 									<div class="clip-title-row">
 										<span class="clip-channel">{clipChannel(clip)}</span>
 										<span class="clip-title-text">{clip.title || 'Untitled'}</span>
+										{#if clip.favourite}
+											<span class="clip-fav-star">&#9733;</span>
+										{/if}
 										{#if clip.createdBy === 'ai'}
 											<span class="clip-badge ai">AI</span>
 										{/if}
@@ -583,13 +579,19 @@
 										<div class="clip-notes">{clip.notes}</div>
 									{/if}
 									<div class="clip-details">
-										<span class="clip-time">{clipDate(clip.startTime)}</span>
+										<span class="clip-time">{formatEpochDate(clip.startTime)}</span>
 										<span class="clip-dur">{formatDuration(dur)}</span>
 									</div>
 								{/if}
 							</div>
 							<div class="clip-actions">
 								{#if !isEditing}
+									<button
+										class="btn-icon btn-fav"
+										class:fav-active={clip.favourite}
+										onclick={() => toggleFavourite(clip)}
+										title={clip.favourite ? 'Remove favourite' : 'Mark as favourite'}
+									>{clip.favourite ? '\u2605' : '\u2606'}</button>
 									<button class="btn-icon" onclick={() => copyClipId(clip.id)} title="Copy clip ID"> ID </button>
 									<button class="btn-icon" onclick={() => openPreview(clip)} title="Preview">
 										{isPreviewing ? '✕' : '▶'}
@@ -794,7 +796,7 @@
 		white-space: nowrap;
 	}
 
-	.btn-export {
+	.btn-create-video {
 		background: #7c3aed;
 		border: none;
 		color: #fff;
@@ -806,11 +808,32 @@
 		white-space: nowrap;
 	}
 
-	.btn-export:hover {
+	.btn-create-video:hover {
 		background: #6d28d9;
 	}
 
-	.btn-export:disabled {
+	.btn-create-video:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+
+	.btn-quick-export {
+		background: #2a2a4a;
+		border: 1px solid #3a3a5a;
+		color: #ccc;
+		font-size: 0.7rem;
+		padding: 4px 10px;
+		border-radius: 4px;
+		cursor: pointer;
+		white-space: nowrap;
+	}
+
+	.btn-quick-export:hover {
+		background: #3a3a5a;
+		color: #fff;
+	}
+
+	.btn-quick-export:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
 	}
@@ -1162,5 +1185,53 @@
 	.btn-ctl:hover {
 		background: #3a3a5a;
 		color: #fff;
+	}
+
+	.filter-fav-btn {
+		background: none;
+		border: 1px solid #2a2a4a;
+		color: #555;
+		font-size: 0.85rem;
+		width: 28px;
+		height: 28px;
+		border-radius: 4px;
+		cursor: pointer;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		flex-shrink: 0;
+		transition: color 0.15s, border-color 0.15s, background 0.15s;
+	}
+
+	.filter-fav-btn:hover {
+		color: #fbbf24;
+		border-color: #3a3a1a;
+	}
+
+	.filter-fav-btn.active {
+		color: #fbbf24;
+		border-color: #fbbf24;
+		background: rgba(251, 191, 36, 0.1);
+	}
+
+	.clip-fav-star {
+		color: #fbbf24;
+		font-size: 0.75rem;
+		flex-shrink: 0;
+	}
+
+	.btn-fav {
+		color: #555;
+		border-color: #2a2a4a;
+	}
+
+	.btn-fav:hover {
+		color: #fbbf24;
+		background: rgba(251, 191, 36, 0.1);
+	}
+
+	.btn-fav.fav-active {
+		color: #fbbf24;
+		border-color: #3a3a1a;
 	}
 </style>

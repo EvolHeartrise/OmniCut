@@ -84,13 +84,12 @@ export function startChatCollection(
 					const username = extractTag(tags, 'display-name') || fallbackUsername;
 					const color = extractTag(tags, 'color');
 					const badgesRaw = extractTag(tags, 'badges');
-					const badges = badgesRaw
-						? badgesRaw.split(',').map((b) => b.split('/')[0]).join(',')
-						: null;
+					const badges = badgesRaw || null;
 					const twitchId = extractTag(tags, 'id');
 					if (!twitchId) continue; // skip messages without a Twitch ID
+					const emotes = extractTag(tags, 'emotes');
 
-					onMessage(streamId, { username, text, timestamp, color, badges, twitchId });
+					onMessage(streamId, { username, text, timestamp, color, badges, twitchId, emotes });
 				}
 			}
 		};

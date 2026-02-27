@@ -6,7 +6,7 @@
 
 import * as path from 'node:path';
 import * as fs from 'node:fs';
-import type { ClipRegion, CameraBoundsEntry } from './types.js';
+import type { ClipRegion, CameraBoundsEntry, ClipEntry } from '../types.js';
 import { parseRelevantSegments, ffmpegConcatEscape, buildConcatContent } from './hlsUtils.js';
 import { runFfmpeg } from './ffmpeg.js';
 import { detectNvenc, probeVideo, type StreamLookup } from './exporter.js';
@@ -22,6 +22,7 @@ const MAX_CAM_H = 700;
 export interface VerticalClip {
 	clip: ClipRegion;
 	cam: CameraBoundsEntry;
+	entry?: ClipEntry;
 }
 
 /**
@@ -51,19 +52,31 @@ export async function exportVerticalVideo(
 		const verticalFiles: string[] = [];
 
 		for (let i = 0; i < verticalClips.length; i++) {
-			const { clip, cam } = verticalClips[i];
+			const { clip, cam, entry } = verticalClips[i];
 			const stream = streamMap.get(clip.streamId);
 			if (!stream) {
 				console.warn(`[vertical-export] Skipping clip ${i + 1} — stream ${clip.streamId} not found`);
 				continue;
 			}
 
-			const dur = clip.endTime - clip.startTime;
+			// Apply trim offsets from clip entry
+			const trimStartOffset = entry?.trimStart ?? 0;
+			const trimEndOffset = entry?.trimEnd ?? 0;
+			const effectiveStart = clip.startTime + trimStartOffset;
+			const effectiveEnd = clip.endTime - trimEndOffset;
+			const speed = entry?.speed ?? 1;
+
+			if (effectiveEnd <= effectiveStart) {
+				console.warn(`[vertical-export] Skipping clip ${i + 1} — trim makes duration ≤ 0`);
+				continue;
+			}
+
+			const dur = effectiveEnd - effectiveStart;
 			onProgress(`Encoding clip ${i + 1}/${verticalClips.length} as vertical (${dur.toFixed(1)}s)`, i, totalSteps);
 
 			const anchor = stream.startedAt / 1000;
-			const localStart = clip.startTime - anchor + stream.offset;
-			const localEnd = clip.endTime - anchor + stream.offset;
+			const localStart = effectiveStart - anchor + stream.offset;
+			const localEnd = effectiveEnd - anchor + stream.offset;
 			const playlistPath = path.join(stream.recordingDir, 'playlist.m3u8');
 
 			const segments = parseRelevantSegments(playlistPath, stream.recordingDir, localStart, localEnd);
@@ -98,12 +111,22 @@ export async function exportVerticalVideo(
 			const gameH = (OUT_H - camH) & ~1;
 
 			// Build filter graph — single pass from raw segments
+			const speedFilter = speed !== 1 ? `,setpts=PTS/${speed}` : '';
 			const filterGraph = [
 				`[0:v]split=2[gameplay][camsrc]`,
 				`[camsrc]crop=${cw}:${ch}:${cx}:${cy},scale=${OUT_W}:-2,crop=${OUT_W}:${camH}[cam]`,
 				`[gameplay]scale=${OUT_W}:${gameH}:force_original_aspect_ratio=increase,crop=${OUT_W}:${gameH}[game]`,
-				`[game][cam]vstack=inputs=2,format=yuv420p[outv]`
+				`[game][cam]vstack=inputs=2${speedFilter},format=yuv420p[outv]`
 			].join(';');
+
+			// Build audio filter for speed
+			const aFilters: string[] = [];
+			if (speed !== 1) {
+				let remaining = speed;
+				while (remaining > 2.0) { aFilters.push('atempo=2.0'); remaining /= 2.0; }
+				while (remaining < 0.5) { aFilters.push('atempo=0.5'); remaining /= 0.5; }
+				aFilters.push(`atempo=${remaining.toFixed(4)}`);
+			}
 
 			const fps = probe.fps > 0 ? probe.fps : 30;
 			const gop = Math.round(fps * 2);
@@ -133,6 +156,10 @@ export async function exportVerticalVideo(
 				];
 			}
 
+			const audioArgs = aFilters.length > 0
+				? ['-af', aFilters.join(','), '-c:a', 'aac', '-ar', '48000', '-b:a', '192k']
+				: ['-c:a', 'aac', '-ar', '48000', '-b:a', '192k'];
+
 			await runFfmpeg([
 				'-fflags', '+genpts',
 				'-f', 'concat', '-safe', '0', '-i', concatPath,
@@ -143,7 +170,7 @@ export async function exportVerticalVideo(
 				...videoArgs,
 				'-fps_mode', 'cfr',
 				'-r', `${fps}`,
-				'-c:a', 'aac', '-ar', '48000', '-b:a', '192k',
+				...audioArgs,
 				'-movflags', '+faststart',
 				'-y', outFile
 			], 2000);

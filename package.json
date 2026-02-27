@@ -27,8 +27,10 @@
 	"dependencies": {
 		"@google/genai": "^1.43.0",
 		"@modelcontextprotocol/sdk": "^1.26.0",
+		"@napi-rs/canvas": "^0.1.95",
 		"googleapis": "^171.4.0",
 		"hls.js": "^1.6.15",
-		"nanoid": "^5.1.6"
+		"nanoid": "^5.1.6",
+		"sharp": "^0.34.5"
 	}
 }

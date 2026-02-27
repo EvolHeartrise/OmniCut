@@ -9,11 +9,11 @@ import * as db from './persistence.js';
 import type { YouTubeUploadRecord } from './persistence.js';
 import { uploadVideo, addToPlaylist, setThumbnail } from './youtubeClient.js';
 import { broadcastYouTubeUploadStatus } from './sseBroadcaster.js';
+import { SequentialQueue } from './sequentialQueue.js';
 
 // --- State ---
 
-const queue: string[] = [];
-let activeUpload: { uploadId: string } | null = null;
+const sq = new SequentialQueue(runUpload);
 
 // --- Public API ---
 
@@ -60,17 +60,9 @@ export function createAndQueueUpload(
 	};
 
 	db.saveYouTubeUpload(record);
-	queueUpload(id);
+	sq.enqueue(id);
 
 	return record;
-}
-
-/**
- * Enqueue an existing upload ID for processing.
- */
-function queueUpload(uploadId: string): void {
-	queue.push(uploadId);
-	processQueue();
 }
 
 /**
@@ -89,11 +81,10 @@ export function restoreUploadQueue(): void {
  * Shut down the upload queue. Marks active upload as error.
  */
 export function shutdownUploadQueue(): void {
-	if (activeUpload) {
-		db.updateYouTubeUploadStatus(activeUpload.uploadId, 'error', undefined, undefined, 'Server shutting down');
-		activeUpload = null;
+	if (sq.active) {
+		db.updateYouTubeUploadStatus(sq.active, 'error', undefined, undefined, 'Server shutting down');
 	}
-	queue.length = 0;
+	sq.shutdown();
 }
 
 // Re-export DB reads for convenience
@@ -110,39 +101,24 @@ export function loadUploadsByExport(exportId: string): YouTubeUploadRecord[] {
 }
 
 export function deleteUpload(id: string): void {
-	if (activeUpload?.uploadId === id) {
+	if (sq.isActive(id)) {
 		throw new Error('Cannot delete an upload that is currently in progress');
 	}
-	// Remove from queue if pending
-	const idx = queue.indexOf(id);
-	if (idx !== -1) queue.splice(idx, 1);
+	sq.dequeue(id);
 	db.deleteYouTubeUpload(id);
 }
 
 // --- Internal ---
 
-function processQueue(): void {
-	if (activeUpload || queue.length === 0) return;
-	const uploadId = queue.shift()!;
-	runUpload(uploadId);
-}
-
 async function runUpload(uploadId: string): Promise<void> {
 	const record = db.loadYouTubeUpload(uploadId);
-	if (!record) {
-		processQueue();
-		return;
-	}
-
-	activeUpload = { uploadId };
+	if (!record) return;
 
 	// Re-validate export
 	const exportRecord = db.loadExport(record.exportId);
 	if (!exportRecord?.outputPath) {
 		db.updateYouTubeUploadStatus(uploadId, 'error', undefined, undefined, 'Export output file not found');
 		broadcastYouTubeUploadStatus(uploadId, 'error', undefined, undefined, 'Export output file not found');
-		activeUpload = null;
-		processQueue();
 		return;
 	}
 
@@ -176,9 +152,10 @@ async function runUpload(uploadId: string): Promise<void> {
 			}
 		}
 
-		// Auto-set thumbnail if one exists for this export
+		// Auto-set thumbnail if one exists (check video first, then export)
 		try {
-			const thumbnail = db.loadThumbnailByExport(record.exportId);
+			const thumbnail = (exportRecord?.videoId ? db.loadThumbnailByVideo(exportRecord.videoId) : null)
+				?? db.loadThumbnailByExport(record.exportId);
 			if (thumbnail) {
 				const fs = await import('node:fs');
 				if (fs.existsSync(thumbnail.filePath)) {
@@ -198,8 +175,5 @@ async function runUpload(uploadId: string): Promise<void> {
 		db.updateYouTubeUploadStatus(uploadId, 'error', undefined, undefined, message);
 		broadcastYouTubeUploadStatus(uploadId, 'error', undefined, undefined, message);
 		console.error(`[youtube-upload] Upload "${record.title}" failed:`, message);
-	} finally {
-		activeUpload = null;
-		processQueue();
 	}
 }

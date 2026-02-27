@@ -29,6 +29,14 @@ import {
 	getClipRegionCount
 } from './clipManager.js';
 import {
+	restoreVideos,
+	createVideo,
+	updateVideo,
+	deleteVideo,
+	getVideo,
+	getAllVideos
+} from './videoManager.js';
+import {
 	createAndQueueExport,
 	restoreExportQueue,
 	shutdownExportQueue,
@@ -175,6 +183,9 @@ export async function initStreamManager(): Promise<void> {
 
 	// Restore clip regions (all clips, including orphans from deleted streams)
 	restoreClipRegions();
+
+	// Restore video compositions
+	restoreVideos();
 
 	// Initialize chat message counts and transcription counts
 	for (const [, handle] of captures) {
@@ -717,13 +728,17 @@ export function getStreamRecordingDir(id: string): string | null {
 	return handle.info.recordingDir;
 }
 
+// --- Video compositions ---
+
+export { createVideo, updateVideo, deleteVideo, getVideo, getAllVideos } from './videoManager.js';
+
 // --- Video export ---
 
 /**
  * Export all clip regions as a single stitched video file (UI path).
  * Sorts clips by startTime and goes through the export queue for consistency.
  */
-export { createAndQueueExport, requeueExport, loadExport, loadAllExports, deleteExport } from './exportQueue.js';
+export { createAndQueueExport, createAndQueueExportFromVideo, requeueExport, loadExport, loadAllExports, deleteExport } from './exportQueue.js';
 
 // --- Shutdown ---
 

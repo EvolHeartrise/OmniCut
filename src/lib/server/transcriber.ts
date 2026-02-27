@@ -445,6 +445,7 @@ async function extractAudio(recordingDir: string, segmentFiles: string[]): Promi
 
 	if (code !== 0) {
 		console.warn(`[transcriber] Audio extraction failed (code ${code}) for ${recordingDir}`);
+		cleanupFiles(wavPath);
 		return null;
 	}
 	return wavPath;
@@ -520,6 +521,61 @@ export type TranscriptionCallback = (
 	words?: WordTimestamp[]
 ) => void;
 
+interface PendingPartial {
+	text: string;
+	startTime: number;
+	endTime: number;
+	words?: WordTimestamp[];
+}
+
+/**
+ * Process deduplicated sentences from a transcription batch: apply time offsets,
+ * merge partial sentences across batch boundaries, and emit completed sentences.
+ * Returns the new pending partial (if any) and count of emitted sentences.
+ */
+function processSentences(
+	sentences: Sentence[],
+	batchOffset: number,
+	pendingPartial: PendingPartial | null,
+	emit: (text: string, startTime: number, endTime: number, words?: WordTimestamp[]) => void
+): { pendingPartial: PendingPartial | null; emitted: number } {
+	let partial = pendingPartial;
+	let emitted = 0;
+
+	for (let i = 0; i < sentences.length; i++) {
+		const s = sentences[i];
+		let text = s.text;
+		let startTime = batchOffset + s.start;
+		const endTime = batchOffset + s.end;
+		let words = s.words?.map((w) => ({ ...w, start: batchOffset + w.start, end: batchOffset + w.end }));
+
+		// Merge pending partial from previous batch into the first sentence
+		if (i === 0 && partial) {
+			text = partial.text + ' ' + text;
+			startTime = partial.startTime;
+			words = [...(partial.words ?? []), ...(words ?? [])];
+			partial = null;
+		}
+
+		// Hold back partial (incomplete) sentences for merging with next batch
+		if (s.partial) {
+			partial = { text, startTime, endTime, words };
+		} else {
+			emit(text, startTime, endTime, words);
+			emitted++;
+		}
+	}
+
+	// If no sentences came back, flush any stale partial
+	if (sentences.length === 0 && partial) {
+		emit(partial.text, partial.startTime, partial.endTime, partial.words);
+		emitted++;
+		partial = null;
+	}
+
+	return { pendingPartial: partial, emitted };
+}
+
 interface StreamTracker {
 	recordingDir: string;
 	language: string | null;
@@ -527,7 +583,7 @@ interface StreamTracker {
 	interval: ReturnType<typeof setInterval>;
 	callback: TranscriptionCallback;
 	active: boolean;
-	pendingPartial: { text: string; startTime: number; endTime: number; words?: WordTimestamp[] } | null;
+	pendingPartial: PendingPartial | null;
 }
 
 const streamTrackers = new Map<string, StreamTracker>();
@@ -594,42 +650,13 @@ async function checkForNewSegments(streamId: string) {
 		// Re-check after transcription await
 		if (!tracker.active) return;
 
-		const batchOffset = startIdx * SEGMENT_DURATION;
-
-		for (let i = 0; i < sentences.length; i++) {
-			const s = sentences[i];
-			let text = s.text;
-			let startTime = batchOffset + s.start;
-			const endTime = batchOffset + s.end;
-			let words = s.words?.map((w) => ({ ...w, start: batchOffset + w.start, end: batchOffset + w.end }));
-
-			// Merge pending partial from previous batch into the first sentence
-			if (i === 0 && tracker.pendingPartial) {
-				text = tracker.pendingPartial.text + ' ' + text;
-				startTime = tracker.pendingPartial.startTime;
-				words = [...(tracker.pendingPartial.words ?? []), ...(words ?? [])];
-				tracker.pendingPartial = null;
-			}
-
-			// Hold back partial (incomplete) sentences for merging with next batch
-			if (s.partial) {
-				tracker.pendingPartial = { text, startTime, endTime, words };
-			} else {
-				tracker.callback(streamId, text, startTime, endTime, words);
-			}
-		}
-
-		// If no sentences came back, clear any stale partial
-		if (sentences.length === 0 && tracker.pendingPartial) {
-			tracker.callback(
-				streamId,
-				tracker.pendingPartial.text,
-				tracker.pendingPartial.startTime,
-				tracker.pendingPartial.endTime,
-				tracker.pendingPartial.words
-			);
-			tracker.pendingPartial = null;
-		}
+		const result = processSentences(
+			sentences,
+			startIdx * SEGMENT_DURATION,
+			tracker.pendingPartial,
+			(text, startTime, endTime, words) => tracker.callback(streamId, text, startTime, endTime, words)
+		);
+		tracker.pendingPartial = result.pendingPartial;
 	} finally {
 		cleanupFiles(wavPath);
 	}
@@ -797,46 +824,14 @@ async function doFullTranscription(job: VodJob): Promise<void> {
 			const sentences = deduplicateSentences(raw);
 			totalDuplicates += raw.length - sentences.length;
 
-			for (let i = 0; i < sentences.length; i++) {
-				const s = sentences[i];
-				let text = s.text;
-				let startTime = batchOffset + s.start;
-				const endTime = batchOffset + s.end;
-				let words = s.words?.map((w) => ({
-					...w,
-					start: batchOffset + w.start,
-					end: batchOffset + w.end
-				}));
-
-				// Merge pending partial from previous batch into the first sentence
-				if (i === 0 && pendingPartial) {
-					text = pendingPartial.text + ' ' + text;
-					startTime = pendingPartial.startTime;
-					words = [...(pendingPartial.words ?? []), ...(words ?? [])];
-					pendingPartial = null;
-				}
-
-				// Hold back partial (incomplete) sentences for merging with next batch
-				if (s.partial) {
-					pendingPartial = { text, startTime, endTime, words };
-				} else {
-					onResult(streamId, text, startTime, endTime, words);
-					totalSentences++;
-				}
-			}
-
-			// If no sentences came back, clear any stale partial
-			if (sentences.length === 0 && pendingPartial) {
-				onResult(
-					streamId,
-					pendingPartial.text,
-					pendingPartial.startTime,
-					pendingPartial.endTime,
-					pendingPartial.words
-				);
-				totalSentences++;
-				pendingPartial = null;
-			}
+			const result = processSentences(
+				sentences,
+				batchOffset,
+				pendingPartial,
+				(text, startTime, endTime, words) => onResult(streamId, text, startTime, endTime, words)
+			);
+			pendingPartial = result.pendingPartial;
+			totalSentences += result.emitted;
 
 			console.log(
 				`[transcriber:vod] Stream ${streamId}: batch ${batchIdx + 1}/${totalBatches} (${totalSentences} sentences so far)`

@@ -1,5 +1,5 @@
 import { writable, get } from 'svelte/store';
-import type { ClipRegion } from '$lib/types.js';
+import type { ClipRegion, VideoRecord } from '$lib/types.js';
 import {
 	getStreams,
 	addStreamCmd,
@@ -13,12 +13,13 @@ import {
 	updateClipCmd,
 	deleteClipCmd,
 	saveCameraBoundsCmd,
-	getCameraBoundsCmd,
-	deleteCameraBoundsCmd
+	getCameraBounds as getCameraBoundsQuery,
+	deleteCameraBoundsCmd,
+	listVideos
 } from '$lib/streams.remote';
 import type { CameraBoundsEntry } from '$lib/types.js';
 
-export type { ClipRegion };
+export type { ClipRegion, VideoRecord };
 
 export interface StreamState {
 	id: string;
@@ -106,6 +107,9 @@ export interface YouTubeUploadStatusEvent {
 }
 export const youtubeUploadEvents = writable<YouTubeUploadStatusEvent[]>([]);
 
+// Video compositions
+export const videos = writable<VideoRecord[]>([]);
+
 // Master timeline control: streams react to seq changes
 export const masterControl = writable<{
 	action: 'seek' | 'play' | 'pause' | 'step';
@@ -168,6 +172,14 @@ export async function refreshStreams() {
 		// Restore clip regions from server
 		if (data.clipRegions) {
 			clipRegions.set(data.clipRegions);
+		}
+
+		// Load videos
+		try {
+			const videoList = await listVideos();
+			videos.set(videoList);
+		} catch {
+			// Non-critical — videos may not be available yet
 		}
 	} catch (err) {
 		console.error('Failed to refresh streams:', err);
@@ -333,7 +345,7 @@ export async function saveCameraBounds(
  * Resolve camera bounds for a channel at a timestamp (most recent entry at or before).
  */
 export async function getCameraBounds(channel: string, timestamp: number): Promise<CameraBoundsEntry | null> {
-	const result = await getCameraBoundsCmd({ channel, timestamp });
+	const result = await getCameraBoundsQuery({ channel, timestamp });
 	return result.bounds;
 }
 
@@ -377,8 +389,17 @@ export function connectSSE(): () => void {
 					const { [data.streamId]: _, ...rest } = current;
 					return rest;
 				});
-			} else if (data.type === 'clip-regions-changed') {
-				clipRegions.set(data.clipRegions);
+			} else if (data.type === 'clip-upsert') {
+				clipRegions.update((current) => {
+					const idx = current.findIndex((c) => c.id === data.clip.id);
+					if (idx >= 0) {
+						current[idx] = data.clip;
+						return [...current];
+					}
+					return [...current, data.clip];
+				});
+			} else if (data.type === 'clip-delete') {
+				clipRegions.update((current) => current.filter((c) => c.id !== data.id));
 			} else if (data.type === 'export-progress') {
 				exportLog.update((log) => [
 					...log,
@@ -405,6 +426,19 @@ export function connectSSE(): () => void {
 						error: data.error
 					}
 				]);
+			} else if (data.type === 'video-create') {
+				videos.update((current) => [...current, data.video]);
+			} else if (data.type === 'video-update') {
+				videos.update((current) => {
+					const idx = current.findIndex((v) => v.id === data.video.id);
+					if (idx >= 0) {
+						current[idx] = data.video;
+						return [...current];
+					}
+					return [...current, data.video];
+				});
+			} else if (data.type === 'video-delete') {
+				videos.update((current) => current.filter((v) => v.id !== data.id));
 			}
 		} catch {
 			// Ignore parse errors (keepalive pings etc)

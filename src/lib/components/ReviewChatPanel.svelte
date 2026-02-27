@@ -1,114 +1,109 @@
 <script lang="ts">
-	import { masterTime, masterPlaying, seekRequest } from '$lib/stores/streams.js';
-	import { createPanelQueryState } from '$lib/panelQueryRanges.svelte.js';
-	import { usernameColor } from '$lib/utils.js';
+	import { streams, syncOffsets, type ClipRegion } from '$lib/stores/streams.js';
 	import { getMultiStreamChat } from '$lib/streams.remote';
+	import { usernameColor, getClipLocalBounds } from '$lib/utils.js';
 	import { parseEmotes, getThirdPartyEmotes, type ChatSegment, type EmoteMap } from '$lib/emoteParser.js';
 	import { fetchTwitchBadges, resolveBadges, type BadgeInfo, type BadgeMap } from '$lib/badgeParser.js';
 
+	let {
+		clip,
+		currentLocalTime,
+		onseek
+	}: {
+		clip: ClipRegion;
+		currentLocalTime: number;
+		onseek: (localTime: number) => void;
+	} = $props();
+
 	let searchQuery = $state('');
-	let emoteMapByChannel = $state(new Map<string, EmoteMap>());
-	let badgeMapByChannel = $state(new Map<string, BadgeMap>());
+	let thirdPartyEmotes = $state<EmoteMap | undefined>(undefined);
+	let badgeMap = $state<BadgeMap>(new Map());
 	let listEl = $state<HTMLDivElement | null>(null);
 	let userScrolled = $state(false);
 	let scrollTimeout: ReturnType<typeof setTimeout> | null = null;
 
 	interface ChatEntry {
 		id: number;
-		streamId: string;
-		channel: string;
-		streamColor: string;
 		username: string;
 		text: string;
-		masterTime: number; // epoch seconds
-		userColor: string; // resolved chat color (real or fallback)
+		localTime: number;
+		userColor: string;
 		segments: ChatSegment[];
 		badges: BadgeInfo[];
 	}
 
-	// Shared debounced query state (visible streams + windowed ranges)
-	const queryState = createPanelQueryState();
-
-	// Fetch third-party emotes and badges for each visible channel
+	// Fetch badges and third-party emotes for the clip's channel
 	$effect(() => {
-		const channels = queryState.visibleStreams.map((s) => s.channel);
-		for (const ch of channels) {
-			if (!emoteMapByChannel.has(ch)) {
-				getThirdPartyEmotes(ch).then((map) => {
-					emoteMapByChannel.set(ch, map);
-					emoteMapByChannel = new Map(emoteMapByChannel);
-				});
-			}
-			if (!badgeMapByChannel.has(ch)) {
-				fetchTwitchBadges(ch).then((map) => {
-					badgeMapByChannel.set(ch, map);
-					badgeMapByChannel = new Map(badgeMapByChannel);
-				});
-			}
-		}
-	});
-
-	// Fetch chat messages via remote query — re-fetches when queryState.ranges changes.
-	// Cap at 500 per stream to avoid freezing on high-volume VODs (we only display 100).
-	const rawMessages = $derived(await getMultiStreamChat({ ranges: queryState.ranges, limit: 500 }));
-
-	// Transform server data to ChatEntry format with master-time positioning
-	let fetchedEntries = $derived.by(() => {
-		if (!rawMessages || rawMessages.length === 0) return [] as ChatEntry[];
-		const streamLookup = new Map(queryState.visibleStreams.map((s) => [s.id, s]));
-		// Trigger re-derivation when emote / badge maps update
-		const _emotes = emoteMapByChannel;
-		const _badges = badgeMapByChannel;
-		return rawMessages.map((m) => {
-			const s = streamLookup.get(m.streamId);
-			const channel = s?.channel || '';
-			return {
-				id: m.id,
-				streamId: m.streamId,
-				channel,
-				streamColor: s?.color || '#888',
-				username: m.username,
-				text: m.text,
-				masterTime: m.timestamp + (s ? s.anchor - s.offset : 0),
-				userColor: m.color || usernameColor(m.username),
-				segments: parseEmotes(m.text, m.emotes, _emotes.get(channel)),
-				badges: resolveBadges(m.badges, _badges.get(channel))
-			};
+		const stream = $streams.find((s) => s.id === clip.streamId);
+		if (!stream || stream.platform !== 'twitch') return;
+		getThirdPartyEmotes(stream.channel).then((map) => {
+			thirdPartyEmotes = map;
+		});
+		fetchTwitchBadges(stream.channel).then((map) => {
+			badgeMap = map;
 		});
 	});
 
-	// Apply search filter
-	let searchFiltered = $derived.by(() => {
-		if (!searchQuery.trim()) return fetchedEntries;
-		const q = searchQuery.trim().toLowerCase();
-		return fetchedEntries.filter((e) => e.text.toLowerCase().includes(q) || e.username.toLowerCase().includes(q));
+	// Derive clip-local bounds
+	let clipBounds = $derived(
+		getClipLocalBounds(clip, $streams.find((s) => s.id === clip.streamId), $syncOffsets[clip.streamId] || 0)
+	);
+
+	// Fetch all chat for the clip range
+	const rawMessages = $derived(
+		clipBounds
+			? await getMultiStreamChat({
+					ranges: [{ streamId: clip.streamId, from: clipBounds.localStart, to: clipBounds.localEnd }]
+				})
+			: []
+	);
+
+	let entries = $derived.by(() => {
+		if (!rawMessages || rawMessages.length === 0) return [] as ChatEntry[];
+		const _emotes = thirdPartyEmotes;
+		const _badges = badgeMap;
+		return rawMessages.map((m) => ({
+			id: m.id,
+			username: m.username,
+			text: m.text,
+			localTime: m.timestamp,
+			userColor: m.color || usernameColor(m.username),
+			segments: parseEmotes(m.text, m.emotes, _emotes),
+			badges: resolveBadges(m.badges, _badges)
+		}));
 	});
 
-	// Only show messages at or before the current playhead (no future messages)
+	let filteredEntries = $derived.by(() => {
+		if (!searchQuery.trim()) return entries;
+		const q = searchQuery.trim().toLowerCase();
+		return entries.filter(
+			(e) => e.text.toLowerCase().includes(q) || e.username.toLowerCase().includes(q)
+		);
+	});
+
+	// Only show messages at or before the current playhead
 	let displayEntries = $derived.by(() => {
-		const now = $masterTime;
-		// Binary search for the cutoff: first entry with masterTime > now
+		const now = currentLocalTime;
 		let lo = 0,
-			hi = searchFiltered.length;
+			hi = filteredEntries.length;
 		while (lo < hi) {
 			const mid = (lo + hi) >>> 1;
-			if (searchFiltered[mid].masterTime <= now) lo = mid + 1;
+			if (filteredEntries[mid].localTime <= now) lo = mid + 1;
 			else hi = mid;
 		}
-		const all = searchFiltered.slice(0, lo);
-		return all.length > 100 ? all.slice(all.length - 100) : all;
+		const all = filteredEntries.slice(0, lo);
+		return all.length > 200 ? all.slice(all.length - 200) : all;
 	});
 
-	// Auto-scroll to bottom while playing and not manually scrolled up
+	// Auto-scroll to bottom
 	$effect(() => {
 		const _len = displayEntries.length;
-		if (!listEl || userScrolled || !$masterPlaying) return;
+		if (!listEl || userScrolled) return;
 		listEl.scrollTop = listEl.scrollHeight;
 	});
 
 	function handleListScroll() {
 		if (!listEl) return;
-		// If near the bottom, re-enable auto-scroll
 		const atBottom = listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight < 50;
 		if (atBottom) {
 			userScrolled = false;
@@ -125,16 +120,11 @@
 		}, 5000);
 	}
 
-	// Clean up scroll timeout on unmount
 	$effect(() => {
 		return () => {
 			if (scrollTimeout) clearTimeout(scrollTimeout);
 		};
 	});
-
-	function seekToEntry(entry: ChatEntry) {
-		seekRequest.update((r) => ({ time: entry.masterTime, seq: r.seq + 1 }));
-	}
 
 	function scrollToBottom() {
 		userScrolled = false;
@@ -148,7 +138,7 @@
 
 <div class="chat-panel">
 	<div class="chat-header">
-		<span class="header-title">Stream Chat</span>
+		<span class="header-title">Chat</span>
 		<span class="msg-count">{displayEntries.length}</span>
 	</div>
 
@@ -161,7 +151,7 @@
 
 	<div class="chat-log" bind:this={listEl} onscroll={handleListScroll}>
 		{#each displayEntries as entry (entry.id)}
-			<button class="chat-line" onclick={() => seekToEntry(entry)}>
+			<button class="chat-line" onclick={() => onseek(entry.localTime)}>
 				{#each entry.badges as badge}<img class="badge" src={badge.imageUrl} alt={badge.title} title={badge.title} />{/each}<span class="user" style="color:{entry.userColor}">{entry.username}</span><span class="sep">:</span>
 				<span class="msg">{#each entry.segments as seg}{#if seg.type === 'emote'}<img class="emote" src={seg.emoteUrl} alt={seg.text} title={seg.text} />{:else}{seg.text}{/if}{/each}</span>
 			</button>
@@ -179,7 +169,7 @@
 	</div>
 
 	{#if userScrolled}
-		<button class="scroll-bottom" onclick={scrollToBottom}> More messages below </button>
+		<button class="scroll-bottom" onclick={scrollToBottom}>More messages below</button>
 	{/if}
 </div>
 
@@ -272,6 +262,9 @@
 		padding: 4px 0;
 		scrollbar-width: thin;
 		scrollbar-color: #3a3a3e #18181b;
+		display: flex;
+		flex-direction: column;
+		justify-content: flex-end;
 	}
 
 	.chat-log::-webkit-scrollbar {

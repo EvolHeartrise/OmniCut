@@ -5,19 +5,22 @@
  */
 
 import { newExportId } from '../ids.js';
+import type { ClipEntry } from '../types.js';
 import { getClipRegion } from './clipManager.js';
+import { getVideo } from './videoManager.js';
 import { exportVideo, type StreamLookup } from './exporter.js';
 import { exportVerticalVideo, type VerticalClip } from './verticalExporter.js';
+import { exportChatOverlay } from './chatOverlayExporter.js';
 import { cleanupFiles } from './fsUtils.js';
 import * as db from './persistence.js';
 import type { ExportRecord } from './persistence.js';
 import { broadcastExportStatus } from './sseBroadcaster.js';
 import { getStream, getStreamRecordingDir } from './streamManager.js';
+import { SequentialQueue } from './sequentialQueue.js';
 
 // --- State ---
 
-const queue: string[] = [];
-let activeExport: { exportId: string } | null = null;
+const sq = new SequentialQueue(runExport);
 
 // --- Public API ---
 
@@ -25,7 +28,7 @@ let activeExport: { exportId: string } | null = null;
  * Create and enqueue a new export. Returns the ExportRecord.
  * Validates that all clip IDs exist before creating.
  */
-export function createAndQueueExport(clipIds: string[], title: string, description?: string, format?: 'standard' | 'mobile_short'): ExportRecord {
+export function createAndQueueExport(clipIds: string[], title: string, description?: string, format?: 'standard' | 'mobile_short' | 'chat_overlay'): ExportRecord {
 	// Validate all clip IDs exist
 	const missing: string[] = [];
 	for (const clipId of clipIds) {
@@ -49,17 +52,45 @@ export function createAndQueueExport(clipIds: string[], title: string, descripti
 	};
 
 	db.saveExport(record);
-	queueExport(id);
+	sq.enqueue(id);
 
 	return record;
 }
 
 /**
- * Enqueue an existing export ID for processing.
+ * Create and enqueue an export from a video composition.
+ * Freezes the video's clip entries and format into the export record.
  */
-export function queueExport(exportId: string): void {
-	queue.push(exportId);
-	processQueue();
+export function createAndQueueExportFromVideo(videoId: string): ExportRecord {
+	const video = getVideo(videoId);
+	if (!video) throw new Error(`Video not found: ${videoId}`);
+
+	// Validate all clip IDs in the video still exist
+	const missing: string[] = [];
+	for (const entry of video.clipEntries) {
+		if (!getClipRegion(entry.clipId)) missing.push(entry.clipId);
+	}
+	if (missing.length > 0) {
+		throw new Error(`Clip IDs not found: ${missing.join(', ')}`);
+	}
+
+	const id = newExportId();
+	const clipIds = video.clipEntries.map((e) => e.clipId);
+	const record: ExportRecord = {
+		id,
+		title: video.title,
+		...(video.description && { description: video.description }),
+		clipIds,
+		clipEntries: video.clipEntries,
+		status: 'pending',
+		createdAt: Math.floor(Date.now() / 1000),
+		format: video.format,
+		videoId
+	};
+
+	db.saveExport(record);
+	sq.enqueue(id);
+	return record;
 }
 
 /**
@@ -79,11 +110,10 @@ export function restoreExportQueue(): void {
  * Shut down the export queue. Marks active export as error.
  */
 export function shutdownExportQueue(): void {
-	if (activeExport) {
-		db.updateExportStatus(activeExport.exportId, 'error', undefined, 'Server shutting down');
-		activeExport = null;
+	if (sq.active) {
+		db.updateExportStatus(sq.active, 'error', undefined, 'Server shutting down');
 	}
-	queue.length = 0;
+	sq.shutdown();
 }
 
 // Re-export DB reads for convenience
@@ -102,27 +132,23 @@ export function loadAllExports(): ExportRecord[] {
 export function requeueExport(id: string): void {
 	const record = db.loadExport(id);
 	if (!record) throw new Error('Export not found');
-	if (activeExport?.exportId === id) {
+	if (sq.isActive(id)) {
 		throw new Error('Cannot re-queue an export that is currently in progress');
 	}
-	// Remove from queue if already pending
-	const idx = queue.indexOf(id);
-	if (idx !== -1) queue.splice(idx, 1);
+	sq.dequeue(id);
 	// Clean up previous output
 	if (record.outputPath) cleanupFiles(record.outputPath);
 	// Reset status
 	db.updateExportStatus(id, 'pending', undefined, undefined);
 	broadcastExportStatus(id, 'pending');
-	queueExport(id);
+	sq.enqueue(id);
 }
 
 export function deleteExport(id: string): void {
-	if (activeExport?.exportId === id) {
+	if (sq.isActive(id)) {
 		throw new Error('Cannot delete an export that is currently in progress');
 	}
-	// Remove from queue if pending
-	const idx = queue.indexOf(id);
-	if (idx !== -1) queue.splice(idx, 1);
+	sq.dequeue(id);
 	// Delete output file if it exists
 	const record = db.loadExport(id);
 	if (record?.outputPath) cleanupFiles(record.outputPath);
@@ -131,20 +157,17 @@ export function deleteExport(id: string): void {
 
 // --- Internal ---
 
-function processQueue(): void {
-	if (activeExport || queue.length === 0) return;
-	const exportId = queue.shift()!;
-	runExport(exportId);
-}
-
 async function runExport(exportId: string): Promise<void> {
 	const record = db.loadExport(exportId);
-	if (!record) {
-		processQueue();
-		return;
-	}
+	if (!record) return;
 
-	activeExport = { exportId };
+	// Build a map from clipId → ClipEntry for trim/speed/transition metadata
+	const entryMap = new Map<string, ClipEntry>();
+	if (record.clipEntries) {
+		for (const entry of record.clipEntries) {
+			entryMap.set(entry.clipId, entry);
+		}
+	}
 
 	// Resolve clip IDs → ClipRegion objects, preserving caller-specified order
 	const clips = record.clipIds.map((id) => getClipRegion(id)).filter((c) => c !== undefined);
@@ -152,10 +175,11 @@ async function runExport(exportId: string): Promise<void> {
 	if (clips.length === 0) {
 		db.updateExportStatus(exportId, 'error', undefined, 'No valid clips found');
 		broadcastExportStatus(exportId, 'error', undefined, 'No valid clips found');
-		activeExport = null;
-		processQueue();
 		return;
 	}
+
+	// Collect the ordered clip entries (for exporters that support effects)
+	const clipEntries = clips.map((clip) => entryMap.get(clip.id));
 
 	// Update status → exporting
 	db.updateExportStatus(exportId, 'exporting');
@@ -181,7 +205,8 @@ async function runExport(exportId: string): Promise<void> {
 		if (record.format === 'mobile_short') {
 			// Resolve camera bounds from channel table for each clip
 			const verticalClips: VerticalClip[] = [];
-			for (const clip of clips) {
+			for (let i = 0; i < clips.length; i++) {
+				const clip = clips[i];
 				const stream = getStream(clip.streamId);
 				if (!stream) {
 					console.warn(`[export-queue] Skipping clip ${clip.id} — stream not found`);
@@ -192,14 +217,23 @@ async function runExport(exportId: string): Promise<void> {
 					console.warn(`[export-queue] Skipping clip ${clip.id} — no camera bounds for ${stream.channel}`);
 					continue;
 				}
-				verticalClips.push({ clip, cam });
+				verticalClips.push({ clip, cam, entry: clipEntries[i] });
 			}
 			if (verticalClips.length === 0) {
 				throw new Error('No clips have camera bounds set — cannot create vertical export');
 			}
 			({ outputPath } = await exportVerticalVideo(verticalClips, streamMap, exportId, () => {}));
+		} else if (record.format === 'chat_overlay') {
+			// Build channel map (streamId → channel login) for emote/badge resolution
+			const channelMap = new Map<string, string>();
+			for (const clip of clips) {
+				if (channelMap.has(clip.streamId)) continue;
+				const stream = getStream(clip.streamId);
+				if (stream) channelMap.set(clip.streamId, stream.channel);
+			}
+			({ outputPath } = await exportChatOverlay(clips, streamMap, channelMap, exportId, () => {}, clipEntries));
 		} else {
-			({ outputPath } = await exportVideo(clips, streamMap, exportId, () => {}));
+			({ outputPath } = await exportVideo(clips, streamMap, exportId, () => {}, clipEntries));
 		}
 
 		db.updateExportStatus(exportId, 'ready', outputPath);
@@ -210,8 +244,5 @@ async function runExport(exportId: string): Promise<void> {
 		db.updateExportStatus(exportId, 'error', undefined, message);
 		broadcastExportStatus(exportId, 'error', undefined, message);
 		console.error(`[export-queue] Export "${record.title}" failed:`, message);
-	} finally {
-		activeExport = null;
-		processQueue();
 	}
 }

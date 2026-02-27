@@ -4,6 +4,7 @@
  */
 
 import type { StreamInfo, ChatMessage } from './types.js';
+import type { VideoRecord } from '../types.js';
 import type { WordTimestamp } from './transcriber.js';
 import * as db from './persistence.js';
 
@@ -125,8 +126,8 @@ export function broadcastTranscriptionCleared(streamId: string) {
 	broadcast(JSON.stringify({ type: 'transcription-cleared', streamId }));
 }
 
-export function broadcastClipRegionsChanged(
-	clipRegions: Array<{
+export function broadcastClipUpsert(
+	clip: {
 		id: string;
 		streamId: string;
 		startTime: number;
@@ -134,9 +135,13 @@ export function broadcastClipRegionsChanged(
 		createdBy?: string;
 		title?: string;
 		notes?: string;
-	}>
+	}
 ) {
-	broadcast(JSON.stringify({ type: 'clip-regions-changed', clipRegions }));
+	broadcast(JSON.stringify({ type: 'clip-upsert', clip }));
+}
+
+export function broadcastClipDelete(id: string) {
+	broadcast(JSON.stringify({ type: 'clip-delete', id }));
 }
 
 export function broadcastExportStatus(exportId: string, status: string, outputPath?: string, error?: string) {
@@ -149,6 +154,18 @@ export function broadcastExportStatus(exportId: string, status: string, outputPa
 			...(error && { error })
 		})
 	);
+}
+
+export function broadcastVideoCreate(video: VideoRecord) {
+	broadcast(JSON.stringify({ type: 'video-create', video }));
+}
+
+export function broadcastVideoUpdate(video: VideoRecord) {
+	broadcast(JSON.stringify({ type: 'video-update', video }));
+}
+
+export function broadcastVideoDelete(id: string) {
+	broadcast(JSON.stringify({ type: 'video-delete', id }));
 }
 
 export function broadcastYouTubeUploadStatus(

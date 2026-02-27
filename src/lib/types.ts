@@ -7,6 +7,7 @@ export interface ClipRegion {
 	createdBy?: 'human' | 'ai'; // who created this clip (default: human)
 	title?: string; // short clip label
 	notes?: string; // longer description/context
+	favourite?: boolean; // user-marked favourite
 }
 
 /** Per-channel camera bounds at a point in time. */
@@ -18,6 +19,27 @@ export interface CameraBoundsEntry {
 	camY: number;
 	camW: number;
 	camH: number;
+}
+
+/** Per-clip entry in a video composition. */
+export interface ClipEntry {
+	clipId: string;
+	trimStart?: number; // seconds offset into clip to start (default 0)
+	trimEnd?: number; // seconds offset from clip end to stop (default 0 = full duration)
+	speed?: number; // playback speed multiplier (default 1)
+	transition?: 'none' | 'crossfade' | 'fade-black'; // transition INTO this clip
+	transitionDuration?: number; // seconds (default 0.5)
+}
+
+/** Video composition — an ordered collection of clips with effects. */
+export interface VideoRecord {
+	id: string;
+	title: string;
+	description?: string;
+	clipEntries: ClipEntry[];
+	format: 'standard' | 'mobile_short' | 'chat_overlay';
+	createdAt: number;
+	updatedAt: number;
 }
 
 /** VOD info returned by the channel vods API. */

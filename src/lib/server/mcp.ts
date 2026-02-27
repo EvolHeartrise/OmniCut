@@ -21,9 +21,15 @@ import {
 	getChatHeatmap,
 	retranscribeStream,
 	createAndQueueExport,
+	createAndQueueExportFromVideo,
 	loadAllExports as smLoadAllExports,
 	loadExport as smLoadExport,
-	getStreamRecordingDir
+	getStreamRecordingDir,
+	createVideo,
+	updateVideo,
+	deleteVideo,
+	getVideo,
+	getAllVideos
 } from './streamManager.js';
 
 import { extractFrame, extractFrameCropped } from './hlsUtils.js';
@@ -873,25 +879,172 @@ export function createMcpServer(): McpServer {
 	);
 
 	// ---------------------------------------------------------------------------
-	// Tool 13 — export_video  (mutating)
+	// Tool — create_video  (mutating)
+	// ---------------------------------------------------------------------------
+
+	mcpServer.tool(
+		'create_video',
+		'Create a video composition from clips. Returns the video record.',
+		{
+			clipIds: z.array(z.string()).min(1).describe('Ordered clip IDs for the video'),
+			title: z.string().describe('Video title'),
+			description: z.string().optional(),
+			format: z
+				.enum(['standard', 'mobile_short', 'chat_overlay'])
+				.optional()
+				.default('standard')
+				.describe('"standard" (16:9), "mobile_short" (9:16), or "chat_overlay"')
+		},
+		async ({ clipIds, title, description, format }) => {
+			try {
+				const clipEntries = clipIds.map((clipId) => ({ clipId }));
+				const video = createVideo({ title, description, clipEntries, format });
+				return {
+					content: [{
+						type: 'text' as const,
+						text: JSON.stringify({
+							success: true,
+							video,
+							message: `Video "${title}" created with ${clipIds.length} clip(s).`
+						})
+					}]
+				};
+			} catch (err) {
+				return {
+					isError: true,
+					content: [{ type: 'text' as const, text: `Failed to create video: ${err instanceof Error ? err.message : String(err)}` }]
+				};
+			}
+		}
+	);
+
+	// ---------------------------------------------------------------------------
+	// Tool — get_videos
+	// ---------------------------------------------------------------------------
+
+	mcpServer.tool(
+		'get_videos',
+		'Get video by ID, or list all if omitted.',
+		{
+			id: z.string().optional()
+		},
+		async ({ id }) => {
+			if (id) {
+				const video = getVideo(id);
+				if (!video) {
+					return { isError: true, content: [{ type: 'text' as const, text: `Video "${id}" not found.` }] };
+				}
+				return { content: [{ type: 'text' as const, text: JSON.stringify(video) }] };
+			}
+			const videos = getAllVideos();
+			return { content: [{ type: 'text' as const, text: JSON.stringify({ count: videos.length, videos }) }] };
+		}
+	);
+
+	// ---------------------------------------------------------------------------
+	// Tool — update_video  (mutating)
+	// ---------------------------------------------------------------------------
+
+	mcpServer.tool(
+		'update_video',
+		'Update a video composition. Only provided fields are changed.',
+		{
+			id: z.string(),
+			title: z.string().optional(),
+			description: z.string().optional(),
+			clipIds: z.array(z.string()).optional().describe('New ordered clip IDs (replaces all entries)'),
+			format: z.enum(['standard', 'mobile_short', 'chat_overlay']).optional()
+		},
+		async ({ id, title, description, clipIds, format }) => {
+			try {
+				const updates: Parameters<typeof updateVideo>[1] = {};
+				if (title !== undefined) updates.title = title;
+				if (description !== undefined) updates.description = description;
+				if (clipIds !== undefined) updates.clipEntries = clipIds.map((clipId) => ({ clipId }));
+				if (format !== undefined) updates.format = format;
+				const video = updateVideo(id, updates);
+				return {
+					content: [{ type: 'text' as const, text: JSON.stringify({ success: true, video }) }]
+				};
+			} catch (err) {
+				return {
+					isError: true,
+					content: [{ type: 'text' as const, text: `Failed to update video: ${err instanceof Error ? err.message : String(err)}` }]
+				};
+			}
+		}
+	);
+
+	// ---------------------------------------------------------------------------
+	// Tool — delete_video  (mutating)
+	// ---------------------------------------------------------------------------
+
+	mcpServer.tool(
+		'delete_video',
+		'Delete a video composition. Does not delete associated exports.',
+		{
+			id: z.string()
+		},
+		async ({ id }) => {
+			const deleted = deleteVideo(id);
+			if (!deleted) {
+				return { isError: true, content: [{ type: 'text' as const, text: `Video "${id}" not found.` }] };
+			}
+			return { content: [{ type: 'text' as const, text: JSON.stringify({ success: true, message: `Video "${id}" deleted.` }) }] };
+		}
+	);
+
+	// ---------------------------------------------------------------------------
+	// Tool — export_video  (mutating)
 	// ---------------------------------------------------------------------------
 
 	mcpServer.tool(
 		'export_video',
-		'Export video from clips. Returns export ID; runs in background.',
+		'Export video from clips or a video composition. Returns export ID; runs in background.',
 		{
-			clipIds: z.array(z.string()).min(1),
-			title: z.string().describe('Used as filename'),
+			videoId: z.string().optional().describe('Video ID to export. If provided, clipIds/title/format are ignored.'),
+			clipIds: z.array(z.string()).min(1).optional().describe('Clip IDs (legacy path). Creates a video and exports it.'),
+			title: z.string().optional().describe('Used as filename (required if clipIds provided)'),
 			description: z.string().optional(),
 			chronological: z.boolean().optional().default(false),
 			format: z
-				.enum(['standard', 'mobile_short'])
+				.enum(['standard', 'mobile_short', 'chat_overlay'])
 				.optional()
 				.default('standard')
-				.describe('"standard" (16:9) or "mobile_short" (9:16 vertical with gameplay + webcam)')
+				.describe('"standard" (16:9) or "mobile_short" (9:16 vertical with gameplay + webcam) or "chat_overlay" (transparent WebM with chat panel)')
 		},
-		async ({ clipIds, title, description, chronological, format }) => {
+		async ({ videoId, clipIds, title, description, chronological, format }) => {
 			try {
+				if (videoId) {
+					// Export from existing video
+					const record = createAndQueueExportFromVideo(videoId);
+					return {
+						content: [{
+							type: 'text' as const,
+							text: JSON.stringify({
+								success: true,
+								exportId: record.id,
+								videoId,
+								message: `Export queued from video "${record.title}". Use get_exports to check status.`
+							})
+						}]
+					};
+				}
+
+				// Legacy path: clipIds required
+				if (!clipIds || clipIds.length === 0) {
+					return {
+						isError: true,
+						content: [{ type: 'text' as const, text: 'Either videoId or clipIds must be provided.' }]
+					};
+				}
+				if (!title) {
+					return {
+						isError: true,
+						content: [{ type: 'text' as const, text: 'title is required when using clipIds.' }]
+					};
+				}
+
 				let finalClipIds = clipIds;
 				if (chronological) {
 					const allClips = getAllClipRegions();
@@ -903,29 +1056,28 @@ export function createMcpServer(): McpServer {
 						return ca.startTime - cb.startTime;
 					});
 				}
-				const record = createAndQueueExport(finalClipIds, title, description, format);
-				const formatLabel = format === 'mobile_short' ? ' (9:16 vertical)' : '';
+
+				// Auto-create a video, then export it
+				const clipEntries = finalClipIds.map((clipId) => ({ clipId }));
+				const video = createVideo({ title, description, clipEntries, format });
+				const record = createAndQueueExportFromVideo(video.id);
+				const formatLabel = format === 'mobile_short' ? ' (9:16 vertical)' : format === 'chat_overlay' ? ' (transparent chat overlay)' : '';
+
 				return {
-					content: [
-						{
-							type: 'text' as const,
-							text: JSON.stringify({
-								success: true,
-								exportId: record.id,
-								message: `Export "${title}" queued with ${finalClipIds.length} clip(s)${chronological ? ' (sorted chronologically)' : ''}${formatLabel}. Use get_exports to check status.`
-							})
-						}
-					]
+					content: [{
+						type: 'text' as const,
+						text: JSON.stringify({
+							success: true,
+							exportId: record.id,
+							videoId: video.id,
+							message: `Video + export "${title}" queued with ${finalClipIds.length} clip(s)${chronological ? ' (sorted chronologically)' : ''}${formatLabel}. Use get_exports to check status.`
+						})
+					}]
 				};
 			} catch (err) {
 				return {
 					isError: true,
-					content: [
-						{
-							type: 'text' as const,
-							text: `Failed to queue export: ${err instanceof Error ? err.message : String(err)}`
-						}
-					]
+					content: [{ type: 'text' as const, text: `Failed to queue export: ${err instanceof Error ? err.message : String(err)}` }]
 				};
 			}
 		}

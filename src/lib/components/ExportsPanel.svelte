@@ -1,9 +1,9 @@
 <script lang="ts">
 	import { onMount, untrack } from 'svelte';
 	import Hls from 'hls.js';
-	import { exportStatusEvents, exportLog, streams, syncOffsets, clipRegions } from '$lib/stores/streams.js';
-	import { listExportsCmd, reexportCmd, deleteExportCmd } from '$lib/streams.remote';
-	import { formatDuration, createHlsConfig } from '$lib/utils.js';
+	import { exportStatusEvents, exportLog, streams, syncOffsets, clipRegions, videos } from '$lib/stores/streams.js';
+	import { listExports, reexportCmd, deleteExportCmd } from '$lib/streams.remote';
+	import { formatDuration, formatEpochDate, getClipLocalBounds, setupHls } from '$lib/utils.js';
 	import type { ClipRegion } from '$lib/stores/streams.js';
 
 	interface ExportRecord {
@@ -11,12 +11,13 @@
 		title: string;
 		description?: string;
 		clipIds: string[];
+		videoId?: string;
 		status: 'pending' | 'exporting' | 'ready' | 'error';
 		outputPath?: string;
 		error?: string;
 		createdAt: number;
 		completedAt?: number;
-		format?: 'standard' | 'mobile_short';
+		format?: 'standard' | 'mobile_short' | 'chat_overlay';
 	}
 
 	let exports = $state<ExportRecord[]>([]);
@@ -53,7 +54,7 @@
 	async function fetchExports() {
 		loading = true;
 		try {
-			const data = await listExportsCmd();
+			const data = await listExports();
 			exports = data.exports;
 		} catch {
 			// Ignore
@@ -99,14 +100,6 @@
 		}
 	}
 
-	function formatDate(epoch: number): string {
-		return new Date(epoch * 1000).toLocaleString(undefined, {
-			month: 'short',
-			day: 'numeric',
-			hour: '2-digit',
-			minute: '2-digit'
-		});
-	}
 
 	async function handleReexport(id: string) {
 		try {
@@ -137,20 +130,11 @@
 
 	// --- Preview helpers ---
 
-	function getClipLocalBounds(clip: ClipRegion): { localStart: number; localEnd: number } | null {
+	function clipBounds(clip: ClipRegion) {
 		const stream = $streams.find((s) => s.id === clip.streamId);
-		if (!stream) return null;
-		const offset = $syncOffsets[clip.streamId] || 0;
-		const anchor = stream.startedAt / 1000;
-		return { localStart: clip.startTime - anchor + offset, localEnd: clip.endTime - anchor + offset };
+		return getClipLocalBounds(clip, stream, $syncOffsets[clip.streamId] || 0);
 	}
 
-	function formatTime(seconds: number): string {
-		const s = Math.max(0, Math.floor(seconds));
-		const m = Math.floor(s / 60);
-		const sec = s % 60;
-		return `${m}:${sec.toString().padStart(2, '0')}`;
-	}
 
 	function getClipDuration(clip: ClipRegion): number {
 		return clip.endTime - clip.startTime;
@@ -188,7 +172,7 @@
 			const clip = $clipRegions.find((c) => c.id === id);
 			if (clip) clips.push(clip);
 		}
-		previewTotalDuration = formatTime(getTotalDuration(clips));
+		previewTotalDuration = formatDuration(getTotalDuration(clips));
 
 		requestAnimationFrame(() => {
 			if (clips.length > 0) loadClipAtIndex(0, clips);
@@ -214,41 +198,16 @@
 		const anchor = stream.startedAt / 1000;
 		const localStart = clip.startTime - anchor + offset;
 
-		const autoPlay = () => {
-			previewVideoEl!
-				.play()
-				.then(() => {
-					previewPlaying = true;
-				})
-				.catch(() => {});
-		};
-
-		if (Hls.isSupported()) {
-			const h = new Hls(createHlsConfig(false));
-			previewHls = h;
-			h.loadSource(url);
-			h.attachMedia(previewVideoEl);
-			h.on(Hls.Events.MANIFEST_PARSED, () => {
-				previewVideoEl!.currentTime = localStart;
-				autoPlay();
-			});
-			h.on(Hls.Events.ERROR, (_event, data) => {
-				if (data.fatal && data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-					h.recoverMediaError();
-				}
-			});
-		} else {
-			previewVideoEl.src = url;
-			previewVideoEl.currentTime = localStart;
-			autoPlay();
-		}
+		previewHls = setupHls(Hls, previewVideoEl, url, localStart, () => {
+			previewVideoEl!.play().then(() => { previewPlaying = true; }).catch(() => {});
+		});
 	}
 
 	function handlePreviewTimeUpdate() {
 		if (!previewVideoEl || previewClips.length === 0) return;
 		const clip = previewClips[currentClipIndex];
 		if (!clip) return;
-		const bounds = getClipLocalBounds(clip);
+		const bounds = clipBounds(clip);
 		if (!bounds) return;
 		const { localStart, localEnd } = bounds;
 		const clipDur = localEnd - localStart;
@@ -263,13 +222,13 @@
 				previewVideoEl.pause();
 				previewPlaying = false;
 				previewProgress = 1;
-				previewCurrentTime = formatTime(totalDur);
+				previewCurrentTime = formatDuration(totalDur);
 			}
 		} else if (!isSeeking) {
 			const elapsed = previewVideoEl.currentTime - localStart;
 			const globalElapsed = getPriorDuration(previewClips, currentClipIndex) + elapsed;
 			previewProgress = totalDur > 0 ? Math.max(0, Math.min(1, globalElapsed / totalDur)) : 0;
-			previewCurrentTime = formatTime(globalElapsed);
+			previewCurrentTime = formatDuration(globalElapsed);
 		}
 	}
 
@@ -278,7 +237,7 @@
 		const value = +(e.target as HTMLInputElement).value;
 		previewProgress = value;
 		const totalDur = getTotalDuration(previewClips);
-		previewCurrentTime = formatTime(value * totalDur);
+		previewCurrentTime = formatDuration(value * totalDur);
 	}
 
 	function handleSeekCommit() {
@@ -328,34 +287,15 @@
 			const localStart = clip.startTime - anchor + offset;
 			const seekTo = localStart + offsetInClip;
 
-			if (Hls.isSupported()) {
-				const h = new Hls(createHlsConfig(false));
-				previewHls = h;
-				h.loadSource(url);
-				h.attachMedia(previewVideoEl);
-				h.on(Hls.Events.MANIFEST_PARSED, () => {
-					previewVideoEl!.currentTime = seekTo;
-					isSeeking = false;
-					if (previewPlaying) {
-						previewVideoEl!.play().catch(() => {});
-					}
-				});
-				h.on(Hls.Events.ERROR, (_event, data) => {
-					if (data.fatal && data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-						h.recoverMediaError();
-					}
-				});
-			} else {
-				previewVideoEl.src = url;
-				previewVideoEl.currentTime = seekTo;
+			previewHls = setupHls(Hls, previewVideoEl, url, seekTo, () => {
 				isSeeking = false;
 				if (previewPlaying) {
-					previewVideoEl.play().catch(() => {});
+					previewVideoEl!.play().catch(() => {});
 				}
-			}
+			});
 		} else {
 			// Same clip — just seek
-			const bounds = getClipLocalBounds(previewClips[targetIndex]);
+			const bounds = clipBounds(previewClips[targetIndex]);
 			if (bounds) {
 				previewVideoEl.currentTime = bounds.localStart + offsetInClip;
 			}
@@ -424,7 +364,11 @@
 					<div class="export-item">
 						<div class="export-item-header">
 							<span class="export-item-title">{exp.title}</span>
-							<span class="format-badge">{exp.format === 'mobile_short' ? '9:16' : '16:9'}</span>
+							{#if exp.videoId}
+								{@const linkedVideo = $videos.find((v) => v.id === exp.videoId)}
+								<a class="btn-video-link" href="/videos/{exp.videoId}" title={linkedVideo?.title ?? 'Video'}>{linkedVideo?.title ?? 'Video'}</a>
+							{/if}
+							<span class="format-badge">{exp.format === 'mobile_short' ? '9:16' : exp.format === 'chat_overlay' ? 'Chat' : '16:9'}</span>
 							<div class="export-item-actions">
 								{#if exp.clipIds.length > 0}
 									<button
@@ -451,9 +395,9 @@
 						{/if}
 						<div class="export-details">
 							<span class="export-clips">{exp.clipIds.length} clip{exp.clipIds.length !== 1 ? 's' : ''}</span>
-							<span class="export-date">{formatDate(exp.createdAt)}</span>
+							<span class="export-date">{formatEpochDate(exp.createdAt)}</span>
 							{#if exp.completedAt}
-								<span class="export-completed">Completed {formatDate(exp.completedAt)}</span>
+								<span class="export-completed">Completed {formatEpochDate(exp.completedAt)}</span>
 							{/if}
 						</div>
 						{#if exp.status === 'exporting' && activeProgress}
@@ -700,6 +644,26 @@
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
+	}
+
+	.btn-video-link {
+		font-size: 0.6rem;
+		font-weight: 600;
+		padding: 1px 6px;
+		border-radius: 3px;
+		background: rgba(59, 130, 246, 0.12);
+		color: #93c5fd;
+		flex-shrink: 0;
+		text-decoration: none;
+		max-width: 120px;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.btn-video-link:hover {
+		background: rgba(59, 130, 246, 0.25);
+		color: #bfdbfe;
 	}
 
 	.format-badge {

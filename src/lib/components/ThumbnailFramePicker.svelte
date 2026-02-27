@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { streams, clipRegions, syncOffsets } from '$lib/stores/streams.js';
-	import { listExportsCmd } from '$lib/streams.remote';
+	import { streams, clipRegions, syncOffsets, videos } from '$lib/stores/streams.js';
+	import { listExports } from '$lib/streams.remote';
 
 	interface ExportRecord {
 		id: string;
@@ -12,14 +12,17 @@
 
 	interface Props {
 		preselectedExportId?: string | null;
+		preselectedVideoId?: string | null;
 		onFrameSelected: (blobUrl: string, streamId: string, timestamp: number) => void;
 		onExportSelected?: (exportId: string) => void;
+		onVideoSelected?: (videoId: string) => void;
 	}
 
-	let { preselectedExportId = null, onFrameSelected, onExportSelected }: Props = $props();
+	let { preselectedExportId = null, preselectedVideoId = null, onFrameSelected, onExportSelected, onVideoSelected }: Props = $props();
 
 	let exports = $state<ExportRecord[]>([]);
 	let selectedExportId = $state<string | null>(null);
+	let selectedVideoId = $state<string | null>(null);
 	let selectedClipId = $state<string | null>(null);
 	let scrubValue = $state(0);
 	let previewUrl = $state<string | null>(null);
@@ -33,6 +36,14 @@
 	let readyExports = $derived(exports.filter((e) => e.status === 'ready'));
 
 	let selectedExportClips = $derived.by(() => {
+		// Prefer video clips if selected
+		if (selectedVideoId) {
+			const video = $videos.find((v) => v.id === selectedVideoId);
+			if (!video) return [];
+			return video.clipEntries
+				.map((e) => $clipRegions.find((c) => c.id === e.clipId))
+				.filter((c): c is NonNullable<typeof c> => !!c);
+		}
 		if (!selectedExportId) return [];
 		const exp = readyExports.find((e) => e.id === selectedExportId);
 		if (!exp) return [];
@@ -63,16 +74,33 @@
 
 	onMount(async () => {
 		try {
-			const data = await listExportsCmd();
+			const data = await listExports();
 			exports = data.exports;
-			if (preselectedExportId && readyExports.some((e) => e.id === preselectedExportId)) {
+			if (preselectedVideoId) {
+				// Video mode: use clips from the video instead of an export
+				const video = $videos.find((v) => v.id === preselectedVideoId);
+				if (video) {
+					selectVideo(preselectedVideoId!);
+				}
+			} else if (preselectedExportId && readyExports.some((e) => e.id === preselectedExportId)) {
 				selectExport(preselectedExportId!);
 			}
 		} catch { /* ignore */ }
 	});
 
+	function selectVideo(videoId: string) {
+		selectedVideoId = videoId;
+		selectedExportId = null;
+		selectedClipId = null;
+		scrubValue = 0;
+		previewUrl = null;
+		previewStreamId = null;
+		onVideoSelected?.(videoId);
+	}
+
 	function selectExport(exportId: string) {
 		selectedExportId = exportId;
+		selectedVideoId = null;
 		selectedClipId = null;
 		scrubValue = 0;
 		previewUrl = null;

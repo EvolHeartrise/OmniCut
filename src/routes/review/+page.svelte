@@ -12,12 +12,14 @@
 		type ClipRegion
 	} from '$lib/stores/streams.js';
 	import type { CameraBoundsEntry } from '$lib/types.js';
-	import { formatDuration, createHlsConfig } from '$lib/utils.js';
+	import { formatDuration, setupHls } from '$lib/utils.js';
 	import { getMultiStreamTranscriptions } from '$lib/streams.remote';
 	import { splitClipRegion } from '$lib/clipActions.js';
 	import { untrack } from 'svelte';
 	import { page } from '$app/state';
 	import CameraRegionOverlay from '$lib/components/CameraRegionOverlay.svelte';
+	import ReviewTranscriptPanel from '$lib/components/ReviewTranscriptPanel.svelte';
+	import ReviewChatPanel from '$lib/components/ReviewChatPanel.svelte';
 
 	// --- URL-targeted clip (e.g. /review?clip=123) ---
 	let urlClipId = $derived(page.url.searchParams.get('clip'));
@@ -104,6 +106,7 @@
 	let playing = $state(false);
 	let progress = $state(0);
 	let currentTime = $state('0:00');
+	let currentLocalTime = $state(0);
 	let durationText = $state('0:00');
 	let isSeeking = $state(false);
 	let loadedClipId = $state<string | null>(null);
@@ -111,6 +114,10 @@
 
 	// --- Transcription regions ---
 	let transcriptionRegions = $state<Array<{ startFrac: number; endFrac: number; text: string }>>([]);
+
+	// --- Side panels ---
+	let transcriptPanelOpen = $state(false);
+	let chatPanelOpen = $state(false);
 
 	// --- Camera region ---
 	let camRegionActive = $state(false);
@@ -142,12 +149,6 @@
 		});
 	}
 
-	function fmtTime(seconds: number): string {
-		const s = Math.max(0, Math.floor(seconds));
-		const m = Math.floor(s / 60);
-		const sec = s % 60;
-		return `${m}:${sec.toString().padStart(2, '0')}`;
-	}
 
 	function getClipLocalBounds(clip: ClipRegion): { localStart: number; localEnd: number } | null {
 		const stream = $streams.find((s) => s.id === clip.streamId);
@@ -174,36 +175,10 @@
 		const anchor = stream.startedAt / 1000;
 		const localStart = clip.startTime - anchor + offset;
 
-		const autoPlay = () => {
+		hls = setupHls(Hls, videoEl, url, localStart, () => {
 			videoEl!.playbackRate = playbackRate;
-			videoEl!
-				.play()
-				.then(() => {
-					playing = true;
-					startWaveformLoop();
-				})
-				.catch(() => {});
-		};
-
-		if (Hls.isSupported()) {
-			const h = new Hls(createHlsConfig(false));
-			hls = h;
-			h.loadSource(url);
-			h.attachMedia(videoEl);
-			h.on(Hls.Events.MANIFEST_PARSED, () => {
-				videoEl!.currentTime = localStart;
-				autoPlay();
-			});
-			h.on(Hls.Events.ERROR, (_event, data) => {
-				if (data.fatal && data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-					h.recoverMediaError();
-				}
-			});
-		} else {
-			videoEl.src = url;
-			videoEl.currentTime = localStart;
-			autoPlay();
-		}
+			videoEl!.play().then(() => { playing = true; startWaveformLoop(); }).catch(() => {});
+		});
 
 		loadedClipId = clip.id;
 		startWaveformScan(clip);
@@ -228,7 +203,7 @@
 		playing = false;
 		progress = 0;
 		currentTime = '0:00';
-		durationText = fmtTime(clip.endTime - clip.startTime);
+		durationText = formatDuration(clip.endTime - clip.startTime);
 		waveformPeaks = new Float32Array(WAVEFORM_BINS);
 		editingId = null;
 		deleteConfirmId = null;
@@ -298,18 +273,21 @@
 		const { localStart, localEnd } = bounds;
 		const clipDur = localEnd - localStart;
 
+		currentLocalTime = videoEl.currentTime;
+
 		if (videoEl.currentTime >= localEnd) {
 			videoEl.pause();
 			playing = false;
 			videoEl.currentTime = localStart;
+			currentLocalTime = localStart;
 			progress = 0;
 			currentTime = '0:00';
 		} else if (!isSeeking) {
 			const elapsed = videoEl.currentTime - localStart;
 			progress = clipDur > 0 ? Math.max(0, Math.min(1, elapsed / clipDur)) : 0;
-			currentTime = fmtTime(elapsed);
+			currentTime = formatDuration(elapsed);
 		}
-		durationText = fmtTime(clipDur);
+		durationText = formatDuration(clipDur);
 	}
 
 	function handleSeekInput(e: Event) {
@@ -318,7 +296,7 @@
 		progress = value;
 		if (currentClip) {
 			const bounds = getClipLocalBounds(currentClip);
-			if (bounds) currentTime = fmtTime(value * (bounds.localEnd - bounds.localStart));
+			if (bounds) currentTime = formatDuration(value * (bounds.localEnd - bounds.localStart));
 		}
 	}
 
@@ -352,6 +330,13 @@
 	function approveClip(clip: ClipRegion) {
 		pushUndo({ type: 'update-region', before: { ...clip } });
 		saveClipRegion({ ...clip, createdBy: 'human' as const });
+	}
+
+	function toggleFavourite(clip: ClipRegion) {
+		pushUndo({ type: 'update-region', before: { ...clip } });
+		const updated = { ...clip, favourite: !clip.favourite };
+		clipRegions.update((regions) => regions.map((r) => (r.id === updated.id ? updated : r)));
+		saveClipRegion(updated);
 	}
 
 	function handleDelete(id: string) {
@@ -476,7 +461,8 @@
 				const clipDur = bounds.localEnd - bounds.localStart;
 				const elapsed = videoEl.currentTime - bounds.localStart;
 				progress = clipDur > 0 ? Math.max(0, Math.min(1, elapsed / clipDur)) : 0;
-				currentTime = fmtTime(elapsed);
+				currentTime = formatDuration(elapsed);
+				currentLocalTime = videoEl.currentTime;
 			}
 		}
 		if (playing || isDraggingWaveform) {
@@ -499,7 +485,7 @@
 		progress = x;
 		if (currentClip) {
 			const bounds = getClipLocalBounds(currentClip);
-			if (bounds) currentTime = fmtTime(x * (bounds.localEnd - bounds.localStart));
+			if (bounds) currentTime = formatDuration(x * (bounds.localEnd - bounds.localStart));
 		}
 	}
 
@@ -591,13 +577,13 @@
 
 		// Immediately refresh display for the new bounds
 		const clipDur = newEnd - newStart;
-		durationText = fmtTime(clipDur);
+		durationText = formatDuration(clipDur);
 		if (videoEl) {
 			const bounds = getClipLocalBounds(updated);
 			if (bounds) {
 				const elapsed = videoEl.currentTime - bounds.localStart;
 				progress = clipDur > 0 ? Math.max(0, Math.min(1, elapsed / clipDur)) : 0;
-				currentTime = fmtTime(Math.max(0, elapsed));
+				currentTime = formatDuration(Math.max(0, elapsed));
 			}
 		}
 
@@ -747,8 +733,18 @@
 			case 'S':
 				splitAtPlayhead();
 				break;
+			case 'f':
+				toggleFavourite(currentClip);
+				break;
 			case 'c':
 				camRegionActive = !camRegionActive;
+				break;
+			case 'p':
+			case 'P':
+				transcriptPanelOpen = !transcriptPanelOpen;
+				break;
+			case 'C':
+				chatPanelOpen = !chatPanelOpen;
 				break;
 		}
 	}
@@ -817,151 +813,185 @@
 			{:else}
 				{aiClips.length} clip{aiClips.length !== 1 ? 's' : ''} to review
 			{/if}
+			<div class="panel-toggles">
+				<button
+					class="panel-toggle"
+					class:active={transcriptPanelOpen}
+					onclick={() => (transcriptPanelOpen = !transcriptPanelOpen)}
+					title="Toggle transcript panel (P)"
+				>T</button>
+				<button
+					class="panel-toggle"
+					class:active={chatPanelOpen}
+					onclick={() => (chatPanelOpen = !chatPanelOpen)}
+					title="Toggle chat panel (Shift+C)"
+				>C</button>
+			</div>
 		</div>
 
-		<div class="review-card">
-			<!-- Video preview -->
-			<div class="video-container">
-				<!-- svelte-ignore a11y_media_has_caption -->
-				<video bind:this={videoEl} ontimeupdate={handleTimeUpdate} playsinline class="review-video"></video>
-				<CameraRegionOverlay
-					{videoEl}
-					camX={resolvedCamBounds?.camX}
-					camY={resolvedCamBounds?.camY}
-					camW={resolvedCamBounds?.camW}
-					camH={resolvedCamBounds?.camH}
-					active={camRegionActive}
-					onchange={handleCamRegionChange}
-					onsave={handleCamRegionSave}
-				/>
-				<div class="video-controls">
-					<div class="timeline-row">
-						<button class="btn-ctl" onclick={togglePlay}>
-							{playing ? '⏸' : '▶'}
-						</button>
-						<!-- svelte-ignore a11y_no_static_element_interactions -->
-						<div
-							class="waveform-seek"
-							bind:this={waveformSeekEl}
-							onpointerdown={handleWaveformPointerDown}
-							onpointermove={handleWaveformPointerMove}
-							onpointerup={handleWaveformPointerUp}
-						>
-							<canvas bind:this={waveformBgCanvas} class="waveform-canvas"></canvas>
-							<canvas
-								bind:this={waveformFgCanvas}
-								class="waveform-canvas waveform-fg"
-								style="clip-path: inset(0 {(1 - progress) * 100}% 0 0)"
-							></canvas>
-							{#each transcriptionRegions as region}
-								<div
-									class="transcript-region"
-									style="left: {region.startFrac * 100}%; width: {(region.endFrac - region.startFrac) * 100}%"
-									title={region.text}
-								></div>
-							{/each}
-							<div class="waveform-playhead" style="left: {progress * 100}%"></div>
+		<div class="review-body">
+			<div class="review-card">
+				<!-- Video preview -->
+				<div class="video-container">
+					<!-- svelte-ignore a11y_media_has_caption -->
+					<video bind:this={videoEl} ontimeupdate={handleTimeUpdate} playsinline class="review-video"></video>
+					<CameraRegionOverlay
+						{videoEl}
+						camX={resolvedCamBounds?.camX}
+						camY={resolvedCamBounds?.camY}
+						camW={resolvedCamBounds?.camW}
+						camH={resolvedCamBounds?.camH}
+						active={camRegionActive}
+						onchange={handleCamRegionChange}
+						onsave={handleCamRegionSave}
+					/>
+					<div class="video-controls">
+						<div class="timeline-row">
+							<button class="btn-ctl" onclick={togglePlay}>
+								{playing ? '⏸' : '▶'}
+							</button>
+							<!-- svelte-ignore a11y_no_static_element_interactions -->
+							<div
+								class="waveform-seek"
+								bind:this={waveformSeekEl}
+								onpointerdown={handleWaveformPointerDown}
+								onpointermove={handleWaveformPointerMove}
+								onpointerup={handleWaveformPointerUp}
+							>
+								<canvas bind:this={waveformBgCanvas} class="waveform-canvas"></canvas>
+								<canvas
+									bind:this={waveformFgCanvas}
+									class="waveform-canvas waveform-fg"
+									style="clip-path: inset(0 {(1 - progress) * 100}% 0 0)"
+								></canvas>
+								{#each transcriptionRegions as region}
+									<div
+										class="transcript-region"
+										style="left: {region.startFrac * 100}%; width: {(region.endFrac - region.startFrac) * 100}%"
+										title={region.text}
+									></div>
+								{/each}
+								<div class="waveform-playhead" style="left: {progress * 100}%"></div>
+							</div>
+						</div>
+						<div class="transport-row">
+							<span class="vid-time">{currentTime}</span>
+							<span style="flex:1"></span>
+							<span class="vid-time">{durationText}</span>
+							<span class="vid-speed">{playbackRate}x</span>
 						</div>
 					</div>
-					<div class="transport-row">
-						<span class="vid-time">{currentTime}</span>
-						<span style="flex:1"></span>
-						<span class="vid-time">{durationText}</span>
-						<span class="vid-speed">{playbackRate}x</span>
-					</div>
 				</div>
-			</div>
 
-			<!-- Clip info -->
-			<div class="clip-info">
-				{#if isEditing}
-					<input
-						type="text"
-						class="edit-input edit-title"
-						bind:value={editTitle}
-						placeholder="Clip title..."
-						onkeydown={(e) => {
-							if (e.key === 'Enter') saveEdit();
-							if (e.key === 'Escape') cancelEdit();
-						}}
-					/>
-					<textarea
-						class="edit-input edit-notes"
-						bind:value={editNotes}
-						placeholder="Notes..."
-						rows="3"
-						onkeydown={(e) => {
-							if (e.key === 'Escape') cancelEdit();
-						}}
-					></textarea>
-					<div class="edit-actions">
-						<button class="btn-sm btn-save" onclick={saveEdit}>Save</button>
-						<button class="btn-sm btn-cancel" onclick={cancelEdit}>Cancel</button>
-					</div>
-				{:else}
-					<div class="clip-header">
-						<span class="clip-channel">{clipChannel(clip)}</span>
-						<span class="clip-badge" class:ai={clip.createdBy === 'ai'}>{clip.createdBy === 'ai' ? 'AI' : 'Human'}</span>
-						{#if resolvedCamBounds != null}
-							<span class="cam-badge">CAM</span>
+				<!-- Clip info -->
+				<div class="clip-info">
+					{#if isEditing}
+						<input
+							type="text"
+							class="edit-input edit-title"
+							bind:value={editTitle}
+							placeholder="Clip title..."
+							onkeydown={(e) => {
+								if (e.key === 'Enter') saveEdit();
+								if (e.key === 'Escape') cancelEdit();
+							}}
+						/>
+						<textarea
+							class="edit-input edit-notes"
+							bind:value={editNotes}
+							placeholder="Notes..."
+							rows="3"
+							onkeydown={(e) => {
+								if (e.key === 'Escape') cancelEdit();
+							}}
+						></textarea>
+						<div class="edit-actions">
+							<button class="btn-sm btn-save" onclick={saveEdit}>Save</button>
+							<button class="btn-sm btn-cancel" onclick={cancelEdit}>Cancel</button>
+						</div>
+					{:else}
+						<div class="clip-header">
+							<span class="clip-channel">{clipChannel(clip)}</span>
+							<span class="clip-badge" class:ai={clip.createdBy === 'ai'}>{clip.createdBy === 'ai' ? 'AI' : 'Human'}</span>
+							{#if clip.favourite}
+								<span class="fav-badge">&#9733;</span>
+							{/if}
+							{#if resolvedCamBounds != null}
+								<span class="cam-badge">CAM</span>
+							{/if}
+						</div>
+						<div class="clip-title">{clip.title || 'Untitled'}</div>
+						{#if clip.notes}
+							<div class="clip-notes">{clip.notes}</div>
 						{/if}
-					</div>
-					<div class="clip-title">{clip.title || 'Untitled'}</div>
-					{#if clip.notes}
-						<div class="clip-notes">{clip.notes}</div>
+						<div class="clip-details">
+							<span>{clipDate(clip.startTime)}</span>
+							<span class="clip-dur">{formatDuration(dur)}</span>
+							<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+							<span class="clip-id" onclick={() => copyClipId(clip.id)} title="Click to copy">{clip.id}</span>
+						</div>
 					{/if}
-					<div class="clip-details">
-						<span>{clipDate(clip.startTime)}</span>
-						<span class="clip-dur">{formatDuration(dur)}</span>
-						<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-						<span class="clip-id" onclick={() => copyClipId(clip.id)} title="Click to copy">{clip.id}</span>
+				</div>
+
+				<!-- Action buttons -->
+				{#if !isEditing}
+					<div class="review-actions">
+						<button class="btn-action btn-approve" onclick={() => approveClip(clip)}>
+							<span class="action-icon">&#10003;</span> Approve
+						</button>
+						<button
+							class="btn-action btn-fav"
+							class:fav-active={clip.favourite}
+							onclick={() => toggleFavourite(clip)}
+							title="Toggle favourite (F)"
+						>
+							<span class="action-icon">{clip.favourite ? '\u2605' : '\u2606'}</span>
+						</button>
+						<button
+							class="btn-action btn-delete"
+							class:confirming={deleteConfirmId === clip.id}
+							onclick={() => handleDelete(clip.id)}
+						>
+							{#if deleteConfirmId === clip.id}
+								Press again to delete
+							{:else}
+								<span class="action-icon">&#10005;</span> Delete
+							{/if}
+						</button>
+						<button class="btn-action btn-edit" onclick={() => startEdit(clip)}>
+							<span class="action-icon">&#9998;</span> Edit
+						</button>
+						<button
+							class="btn-action btn-camera"
+							class:cam-active={camRegionActive}
+							onclick={() => (camRegionActive = !camRegionActive)}
+							title="Toggle camera region (C)"
+						>
+							{#if resolvedCamBounds != null}
+								{camRegionActive ? 'Done' : 'Edit Camera'}
+							{:else}
+								Set Camera
+							{/if}
+						</button>
+						{#if resolvedCamBounds != null && camRegionActive}
+							<button class="btn-action btn-cam-clear" onclick={clearCamRegion}>
+								Clear
+							</button>
+						{/if}
+						{#if undoStack.length > 0}
+							<button class="btn-action btn-undo" onclick={applyUndo} title="Undo (Ctrl+Z)">
+								&#8630; Undo<span class="undo-count">{undoStack.length}</span>
+							</button>
+						{/if}
 					</div>
 				{/if}
 			</div>
 
-			<!-- Action buttons -->
-			{#if !isEditing}
-				<div class="review-actions">
-					<button class="btn-action btn-approve" onclick={() => approveClip(clip)}>
-						<span class="action-icon">&#10003;</span> Approve
-					</button>
-					<button
-						class="btn-action btn-delete"
-						class:confirming={deleteConfirmId === clip.id}
-						onclick={() => handleDelete(clip.id)}
-					>
-						{#if deleteConfirmId === clip.id}
-							Press again to delete
-						{:else}
-							<span class="action-icon">&#10005;</span> Delete
-						{/if}
-					</button>
-					<button class="btn-action btn-edit" onclick={() => startEdit(clip)}>
-						<span class="action-icon">&#9998;</span> Edit
-					</button>
-					<button
-						class="btn-action btn-camera"
-						class:cam-active={camRegionActive}
-						onclick={() => (camRegionActive = !camRegionActive)}
-						title="Toggle camera region (C)"
-					>
-						{#if resolvedCamBounds != null}
-							{camRegionActive ? 'Done' : 'Edit Camera'}
-						{:else}
-							Set Camera
-						{/if}
-					</button>
-					{#if resolvedCamBounds != null && camRegionActive}
-						<button class="btn-action btn-cam-clear" onclick={clearCamRegion}>
-							Clear
-						</button>
-					{/if}
-					{#if undoStack.length > 0}
-						<button class="btn-action btn-undo" onclick={applyUndo} title="Undo (Ctrl+Z)">
-							&#8630; Undo<span class="undo-count">{undoStack.length}</span>
-						</button>
-					{/if}
-				</div>
+			{#if transcriptPanelOpen}
+				<ReviewTranscriptPanel {clip} {currentLocalTime} onseek={(t) => { if (videoEl) videoEl.currentTime = t; }} />
+			{/if}
+			{#if chatPanelOpen}
+				<ReviewChatPanel {clip} {currentLocalTime} onseek={(t) => { if (videoEl) videoEl.currentTime = t; }} />
 			{/if}
 		</div>
 	{/if}
@@ -1005,11 +1035,53 @@
 		color: #888;
 		align-self: flex-start;
 		width: 100%;
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+	}
+
+	.panel-toggles {
+		display: flex;
+		gap: 4px;
+	}
+
+	.panel-toggle {
+		background: #1a1a2e;
+		border: 1px solid #2a2a4a;
+		color: #666;
+		font-size: 0.7rem;
+		font-weight: 700;
+		width: 26px;
+		height: 26px;
+		border-radius: 4px;
+		cursor: pointer;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		transition: background 0.15s, color 0.15s, border-color 0.15s;
+	}
+
+	.panel-toggle:hover {
+		color: #aaa;
+		border-color: #3a3a5a;
+	}
+
+	.panel-toggle.active {
+		background: #7c3aed;
+		border-color: #7c3aed;
+		color: #fff;
+	}
+
+	.review-body {
+		flex: 1;
+		min-height: 0;
+		display: flex;
+		width: 100%;
 	}
 
 	.review-card {
-		width: 100%;
 		flex: 1;
+		min-width: 0;
 		min-height: 0;
 		display: flex;
 		flex-direction: column;
@@ -1285,15 +1357,6 @@
 		color: #fff;
 	}
 
-	.btn-copy {
-		color: #aaa;
-		margin-left: auto;
-	}
-	.btn-copy:hover {
-		background: #2a2a4a;
-		color: #fff;
-	}
-
 	.btn-undo {
 		color: #fbbf24;
 		border-color: #3a3a1a;
@@ -1405,5 +1468,23 @@
 	}
 	.btn-cam-clear:hover {
 		background: #3a1a1a;
+	}
+
+	.btn-fav {
+		color: #666;
+		border-color: #2a2a4a;
+	}
+	.btn-fav:hover {
+		color: #fbbf24;
+		background: #3a3a1a;
+	}
+	.btn-fav.fav-active {
+		color: #fbbf24;
+		border-color: #3a3a1a;
+	}
+
+	.fav-badge {
+		font-size: 0.7rem;
+		color: #fbbf24;
 	}
 </style>

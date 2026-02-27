@@ -17,7 +17,7 @@ const VOD_COMMENTS_QUERY = `query($videoID: ID!, $cursor: Cursor) {
           id
           contentOffsetSeconds
           commenter { displayName chatColor }
-          message { fragments { text } userBadges { setID } }
+          message { fragments { text emote { emoteID } } userBadges { setID version } }
         }
       }
       pageInfo { hasNextPage }
@@ -160,16 +160,34 @@ async function fetchAllPages(entry: QueueEntry) {
 				if (!twitchId) continue; // skip messages without a Twitch ID
 				const username = node.commenter?.displayName ?? '[deleted]';
 				const fragments: any[] = node.message?.fragments ?? [];
-				const text = fragments.map((f: any) => f.text).join('');
+				// Build text and emote position string from fragments
+				let text = '';
+				const emoteEntries = new Map<string, number[][]>(); // emoteId -> [[start,end], ...]
+				for (const frag of fragments) {
+					const fragText: string = frag.text ?? '';
+					const emoteId: string | undefined = frag.emote?.emoteID;
+					if (emoteId && fragText.length > 0) {
+						const start = text.length;
+						const end = start + fragText.length - 1;
+						if (!emoteEntries.has(emoteId)) emoteEntries.set(emoteId, []);
+						emoteEntries.get(emoteId)!.push([start, end]);
+					}
+					text += fragText;
+				}
+				const emotes: string | null = emoteEntries.size > 0
+					? [...emoteEntries.entries()].map(([id, ranges]) =>
+						`${id}:${ranges.map(([s, e]) => `${s}-${e}`).join(',')}`
+					).join('/')
+					: null;
 				const timestamp: number = node.contentOffsetSeconds ?? 0;
 				const color: string | null = node.commenter?.chatColor ?? null;
 				const userBadges: any[] = node.message?.userBadges ?? [];
 				const badges: string | null =
 					userBadges.length > 0
-						? userBadges.map((b: any) => b.setID).join(',')
+						? userBadges.map((b: any) => `${b.setID}/${b.version ?? '1'}`).join(',')
 						: null;
 
-				batch.push({ username, text, timestamp, color, badges, twitchId });
+				batch.push({ username, text, timestamp, color, badges, twitchId, emotes });
 				totalMessages++;
 
 				cursor = edge.cursor;

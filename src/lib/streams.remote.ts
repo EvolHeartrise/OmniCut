@@ -19,10 +19,16 @@ import {
 	getChatMessagesInRange as smGetChatMessagesInRange,
 	getTranscriptionsInRange as smGetTranscriptionsInRange,
 	createAndQueueExport,
+	createAndQueueExportFromVideo,
 	requeueExport as smRequeueExport,
 	loadAllExports as smLoadAllExports,
 	loadExport as smLoadExport,
-	deleteExport as smDeleteExport
+	deleteExport as smDeleteExport,
+	createVideo as smCreateVideo,
+	updateVideo as smUpdateVideo,
+	deleteVideo as smDeleteVideo,
+	getVideo as smGetVideo,
+	getAllVideos as smGetAllVideos
 } from '$lib/server/streamManager.js';
 import {
 	addIgnoredChannel,
@@ -51,7 +57,7 @@ import {
 	type BrowseStreamEdge,
 	type VideoEdge
 } from '$lib/server/twitchApi.js';
-import type { ChannelInfo, VodInfo, CameraBoundsEntry } from '$lib/types.js';
+import type { ChannelInfo, VodInfo, CameraBoundsEntry, ClipEntry, VideoRecord } from '$lib/types.js';
 
 // ---------------------------------------------------------------------------
 // Queries — Stream & Media Data
@@ -325,6 +331,7 @@ export const createClipCmd = command(
 		createdBy?: 'human' | 'ai';
 		title?: string;
 		notes?: string;
+		favourite?: boolean;
 	}) => {
 		return smCreateClipRegion(data);
 	}
@@ -341,6 +348,7 @@ export const updateClipCmd = command(
 		createdBy?: 'human' | 'ai';
 		title?: string;
 		notes?: string;
+		favourite?: boolean;
 	}) => {
 		addClipRegion(region);
 	}
@@ -364,7 +372,7 @@ export const saveCameraBoundsCmd = command(
 );
 
 /** Resolve camera bounds for a channel at a timestamp (most recent entry at or before). */
-export const getCameraBoundsCmd = query(
+export const getCameraBounds = query(
 	'unchecked',
 	async (args: { channel: string; timestamp: number }): Promise<{ bounds: CameraBoundsEntry | null }> => {
 		return { bounds: dbResolveCameraBounds(args.channel, args.timestamp) };
@@ -380,7 +388,7 @@ export const deleteCameraBoundsCmd = command(
 );
 
 /** Load all camera bounds entries for a channel. */
-export const loadCameraBoundsForChannelCmd = query(
+export const loadCameraBoundsForChannel = query(
 	'unchecked',
 	async (args: { channel: string }): Promise<{ bounds: CameraBoundsEntry[] }> => {
 		return { bounds: dbLoadCameraBoundsForChannel(args.channel) };
@@ -424,6 +432,83 @@ export const removeFromWatchlistCmd = command('unchecked', async (args: { login:
 	dbRemoveFromWatchlist(args.login.toLowerCase().trim(), args.platform || 'twitch');
 });
 
+// ---------------------------------------------------------------------------
+// Queries — Videos
+// ---------------------------------------------------------------------------
+
+/** List all video compositions. */
+export const listVideos = query(async (): Promise<VideoRecord[]> => {
+	return smGetAllVideos();
+});
+
+/** Get a video by ID. */
+export const getVideoById = query('unchecked', async (args: { id: string }): Promise<VideoRecord> => {
+	const video = smGetVideo(args.id);
+	if (!video) throw new Error('Video not found');
+	return video;
+});
+
+/** Get exports associated with a video. */
+export const getExportsByVideo = query('unchecked', async (args: { videoId: string }) => {
+	const { loadExportsByVideo } = await import('$lib/server/persistence.js');
+	return { exports: loadExportsByVideo(args.videoId) };
+});
+
+/** Get thumbnail for a video. */
+export const getThumbnailByVideo = query('unchecked', async (args: { videoId: string }) => {
+	const { loadThumbnailByVideo } = await import('$lib/server/persistence.js');
+	return { thumbnail: loadThumbnailByVideo(args.videoId) };
+});
+
+// ---------------------------------------------------------------------------
+// Commands — Videos
+// ---------------------------------------------------------------------------
+
+/** Create a new video composition. */
+export const createVideoCmd = command('unchecked', async (args: {
+	clipIds: string[];
+	title: string;
+	description?: string;
+	format?: 'standard' | 'mobile_short' | 'chat_overlay';
+}): Promise<VideoRecord> => {
+	const clipEntries: ClipEntry[] = args.clipIds.map((clipId) => ({ clipId }));
+	return smCreateVideo({
+		title: args.title,
+		description: args.description,
+		clipEntries,
+		format: args.format
+	});
+});
+
+/** Update a video composition. */
+export const updateVideoCmd = command('unchecked', async (args: {
+	id: string;
+	title?: string;
+	description?: string;
+	clipEntries?: ClipEntry[];
+	format?: 'standard' | 'mobile_short' | 'chat_overlay';
+}): Promise<VideoRecord> => {
+	const updates: Partial<Pick<VideoRecord, 'title' | 'description' | 'clipEntries' | 'format'>> = {};
+	if (args.title !== undefined) updates.title = args.title;
+	if (args.description !== undefined) updates.description = args.description;
+	if (args.clipEntries !== undefined) updates.clipEntries = args.clipEntries;
+	if (args.format !== undefined) updates.format = args.format;
+	return smUpdateVideo(args.id, updates);
+});
+
+/** Delete a video composition. */
+export const deleteVideoCmd = command('unchecked', async (args: { id: string }) => {
+	const deleted = smDeleteVideo(args.id);
+	if (!deleted) throw new Error('Video not found');
+	return { success: true };
+});
+
+/** Export a video composition (creates and queues an export). */
+export const exportVideoFromVideoCmd = command('unchecked', async (args: { videoId: string }) => {
+	const record = createAndQueueExportFromVideo(args.videoId);
+	return { success: true, exportId: record.id };
+});
+
 /** Export all clip regions into a single video file (via export queue). */
 export const exportVideoCmd = command('unchecked', async (args: { filename: string }) => {
 	if (!args.filename || typeof args.filename !== 'string' || args.filename.trim().length === 0) {
@@ -441,12 +526,12 @@ export const exportVideoCmd = command('unchecked', async (args: { filename: stri
 });
 
 /** List all video exports. */
-export const listExportsCmd = query(async () => {
+export const listExports = query(async () => {
 	return { exports: smLoadAllExports() };
 });
 
 /** Get a specific export by ID. */
-export const getExportCmd = query('unchecked', async (args: { id: string }) => {
+export const getExport = query('unchecked', async (args: { id: string }) => {
 	const record = smLoadExport(args.id);
 	if (!record) throw new Error('Export not found');
 	return record;
@@ -513,7 +598,7 @@ export const youtubeUploadsByExport = query('unchecked', async (args: { exportId
 // ---------------------------------------------------------------------------
 
 /** Get the YouTube OAuth URL for connecting a new account. */
-export const youtubeAuthUrlCmd = query(async () => {
+export const youtubeAuthUrl = query(async () => {
 	const { getAuthUrl, isConfigured } = await import('$lib/server/youtubeClient.js');
 	if (!isConfigured()) throw new Error('YouTube integration not configured');
 	return { url: getAuthUrl() };
@@ -564,13 +649,13 @@ export const youtubeDeleteUploadCmd = command('unchecked', async (args: { id: st
 // ---------------------------------------------------------------------------
 
 /** Get thumbnail for an export. */
-export const getThumbnailByExportCmd = query('unchecked', async (args: { exportId: string }) => {
+export const getThumbnailByExport = query('unchecked', async (args: { exportId: string }) => {
 	const { loadThumbnailByExport } = await import('$lib/server/persistence.js');
 	return { thumbnail: loadThumbnailByExport(args.exportId) };
 });
 
 /** Check if AI (Gemini) is configured. */
-export const isAIConfiguredCmd = query(async () => {
+export const isAIConfigured = query(async () => {
 	const { isAIConfigured } = await import('$lib/server/thumbnailStore.js');
 	return { configured: isAIConfigured() };
 });
@@ -579,9 +664,10 @@ export const isAIConfiguredCmd = query(async () => {
 // Commands — Thumbnails
 // ---------------------------------------------------------------------------
 
-/** Save a thumbnail PNG for an export. */
+/** Save a thumbnail PNG for an export or video. */
 export const saveThumbnailCmd = command('unchecked', async (args: {
 	exportId: string;
+	videoId?: string;
 	pngBase64: string;
 	width?: number;
 	height?: number;
@@ -617,7 +703,8 @@ export const saveThumbnailCmd = command('unchecked', async (args: {
 	const record = saveThumbnailFromPng(args.exportId, pngBuffer, {
 		width: args.width,
 		height: args.height,
-		layers: args.layers
+		layers: args.layers,
+		videoId: args.videoId
 	});
 	return record;
 });
@@ -650,7 +737,7 @@ export const deleteThumbnailCmd = command('unchecked', async (args: { id: string
 });
 
 /** Export selected clips by IDs (in order). */
-export const exportSelectedClipsCmd = command('unchecked', async (args: { clipIds: string[]; title: string; format?: 'standard' | 'mobile_short' }) => {
+export const exportSelectedClipsCmd = command('unchecked', async (args: { clipIds: string[]; title: string; format?: 'standard' | 'mobile_short' | 'chat_overlay' }) => {
 	if (!args.clipIds || args.clipIds.length === 0) {
 		throw new Error('No clips selected');
 	}

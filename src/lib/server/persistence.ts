@@ -1,8 +1,10 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
-import type { StreamInfo, ClipRegion, ChatMessage, CameraBoundsEntry } from './types.js';
+import type { StreamInfo, ChatMessage } from './types.js';
+import type { ClipRegion, CameraBoundsEntry, ClipEntry, VideoRecord } from '../types.js';
 import type { WordTimestamp } from './transcriber.js';
+import { newVideoId } from '../ids.js';
 
 // bun:sqlite is a Bun-native module. We use a lazy import because Vite's SSR
 // renderer evaluates the bundle in a Node.js worker thread during build, which
@@ -122,6 +124,7 @@ export async function initDatabase(): Promise<void> {
 			color TEXT,
 			badges TEXT,
 			twitch_id TEXT NOT NULL,
+			emotes TEXT,
 			FOREIGN KEY (stream_id) REFERENCES streams(id) ON DELETE CASCADE
 		);
 
@@ -157,6 +160,16 @@ export async function initDatabase(): Promise<void> {
 			platform TEXT NOT NULL DEFAULT 'twitch',
 			added_at INTEGER NOT NULL DEFAULT (unixepoch()),
 			PRIMARY KEY (login, platform)
+		);
+
+		CREATE TABLE IF NOT EXISTS videos (
+			id TEXT PRIMARY KEY,
+			title TEXT NOT NULL,
+			description TEXT,
+			clip_entries TEXT NOT NULL,
+			format TEXT NOT NULL DEFAULT 'standard',
+			created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+			updated_at INTEGER NOT NULL DEFAULT (unixepoch())
 		);
 
 		CREATE TABLE IF NOT EXISTS exports (
@@ -243,7 +256,12 @@ export async function initDatabase(): Promise<void> {
 		'ALTER TABLE clip_regions ADD COLUMN cam_y REAL',
 		'ALTER TABLE clip_regions ADD COLUMN cam_w REAL',
 		'ALTER TABLE clip_regions ADD COLUMN cam_h REAL',
-		"ALTER TABLE exports ADD COLUMN format TEXT NOT NULL DEFAULT 'standard'"
+		"ALTER TABLE exports ADD COLUMN format TEXT NOT NULL DEFAULT 'standard'",
+		'ALTER TABLE chat_messages ADD COLUMN emotes TEXT',
+		'ALTER TABLE exports ADD COLUMN video_id TEXT REFERENCES videos(id)',
+		'ALTER TABLE exports ADD COLUMN clip_entries TEXT',
+		'ALTER TABLE thumbnails ADD COLUMN video_id TEXT REFERENCES videos(id)',
+		'ALTER TABLE clip_regions ADD COLUMN favourite INTEGER NOT NULL DEFAULT 0'
 	];
 	for (const sql of migrations) {
 		try { db.exec(sql); } catch { /* column already exists */ }
@@ -272,9 +290,38 @@ export async function initDatabase(): Promise<void> {
 		console.warn('[persistence] Camera bounds migration error:', err instanceof Error ? err.message : String(err));
 	}
 
+	// Migrate existing exports to videos (one-time)
+	try {
+		const unmigrated = db.query(
+			`SELECT * FROM exports WHERE video_id IS NULL AND clip_ids IS NOT NULL`
+		).all() as ExportRow[];
+		if (unmigrated.length > 0) {
+			const insertVideo = db.prepare(
+				`INSERT INTO videos (id, title, description, clip_entries, format, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`
+			);
+			const linkExport = db.prepare(`UPDATE exports SET video_id = ? WHERE id = ?`);
+			const linkThumbnail = db.prepare(`UPDATE thumbnails SET video_id = ? WHERE export_id = ?`);
+			for (const exp of unmigrated) {
+				const videoId = newVideoId();
+				let clipIds: string[];
+				try { clipIds = JSON.parse(exp.clip_ids); } catch { clipIds = []; }
+				const clipEntries: ClipEntry[] = clipIds.map((clipId) => ({ clipId }));
+				insertVideo.run(videoId, exp.title, exp.description, JSON.stringify(clipEntries), exp.format || 'standard', exp.created_at, exp.created_at);
+				linkExport.run(videoId, exp.id);
+				linkThumbnail.run(videoId, exp.id);
+			}
+			console.log(`[persistence] Migrated ${unmigrated.length} exports to videos`);
+		}
+	} catch (err) {
+		console.warn('[persistence] Export→Video migration error:', err instanceof Error ? err.message : String(err));
+	}
+
 	// Prepare hot-path statements for better performance
 	stmtSaveChatMessage = db.prepare(
-		'INSERT OR IGNORE INTO chat_messages (stream_id, username, text, timestamp, color, badges, twitch_id) VALUES (?, ?, ?, ?, ?, ?, ?)'
+		`INSERT INTO chat_messages (stream_id, username, text, timestamp, color, badges, twitch_id, emotes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(twitch_id) DO UPDATE SET
+		   emotes = COALESCE(NULLIF(excluded.emotes, ''), emotes),
+		   badges = COALESCE(NULLIF(excluded.badges, ''), badges)`
 	);
 	stmtSaveTranscription = db.prepare(
 		'INSERT INTO transcriptions (stream_id, text, start_time, end_time) VALUES (?, ?, ?, ?)'
@@ -347,6 +394,7 @@ interface ChatRow {
 	color: string | null;
 	badges: string | null;
 	twitch_id: string;
+	emotes: string | null;
 }
 
 interface ClipRow {
@@ -357,6 +405,7 @@ interface ClipRow {
 	created_by: string | null;
 	title: string | null;
 	notes: string | null;
+	favourite: number | null;
 }
 
 interface ExportRow {
@@ -364,12 +413,14 @@ interface ExportRow {
 	title: string;
 	description: string | null;
 	clip_ids: string;
+	clip_entries: string | null;
 	status: string;
 	output_path: string | null;
 	error: string | null;
 	created_at: number;
 	completed_at: number | null;
 	format: string;
+	video_id: string | null;
 }
 
 export interface ExportRecord {
@@ -377,12 +428,14 @@ export interface ExportRecord {
 	title: string;
 	description?: string;
 	clipIds: string[];
+	clipEntries?: ClipEntry[];
 	status: 'pending' | 'exporting' | 'ready' | 'error';
 	outputPath?: string;
 	error?: string;
 	createdAt: number;
 	completedAt?: number;
-	format: 'standard' | 'mobile_short';
+	format: 'standard' | 'mobile_short' | 'chat_overlay';
+	videoId?: string;
 }
 
 interface HeatmapRow {
@@ -576,17 +629,21 @@ export function deleteTranscriptions(streamId: string): void {
 
 export function saveChatMessage(streamId: string, msg: ChatMessage): void {
 	if (stmtSaveChatMessage) {
-		stmtSaveChatMessage.run(streamId, msg.username, msg.text, msg.timestamp, msg.color ?? null, msg.badges ?? null, msg.twitchId);
+		stmtSaveChatMessage.run(streamId, msg.username, msg.text, msg.timestamp, msg.color ?? null, msg.badges ?? null, msg.twitchId, msg.emotes ?? null);
 	} else {
 		const d = getDb();
-		d.run('INSERT OR IGNORE INTO chat_messages (stream_id, username, text, timestamp, color, badges, twitch_id) VALUES (?, ?, ?, ?, ?, ?, ?)', [
+		d.run(`INSERT INTO chat_messages (stream_id, username, text, timestamp, color, badges, twitch_id, emotes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(twitch_id) DO UPDATE SET
+			  emotes = COALESCE(NULLIF(excluded.emotes, ''), emotes),
+			  badges = COALESCE(NULLIF(excluded.badges, ''), badges)`, [
 			streamId,
 			msg.username,
 			msg.text,
 			msg.timestamp,
 			msg.color ?? null,
 			msg.badges ?? null,
-			msg.twitchId
+			msg.twitchId,
+			msg.emotes ?? null
 		]);
 	}
 }
@@ -598,12 +655,15 @@ export function saveChatMessagesBatch(streamId: string, messages: ChatMessage[])
 	const stmt =
 		stmtSaveChatMessage ??
 		d.prepare(
-			'INSERT OR IGNORE INTO chat_messages (stream_id, username, text, timestamp, color, badges, twitch_id) VALUES (?, ?, ?, ?, ?, ?, ?)'
+			`INSERT INTO chat_messages (stream_id, username, text, timestamp, color, badges, twitch_id, emotes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(twitch_id) DO UPDATE SET
+			   emotes = COALESCE(NULLIF(excluded.emotes, ''), emotes),
+			   badges = COALESCE(NULLIF(excluded.badges, ''), badges)`
 		);
 	d.exec('BEGIN');
 	try {
 		for (const msg of messages) {
-			stmt.run(streamId, msg.username, msg.text, msg.timestamp, msg.color ?? null, msg.badges ?? null, msg.twitchId);
+			stmt.run(streamId, msg.username, msg.text, msg.timestamp, msg.color ?? null, msg.badges ?? null, msg.twitchId, msg.emotes ?? null);
 		}
 		d.exec('COMMIT');
 	} catch (err) {
@@ -637,9 +697,10 @@ export function loadChatMessagesInRange(
 		timestamp: r.timestamp,
 		color: r.color ?? null,
 		badges: r.badges ?? null,
-		twitchId: r.twitch_id
+		twitchId: r.twitch_id,
+		emotes: r.emotes ?? null
 	});
-	const cols = 'id, username, text, timestamp, color, badges, twitch_id';
+	const cols = 'id, username, text, timestamp, color, badges, twitch_id, emotes';
 	const base = `SELECT ${cols} FROM chat_messages WHERE stream_id = ? AND timestamp >= ? AND timestamp <= ?`;
 	const { clause, params: textParams } = buildTextFilter(query, regex);
 	// When limited, fetch the LAST N messages in the range (most recent, near the playhead)
@@ -672,8 +733,8 @@ export function loadChatHeatmap(streamId: string, bucketSeconds: number): Array<
 export function insertClipRegion(data: Omit<ClipRegion, 'id'>): string {
 	const d = getDb();
 	d.run(
-		'INSERT INTO clip_regions (stream_id, start_time, end_time, created_by, title, notes) VALUES (?, ?, ?, ?, ?, ?)',
-		[data.streamId, data.startTime, data.endTime, data.createdBy ?? 'human', data.title ?? null, data.notes ?? null]
+		'INSERT INTO clip_regions (stream_id, start_time, end_time, created_by, title, notes, favourite) VALUES (?, ?, ?, ?, ?, ?, ?)',
+		[data.streamId, data.startTime, data.endTime, data.createdBy ?? 'human', data.title ?? null, data.notes ?? null, data.favourite ? 1 : 0]
 	);
 	const row = d.query('SELECT last_insert_rowid() as id').get() as { id: number };
 	return String(row.id);
@@ -683,8 +744,8 @@ export function insertClipRegion(data: Omit<ClipRegion, 'id'>): string {
 export function saveClipRegion(region: ClipRegion): void {
 	const d = getDb();
 	d.run(
-		`INSERT INTO clip_regions (id, stream_id, start_time, end_time, created_by, title, notes) VALUES (?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET start_time = excluded.start_time, end_time = excluded.end_time, created_by = excluded.created_by, title = excluded.title, notes = excluded.notes`,
+		`INSERT INTO clip_regions (id, stream_id, start_time, end_time, created_by, title, notes, favourite) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET start_time = excluded.start_time, end_time = excluded.end_time, created_by = excluded.created_by, title = excluded.title, notes = excluded.notes, favourite = excluded.favourite`,
 		[
 			region.id,
 			region.streamId,
@@ -692,7 +753,8 @@ export function saveClipRegion(region: ClipRegion): void {
 			region.endTime,
 			region.createdBy ?? 'human',
 			region.title ?? null,
-			region.notes ?? null
+			region.notes ?? null,
+			region.favourite ? 1 : 0
 		]
 	);
 }
@@ -705,7 +767,7 @@ export function deleteClipRegion(id: string): void {
 export function loadAllClipRegions(): ClipRegion[] {
 	const d = getDb();
 	const rows = d
-		.query('SELECT id, stream_id, start_time, end_time, created_by, title, notes FROM clip_regions')
+		.query('SELECT id, stream_id, start_time, end_time, created_by, title, notes, favourite FROM clip_regions')
 		.all() as ClipRow[];
 	return rows.map((r) => ({
 		id: String(r.id),
@@ -714,7 +776,8 @@ export function loadAllClipRegions(): ClipRegion[] {
 		endTime: r.end_time,
 		createdBy: (r.created_by as 'human' | 'ai') ?? 'human',
 		...(r.title && { title: r.title }),
-		...(r.notes && { notes: r.notes })
+		...(r.notes && { notes: r.notes }),
+		...(r.favourite && { favourite: true })
 	}));
 }
 
@@ -863,19 +926,21 @@ export function removeFromWatchlist(login: string, platform: string): void {
 export function saveExport(record: ExportRecord): void {
 	const d = getDb();
 	d.run(
-		`INSERT INTO exports (id, title, description, clip_ids, status, output_path, error, created_at, completed_at, format)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO exports (id, title, description, clip_ids, clip_entries, status, output_path, error, created_at, completed_at, format, video_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		[
 			record.id,
 			record.title,
 			record.description ?? null,
 			JSON.stringify(record.clipIds),
+			record.clipEntries ? JSON.stringify(record.clipEntries) : null,
 			record.status,
 			record.outputPath ?? null,
 			record.error ?? null,
 			record.createdAt,
 			record.completedAt ?? null,
-			record.format ?? 'standard'
+			record.format ?? 'standard',
+			record.videoId ?? null
 		]
 	);
 }
@@ -928,18 +993,125 @@ function mapExportRow(r: ExportRow): ExportRecord {
 		console.error(`[persistence] Corrupt clip_ids JSON for export ${r.id}, treating as empty`);
 		clipIds = [];
 	}
+	let clipEntries: ClipEntry[] | undefined;
+	if (r.clip_entries) {
+		try { clipEntries = JSON.parse(r.clip_entries) as ClipEntry[]; } catch { /* ignore */ }
+	}
 	return {
 		id: r.id,
 		title: r.title,
 		...(r.description && { description: r.description }),
 		clipIds,
+		...(clipEntries && { clipEntries }),
 		status: r.status as ExportRecord['status'],
 		...(r.output_path && { outputPath: r.output_path }),
 		...(r.error && { error: r.error }),
 		createdAt: r.created_at,
 		...(r.completed_at != null && { completedAt: r.completed_at }),
-		format: (r.format || 'standard') as ExportRecord['format']
+		format: (r.format || 'standard') as ExportRecord['format'],
+		...(r.video_id && { videoId: r.video_id })
 	};
+}
+
+// --- Videos ---
+
+interface VideoRow {
+	id: string;
+	title: string;
+	description: string | null;
+	clip_entries: string;
+	format: string;
+	created_at: number;
+	updated_at: number;
+}
+
+function mapVideoRow(r: VideoRow): VideoRecord {
+	let clipEntries: ClipEntry[];
+	try {
+		clipEntries = JSON.parse(r.clip_entries) as ClipEntry[];
+	} catch {
+		console.error(`[persistence] Corrupt clip_entries JSON for video ${r.id}, treating as empty`);
+		clipEntries = [];
+	}
+	return {
+		id: r.id,
+		title: r.title,
+		...(r.description && { description: r.description }),
+		clipEntries,
+		format: (r.format || 'standard') as VideoRecord['format'],
+		createdAt: r.created_at,
+		updatedAt: r.updated_at
+	};
+}
+
+export function saveVideo(record: VideoRecord): void {
+	const d = getDb();
+	d.run(
+		`INSERT INTO videos (id, title, description, clip_entries, format, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			title = excluded.title,
+			description = excluded.description,
+			clip_entries = excluded.clip_entries,
+			format = excluded.format,
+			updated_at = excluded.updated_at`,
+		[
+			record.id,
+			record.title,
+			record.description ?? null,
+			JSON.stringify(record.clipEntries),
+			record.format,
+			record.createdAt,
+			record.updatedAt
+		]
+	);
+}
+
+export function updateVideoRecord(
+	id: string,
+	updates: Partial<Pick<VideoRecord, 'title' | 'description' | 'clipEntries' | 'format'>>
+): void {
+	const d = getDb();
+	const sets: string[] = ['updated_at = unixepoch()'];
+	const params: (string | number | null)[] = [];
+	if (updates.title !== undefined) { sets.push('title = ?'); params.push(updates.title); }
+	if (updates.description !== undefined) { sets.push('description = ?'); params.push(updates.description); }
+	if (updates.clipEntries !== undefined) { sets.push('clip_entries = ?'); params.push(JSON.stringify(updates.clipEntries)); }
+	if (updates.format !== undefined) { sets.push('format = ?'); params.push(updates.format); }
+	if (sets.length === 1) return; // only updated_at, nothing to do
+	params.push(id);
+	d.run(`UPDATE videos SET ${sets.join(', ')} WHERE id = ?`, params);
+}
+
+export function loadVideo(id: string): VideoRecord | null {
+	const d = getDb();
+	const row = d.query('SELECT * FROM videos WHERE id = ?').get(id) as VideoRow | null;
+	if (!row) return null;
+	return mapVideoRow(row);
+}
+
+export function loadAllVideos(): VideoRecord[] {
+	const d = getDb();
+	const rows = d.query('SELECT * FROM videos ORDER BY updated_at DESC').all() as VideoRow[];
+	return rows.map(mapVideoRow);
+}
+
+export function deleteVideoRecord(id: string): void {
+	const d = getDb();
+	d.run('DELETE FROM videos WHERE id = ?', [id]);
+}
+
+export function loadExportsByVideo(videoId: string): ExportRecord[] {
+	const d = getDb();
+	const rows = d.query('SELECT * FROM exports WHERE video_id = ? ORDER BY created_at DESC').all(videoId) as ExportRow[];
+	return rows.map(mapExportRow);
+}
+
+export function loadThumbnailByVideo(videoId: string): ThumbnailRecord | null {
+	const d = getDb();
+	const row = d.query('SELECT * FROM thumbnails WHERE video_id = ? ORDER BY updated_at DESC LIMIT 1').get(videoId) as ThumbnailRow | null;
+	if (!row) return null;
+	return mapThumbnailRow(row);
 }
 
 // --- YouTube Accounts ---
@@ -1256,6 +1428,7 @@ export type LayerConfig = TextLayerConfig | ImageLayerConfig | EffectLayerConfig
 export interface ThumbnailRecord {
 	id: string;
 	exportId: string;
+	videoId?: string;
 	filePath: string;
 	width: number;
 	height: number;
@@ -1268,6 +1441,7 @@ export interface ThumbnailRecord {
 interface ThumbnailRow {
 	id: string;
 	export_id: string;
+	video_id: string | null;
 	file_path: string;
 	width: number;
 	height: number;
@@ -1291,6 +1465,7 @@ function mapThumbnailRow(r: ThumbnailRow): ThumbnailRecord {
 	return {
 		id: r.id,
 		exportId: r.export_id,
+		...(r.video_id && { videoId: r.video_id }),
 		filePath: r.file_path,
 		width: r.width,
 		height: r.height,
@@ -1304,10 +1479,11 @@ function mapThumbnailRow(r: ThumbnailRow): ThumbnailRecord {
 export function saveThumbnail(record: ThumbnailRecord): void {
 	const d = getDb();
 	d.run(
-		`INSERT INTO thumbnails (id, export_id, file_path, width, height, source_stream_id, source_timestamp, text_layers, ai_enhanced, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO thumbnails (id, export_id, video_id, file_path, width, height, source_stream_id, source_timestamp, text_layers, ai_enhanced, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			file_path = excluded.file_path,
+			video_id = excluded.video_id,
 			width = excluded.width,
 			height = excluded.height,
 			source_stream_id = excluded.source_stream_id,
@@ -1318,6 +1494,7 @@ export function saveThumbnail(record: ThumbnailRecord): void {
 		[
 			record.id,
 			record.exportId,
+			record.videoId ?? null,
 			record.filePath,
 			record.width,
 			record.height,

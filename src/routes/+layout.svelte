@@ -20,6 +20,7 @@
 		{ href: '/library', label: 'Library' },
 		{ href: '/clipping', label: 'Clipping' },
 		{ href: '/clips', label: 'Clips' },
+		{ href: '/videos', label: 'Videos' },
 		{ href: '/review', label: 'Review' },
 		{ href: '/exports', label: 'Exports' },
 		{ href: '/thumbnail', label: 'Thumbnail' },
@@ -35,7 +36,7 @@
 	<header class="app-header">
 		<nav class="mode-tabs">
 			{#each tabs as tab}
-				<a class="mode-tab" class:active={pathname === tab.href} href={tab.href}>{tab.label}</a>
+				<a class="mode-tab" class:active={pathname === tab.href || pathname.startsWith(tab.href + '/')} href={tab.href}>{tab.label}</a>
 			{/each}
 		</nav>
 	</header>

@@ -1,7 +1,3 @@
-import type { ClipRegion, CameraBoundsEntry } from '../types.js';
-
-export type { ClipRegion, CameraBoundsEntry };
-
 export interface StreamInfo {
 	id: string;
 	channel: string;
@@ -30,6 +26,7 @@ export interface ChatMessage {
 	color?: string | null; // user's chat color (hex string like "#FF69B4")
 	badges?: string | null; // comma-separated badge set IDs (e.g. "moderator,subscriber")
 	twitchId: string; // Twitch-assigned globally unique message ID (UUID)
+	emotes?: string | null; // Twitch emote positions: "emoteId:start-end,start-end/emoteId:start-end"
 }
 
 export type ChatCallback = (streamId: string, msg: ChatMessage) => void;
