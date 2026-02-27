@@ -13,8 +13,10 @@
 		getVideoById,
 		updateVideoCmd,
 		deleteVideoCmd,
-		exportVideoFromVideoCmd
+		exportVideoFromVideoCmd,
+		getMultiStreamTranscriptions
 	} from '$lib/streams.remote';
+	import { untrack } from 'svelte';
 	import { formatDuration, getClipLocalBounds, setupHls } from '$lib/utils.js';
 	import type { ClipEntry } from '$lib/types.js';
 	import type { ClipRegion } from '$lib/stores/streams.js';
@@ -217,6 +219,20 @@
 	// Playhead X
 	let playheadX = $derived(compositionTime * pixelsPerSecond);
 
+	// Auto-select clip under playhead
+	$effect(() => {
+		const t = compositionTime;
+		if (dragMode !== 'none') return;
+		let found: number | null = null;
+		for (const cl of clipLayout) {
+			if (t >= cl.startOffset && t < cl.startOffset + cl.effectiveDuration) {
+				found = cl.index;
+				break;
+			}
+		}
+		selectedIndex = found;
+	});
+
 	// --- Entry management ---
 	function updateEntry(index: number, updates: Partial<ClipEntry>) {
 		entries = entries.map((e, i) => (i === index ? { ...e, ...updates } : e));
@@ -258,6 +274,31 @@
 	let currentPreviewIndex = $state(0);
 	let previewReady = $state(false);
 
+	// --- Waveform + transcription (per-clip) ---
+	const WAVEFORM_BINS = 800;
+	let waveformBgCanvas = $state<HTMLCanvasElement | null>(null);
+	let waveformFgCanvas = $state<HTMLCanvasElement | null>(null);
+	let waveformSeekEl = $state<HTMLElement | null>(null);
+	let waveformPeaks = new Float32Array(WAVEFORM_BINS);
+	let waveformActive = false;
+	let isDraggingWaveform = $state(false);
+	let scanAbort: AbortController | null = null;
+	let rafId: number | null = null;
+	let clipProgress = $state(0);
+	let clipDurationText = $state('0:00');
+	let transcriptionRegions = $state<Array<{ startFrac: number; endFrac: number; text: string }>>([]);
+
+	/** Trimmed local bounds for a clip entry — accounts for trimStart/trimEnd. */
+	function trimmedBounds(entry: ClipEntry, clip: ClipRegion) {
+		const bounds = clipBounds(clip);
+		if (!bounds) return null;
+		const trimmedStart = bounds.localStart + (entry.trimStart || 0);
+		const trimmedEnd = bounds.localEnd - (entry.trimEnd || 0);
+		const trimmedDur = trimmedEnd - trimmedStart;
+		if (trimmedDur <= 0) return null;
+		return { trimmedStart, trimmedEnd, trimmedDur };
+	}
+
 	function clipBounds(clip: ClipRegion) {
 		return getClipLocalBounds(clip, streamMap.get(clip.streamId), $syncOffsets[clip.streamId] || 0);
 	}
@@ -269,6 +310,169 @@
 			loadPreviewClip(0, false);
 		}
 	});
+
+	// --- Waveform drawing + scan ---
+	function drawStaticWaveform() {
+		const bg = waveformBgCanvas;
+		const fg = waveformFgCanvas;
+		if (!bg || !fg) return;
+		const bgCtx = bg.getContext('2d');
+		const fgCtx = fg.getContext('2d');
+		if (!bgCtx || !fgCtx) return;
+
+		const dpr = window.devicePixelRatio || 1;
+		const rect = bg.getBoundingClientRect();
+		const w = rect.width;
+		const h = rect.height;
+		const pw = Math.round(w * dpr);
+		const ph = Math.round(h * dpr);
+
+		for (const [canvas, ctx] of [[bg, bgCtx], [fg, fgCtx]] as const) {
+			if (canvas.width !== pw || canvas.height !== ph) {
+				canvas.width = pw;
+				canvas.height = ph;
+			}
+			ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+			ctx.clearRect(0, 0, w, h);
+		}
+
+		let maxPeak = 0;
+		for (let i = 0; i < WAVEFORM_BINS; i++) {
+			if (waveformPeaks[i] > maxPeak) maxPeak = waveformPeaks[i];
+		}
+		if (maxPeak < 0.001) maxPeak = 1;
+
+		const barW = w / WAVEFORM_BINS;
+		const halfH = h / 2;
+
+		bgCtx.strokeStyle = '#1a1a2e';
+		bgCtx.lineWidth = 1;
+		bgCtx.beginPath();
+		bgCtx.moveTo(0, halfH);
+		bgCtx.lineTo(w, halfH);
+		bgCtx.stroke();
+
+		bgCtx.fillStyle = '#2a2a4a';
+		fgCtx.fillStyle = '#7c3aed';
+		for (let i = 0; i < WAVEFORM_BINS; i++) {
+			const amp = waveformPeaks[i] / maxPeak;
+			const barH = Math.max(1, amp * (halfH - 2));
+			const x = i * barW;
+			bgCtx.fillRect(x, halfH - barH, barW - 0.5, barH * 2);
+			fgCtx.fillRect(x, halfH - barH, barW - 0.5, barH * 2);
+		}
+	}
+
+	function stopWaveformScan() {
+		if (scanAbort) {
+			scanAbort.abort();
+			scanAbort = null;
+		}
+	}
+
+	function startWaveformScan(entry: ClipEntry, clip: ClipRegion) {
+		stopWaveformScan();
+		const tb = trimmedBounds(entry, clip);
+		if (!tb) return;
+		const { trimmedStart, trimmedEnd } = tb;
+
+		const abort = new AbortController();
+		scanAbort = abort;
+
+		fetch(`/api/waveform/${clip.streamId}?start=${trimmedStart.toFixed(3)}&end=${trimmedEnd.toFixed(3)}`, {
+			signal: abort.signal
+		})
+			.then((r) => {
+				if (!r.ok) throw new Error(r.statusText);
+				return r.arrayBuffer();
+			})
+			.then((buf) => {
+				if (abort.signal.aborted) return;
+				const samples = new Int16Array(buf);
+				const samplesPerBin = Math.max(1, Math.floor(samples.length / WAVEFORM_BINS));
+				const peaks = new Float32Array(WAVEFORM_BINS);
+				for (let bin = 0; bin < WAVEFORM_BINS; bin++) {
+					const start = bin * samplesPerBin;
+					const end = Math.min(start + samplesPerBin, samples.length);
+					let sum = 0;
+					for (let i = start; i < end; i++) {
+						const s = samples[i] / 32768;
+						sum += s * s;
+					}
+					peaks[bin] = Math.sqrt(sum / (end - start));
+				}
+				waveformPeaks = peaks;
+				drawStaticWaveform();
+			})
+			.catch(() => {});
+	}
+
+	function waveformLoop() {
+		rafId = null;
+		if (!waveformActive) return;
+		if (!isSeeking && previewVideoEl && entries.length > 0) {
+			const entry = entries[currentPreviewIndex];
+			const clip = entry ? resolveClip(entry.clipId) : undefined;
+			if (entry && clip) {
+				const tb = trimmedBounds(entry, clip);
+				if (tb) {
+					const elapsed = previewVideoEl.currentTime - tb.trimmedStart;
+					clipProgress = tb.trimmedDur > 0 ? Math.max(0, Math.min(1, elapsed / tb.trimmedDur)) : 0;
+				}
+			}
+		}
+		if (previewPlaying || isDraggingWaveform) {
+			rafId = requestAnimationFrame(waveformLoop);
+		}
+	}
+
+	function startWaveformLoop() {
+		if (rafId != null) return;
+		rafId = requestAnimationFrame(waveformLoop);
+	}
+
+	// --- Waveform pointer handlers ---
+	function waveformSeekFromEvent(e: PointerEvent) {
+		const el = waveformSeekEl;
+		if (!el) return;
+		const rect = el.getBoundingClientRect();
+		clipProgress = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+	}
+
+	function handleWaveformPointerDown(e: PointerEvent) {
+		if (e.button !== 0) return;
+		isDraggingWaveform = true;
+		isSeeking = true;
+		(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+		waveformSeekFromEvent(e);
+		startWaveformLoop();
+	}
+
+	function handleWaveformPointerMove(e: PointerEvent) {
+		if (!isDraggingWaveform) return;
+		waveformSeekFromEvent(e);
+	}
+
+	function handleWaveformPointerUp(e: PointerEvent) {
+		if (!isDraggingWaveform) return;
+		isDraggingWaveform = false;
+		waveformSeekFromEvent(e);
+		// Convert clipProgress → composition time and seek
+		const entry = entries[currentPreviewIndex];
+		const clip = entry ? resolveClip(entry.clipId) : undefined;
+		if (previewVideoEl && entry && clip) {
+			const tb = trimmedBounds(entry, clip);
+			if (tb) {
+				const elapsed = clipProgress * tb.trimmedDur;
+				const layoutEntry = clipLayout[currentPreviewIndex];
+				if (layoutEntry) {
+					const compTime = layoutEntry.startOffset + elapsed / (entry.speed || 1);
+					seekToCompositionTime(compTime);
+				}
+			}
+		}
+		isSeeking = false;
+	}
 
 	function loadPreviewClip(index: number, autoPlay = true) {
 		if (index < 0 || index >= entries.length) return;
@@ -288,7 +492,7 @@
 
 		previewHls = setupHls(Hls, previewVideoEl, url, localStart, () => {
 			if (autoPlay) {
-				previewVideoEl!.play().then(() => { previewPlaying = true; }).catch(() => {});
+				previewVideoEl!.play().then(() => { previewPlaying = true; startWaveformLoop(); }).catch(() => {});
 			}
 		});
 	}
@@ -305,6 +509,8 @@
 		const trimmedStart = localStart + (entry.trimStart || 0);
 		const trimmedEnd = localEnd - (entry.trimEnd || 0);
 
+		const trimmedDur = trimmedEnd - trimmedStart;
+
 		if (previewVideoEl.currentTime >= trimmedEnd) {
 			if (currentPreviewIndex < entries.length - 1) {
 				loadPreviewClip(currentPreviewIndex + 1);
@@ -314,10 +520,12 @@
 				previewProgress = 1;
 				previewCurrentTime = formatDuration(totalDuration);
 				compositionTime = totalDuration;
+				clipProgress = 1;
 			}
 		} else if (!isSeeking) {
 			// elapsed within the trimmed region of this clip
 			const elapsed = previewVideoEl.currentTime - trimmedStart;
+			clipProgress = trimmedDur > 0 ? Math.max(0, Math.min(1, elapsed / trimmedDur)) : 0;
 			// Sync composition time for playhead
 			const layoutEntry = clipLayout[currentPreviewIndex];
 			if (layoutEntry) {
@@ -382,19 +590,88 @@
 			if (compositionTime >= totalDuration && entries.length > 0) {
 				compositionTime = 0;
 				previewCurrentTime = '0:00';
+				clipProgress = 0;
 				loadPreviewClip(0);
 				return;
 			}
 			previewVideoEl.play().catch(() => {});
+			startWaveformLoop();
 		}
 		previewPlaying = !previewPlaying;
 	}
+
+	// Clip-change detection: reset waveform, start new scan, fetch transcription
+	let prevWaveformIndex = -1;
+	$effect(() => {
+		const idx = currentPreviewIndex;
+		if (idx === prevWaveformIndex) return;
+		prevWaveformIndex = idx;
+
+		// Reset waveform
+		clipProgress = 0;
+		waveformPeaks = new Float32Array(WAVEFORM_BINS);
+		drawStaticWaveform();
+		stopWaveformScan();
+		transcriptionRegions = [];
+
+		const entry = entries[idx];
+		const clip = entry ? untrack(() => resolveClip(entry.clipId)) : undefined;
+		if (!entry || !clip) {
+			clipDurationText = '0:00';
+			return;
+		}
+
+		const tb = untrack(() => trimmedBounds(entry, clip));
+		if (!tb) {
+			clipDurationText = '0:00';
+			return;
+		}
+		clipDurationText = formatDuration(tb.trimmedDur / (entry.speed || 1));
+
+		// Start waveform scan
+		startWaveformScan(entry, clip);
+
+		// Fetch transcription for trimmed range
+		getMultiStreamTranscriptions({ ranges: [{ streamId: clip.streamId, from: tb.trimmedStart, to: tb.trimmedEnd }] })
+			.then((segments) => {
+				transcriptionRegions = segments.map((e) => ({
+					startFrac: Math.max(0, (e.startTime - tb.trimmedStart) / tb.trimmedDur),
+					endFrac: Math.min(1, (e.endTime - tb.trimmedStart) / tb.trimmedDur),
+					text: e.text
+				}));
+			})
+			.catch(() => {
+				transcriptionRegions = [];
+			});
+	});
+
+	// Waveform canvas lifecycle
+	$effect(() => {
+		if (waveformBgCanvas && waveformFgCanvas) {
+			waveformActive = true;
+			drawStaticWaveform();
+			if (previewPlaying) startWaveformLoop();
+			return () => {
+				waveformActive = false;
+				if (rafId != null) {
+					cancelAnimationFrame(rafId);
+					rafId = null;
+				}
+			};
+		}
+	});
 
 	// Cleanup
 	$effect(() => {
 		return () => {
 			if (previewHls) { previewHls.destroy(); previewHls = null; }
 			if (saveTimer) clearTimeout(saveTimer);
+			waveformActive = false;
+			if (rafId != null) {
+				cancelAnimationFrame(rafId);
+				rafId = null;
+			}
+			stopWaveformScan();
 		};
 	});
 
@@ -653,19 +930,51 @@
 						class="preview-video"
 					></video>
 				</div>
-				<div class="transport-bar">
-					<span class="transport-time">{previewCurrentTime}</span>
-					<span class="transport-sep">/</span>
-					<span class="transport-time">{formatDuration(totalDuration)}</span>
-					{#if entries.length > 0}
-						<span class="transport-clip-info">
-							Clip {currentPreviewIndex + 1}/{entries.length}
-							{#if resolveClip(entries[currentPreviewIndex]?.clipId ?? '')}
-								{@const curClip = resolveClip(entries[currentPreviewIndex]?.clipId ?? '')!}
-								— {curClip.title || clipChannel(curClip)}
-							{/if}
-						</span>
-					{/if}
+				<div class="video-controls">
+					<div class="timeline-row">
+						<button class="btn-ctl" onclick={togglePreviewPlay}>
+							{previewPlaying ? '\u23F8' : '\u25B6'}
+						</button>
+						<!-- svelte-ignore a11y_no_static_element_interactions -->
+						<div
+							class="waveform-seek"
+							bind:this={waveformSeekEl}
+							onpointerdown={handleWaveformPointerDown}
+							onpointermove={handleWaveformPointerMove}
+							onpointerup={handleWaveformPointerUp}
+						>
+							<canvas bind:this={waveformBgCanvas} class="waveform-canvas"></canvas>
+							<canvas
+								bind:this={waveformFgCanvas}
+								class="waveform-canvas waveform-fg"
+								style="clip-path: inset(0 {(1 - clipProgress) * 100}% 0 0)"
+							></canvas>
+							{#each transcriptionRegions as region}
+								<div
+									class="transcript-region"
+									style="left: {region.startFrac * 100}%; width: {(region.endFrac - region.startFrac) * 100}%"
+									title={region.text}
+								></div>
+							{/each}
+							<div class="waveform-playhead" style="left: {clipProgress * 100}%"></div>
+						</div>
+					</div>
+					<div class="transport-row">
+						<span class="vid-time">{previewCurrentTime}</span>
+						<span class="vid-time" style="color: #555">/</span>
+						<span class="vid-time">{formatDuration(totalDuration)}</span>
+						{#if entries.length > 0}
+							<span class="transport-clip-info">
+								Clip {currentPreviewIndex + 1}/{entries.length}
+								{#if resolveClip(entries[currentPreviewIndex]?.clipId ?? '')}
+									{@const curClip = resolveClip(entries[currentPreviewIndex]?.clipId ?? '')!}
+									— {curClip.title || clipChannel(curClip)}
+								{/if}
+							</span>
+						{/if}
+						<span style="flex:1"></span>
+						<span class="vid-time">{clipDurationText}</span>
+					</div>
 				</div>
 			</div>
 
@@ -982,32 +1291,102 @@
 		display: block;
 	}
 
-	.transport-bar {
+	.video-controls {
 		display: flex;
-		align-items: center;
-		gap: 6px;
-		padding: 6px 12px;
-		background: #0f0f23;
-		border-top: 1px solid #1a1a2e;
+		flex-direction: column;
+		background: #0a0a1a;
 		flex-shrink: 0;
 	}
 
-	.transport-time {
-		font-size: 0.75rem;
-		color: #e0e0ff;
-		font-variant-numeric: tabular-nums;
-		font-family: monospace;
+	.timeline-row {
+		display: flex;
+		align-items: stretch;
+		flex-shrink: 0;
 	}
 
-	.transport-sep {
-		color: #555;
+	.timeline-row .btn-ctl {
+		border-radius: 0;
+		padding: 0;
+		width: 44px;
+		flex-shrink: 0;
+		text-align: center;
+	}
+
+	.waveform-seek {
+		position: relative;
+		height: 64px;
+		cursor: pointer;
+		touch-action: none;
+		flex: 1;
+		min-width: 0;
+	}
+
+	.waveform-canvas {
+		display: block;
+		width: 100%;
+		height: 100%;
+	}
+
+	.waveform-fg {
+		position: absolute;
+		top: 0;
+		left: 0;
+	}
+
+	.waveform-playhead {
+		position: absolute;
+		top: 0;
+		bottom: 0;
+		width: 2px;
+		background: #fff;
+		box-shadow: 0 0 6px #7c3aed;
+		pointer-events: none;
+		transform: translateX(-1px);
+	}
+
+	.transcript-region {
+		position: absolute;
+		top: 0;
+		bottom: 0;
+		background: rgba(56, 189, 248, 0.15);
+		border-left: 1px solid rgba(56, 189, 248, 0.3);
+		pointer-events: none;
+	}
+
+	.transport-row {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		padding: 4px 16px 6px;
+	}
+
+	.vid-time {
 		font-size: 0.7rem;
+		color: #888;
+		font-variant-numeric: tabular-nums;
+		font-family: monospace;
+		min-width: 3em;
+		text-align: center;
+	}
+
+	.btn-ctl {
+		background: #2a2a4a;
+		border: none;
+		color: #ccc;
+		padding: 6px 14px;
+		border-radius: 4px;
+		cursor: pointer;
+		font-size: 0.85rem;
+	}
+
+	.btn-ctl:hover {
+		background: #3a3a5a;
+		color: #fff;
 	}
 
 	.transport-clip-info {
 		font-size: 0.7rem;
 		color: #888;
-		margin-left: 8px;
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;

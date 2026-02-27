@@ -20,8 +20,8 @@
 		{ href: '/library', label: 'Library' },
 		{ href: '/clipping', label: 'Clipping' },
 		{ href: '/clips', label: 'Clips' },
-		{ href: '/videos', label: 'Videos' },
 		{ href: '/review', label: 'Review' },
+		{ href: '/videos', label: 'Videos' },
 		{ href: '/exports', label: 'Exports' },
 		{ href: '/thumbnail', label: 'Thumbnail' },
 		{ href: '/upload', label: 'Upload' }
