@@ -8,7 +8,7 @@
 
 import * as fs from 'node:fs';
 import { createCanvas, type SKRSContext2D } from '@napi-rs/canvas';
-import { loadChatMessagesInRange } from './db/index.js';
+import { loadChatMessagesInRange, loadAllCensorTerms } from './db/index.js';
 import { parseEmotes, getThirdPartyEmotes, type EmoteMap } from '../emoteParser.js';
 import { fetchTwitchBadges, resolveBadges, type BadgeMap } from '../badgeParser.js';
 import {
@@ -120,7 +120,14 @@ function renderFrame(
 				} else {
 					ctx.font = seg.bold ? chatBoldFont : chatFont;
 					ctx.fillStyle = seg.color || CHAT_TEXT_COLOR;
-					ctx.fillText(seg.text!, x, baseline);
+					if (seg.censor) {
+						ctx.save();
+						ctx.filter = 'blur(2.5px)';
+						ctx.fillText(seg.text!, x, baseline);
+						ctx.restore();
+					} else {
+						ctx.fillText(seg.text!, x, baseline);
+					}
 					x += seg.width;
 				}
 			}
@@ -212,7 +219,8 @@ export async function renderChatEffectVideo(opts: {
 	}
 	const imageCache = await prefetchImages(imageUrls);
 
-	// 4. Prepare messages with layout
+	// 4. Load censor terms + prepare messages with layout
+	const censorTerms = loadAllCensorTerms();
 	const measureCanvas = createCanvas(1, 1);
 	const measureCtx = measureCanvas.getContext('2d');
 	const { prepared, hasAnimated } = prepareMessages(
@@ -222,7 +230,8 @@ export async function renderChatEffectVideo(opts: {
 		imageCache,
 		measureCtx,
 		panelWidth - CHAT_PAD_X * 2,
-		fontWeight
+		fontWeight,
+		censorTerms
 	);
 	const { font: chatFont, boldFont: chatBoldFont } = buildChatFonts(fontWeight);
 

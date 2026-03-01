@@ -169,7 +169,7 @@ export async function exportVerticalVideo(
 						'-i', eff.videoPath!
 					);
 				} else if (eff.animation) {
-					// Animated subtitle: loop the PNG as a 30fps video so fade filters work
+					// Animated overlay: loop the PNG as a 30fps video so fade filters work
 					extraInputs.push(
 						...itsoffset,
 						'-loop', '1', '-framerate', '30',

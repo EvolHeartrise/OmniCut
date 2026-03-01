@@ -10,3 +10,4 @@ export { type ExportRecord, saveExport, updateExportStatus, loadExport, loadAllE
 export { saveVideo, updateVideoRecord, loadVideo, loadAllVideos, deleteVideoRecord, loadThumbnailByVideo } from './persistenceVideos.js';
 export { type YouTubeAccount, type YouTubeUploadRecord, saveYouTubeAccount, updateYouTubeAccountTokens, loadYouTubeAccount, loadYouTubeAccountByChannelId, loadAllYouTubeAccounts, deleteYouTubeAccount, saveYouTubeUpload, updateYouTubeUploadStatus, loadYouTubeUpload, loadAllYouTubeUploads, loadYouTubeUploadsByExport, deleteYouTubeUpload } from './persistenceYoutube.js';
 export { type TextLayerConfig, type ImageLayerConfig, type EffectLayerConfig, type LayerConfig, type ThumbnailRecord, saveThumbnail, loadThumbnail, loadThumbnailByExport, updateThumbnail, deleteThumbnail } from './persistenceThumbnails.js';
+export { loadAllCensorTerms, addCensorTerm, removeCensorTerm, clearCensorTerms } from './persistenceCensor.js';

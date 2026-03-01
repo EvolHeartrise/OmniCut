@@ -34,7 +34,8 @@
 		localEnd,
 		currentTime,
 		chatOffset = 0,
-		fontWeight = 400
+		fontWeight = 400,
+		censorTerms = []
 	}: {
 		streamId: string;
 		localStart: number;
@@ -42,6 +43,7 @@
 		currentTime: number;
 		chatOffset?: number;
 		fontWeight?: number;
+		censorTerms?: string[];
 	} = $props();
 
 	let thirdPartyEmotes = $state<EmoteMap>(new Map());
@@ -130,12 +132,33 @@
 		const _len = displayEntries.length;
 		if (listEl) listEl.scrollTop = listEl.scrollHeight;
 	});
+
+	// Censor term splitting for text segments
+	function escapeRegex(s: string): string {
+		return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+	}
+
+	function censorSplit(text: string, terms: string[]): Array<{ text: string; censored: boolean }> {
+		if (!terms.length) return [{ text, censored: false }];
+		const escaped = terms.map(escapeRegex).sort((a, b) => b.length - a.length);
+		const re = new RegExp(`(${escaped.join('|')})`, 'gi');
+		const parts: Array<{ text: string; censored: boolean }> = [];
+		let lastIndex = 0;
+		for (const match of text.matchAll(re)) {
+			const idx = match.index!;
+			if (idx > lastIndex) parts.push({ text: text.slice(lastIndex, idx), censored: false });
+			parts.push({ text: match[0], censored: true });
+			lastIndex = idx + match[0].length;
+		}
+		if (lastIndex < text.length) parts.push({ text: text.slice(lastIndex), censored: false });
+		return parts.length ? parts : [{ text, censored: false }];
+	}
 </script>
 
 <div class="preview-chat-log" bind:this={listEl} style="font-weight:{fontWeight}">
 	{#each displayEntries as entry (entry.id)}
 		<div class="pc-line">
-			{#each entry.badges as badge}<img class="pc-badge" src={badge.imageUrl} alt={badge.title} />{/each}<span class="pc-user" style="color:{entry.userColor};font-weight:{Math.min(900, fontWeight + 300)}">{entry.username}</span><span class="pc-sep">: </span><span class="pc-msg">{#each entry.segments as seg}{#if seg.type === 'emote' && seg.emoteUrl}<img class="pc-emote" src={seg.emoteUrl} alt={seg.text} />{:else}{seg.text}{/if}{/each}</span>
+			{#each entry.badges as badge}<img class="pc-badge" src={badge.imageUrl} alt={badge.title} />{/each}<span class="pc-user" style="color:{entry.userColor};font-weight:{Math.min(900, fontWeight + 300)}">{entry.username}</span><span class="pc-sep">: </span><span class="pc-msg">{#each entry.segments as seg}{#if seg.type === 'emote' && seg.emoteUrl}<img class="pc-emote" src={seg.emoteUrl} alt={seg.text} />{:else}{#each censorSplit(seg.text, censorTerms) as part}{#if part.censored}<span class="pc-censored">{part.text}</span>{:else}{part.text}{/if}{/each}{/if}{/each}</span>
 		</div>
 	{/each}
 </div>
@@ -198,5 +221,11 @@
 		height: 23px;
 		vertical-align: middle;
 		margin: -1px 2px;
+	}
+
+	.pc-censored {
+		filter: blur(2.5px);
+		display: inline;
+		user-select: none;
 	}
 </style>

@@ -5,7 +5,7 @@
 
 import * as path from 'node:path';
 import * as fs from 'node:fs';
-import type { ClipRegion, ClipEntry, EffectEntry, SubtitleAnimation } from '../types.js';
+import type { ClipRegion, ClipEntry, EffectEntry, OverlayAnimation } from '../types.js';
 import { runFfmpeg } from './ffmpeg.js';
 import { renderEffectOverlay, clearEffectRendererCache } from './effectRenderer.js';
 import { renderChatEffectVideo, clearChatEffectCache } from './chatEffectRenderer.js';
@@ -112,7 +112,7 @@ export async function exportVideo(
 							'-i', eff.videoPath!
 						);
 					} else if (eff.animation) {
-						// Animated subtitle: loop the PNG as a 30fps video so fade filters work
+						// Animated overlay: loop the PNG as a 30fps video so fade filters work
 						extraInputs.push(
 							...itsoffset,
 							'-loop', '1', '-framerate', '30',
@@ -290,13 +290,16 @@ export interface ResolvedEffect {
 	scale?: number;      // uniform scale multiplier (default 1)
 	/** If set, videoPath is a raw RGBA file — needs explicit format args on input. */
 	rawVideo?: { width: number; height: number; fps: number };
-	/** Subtitle animation config — only set for subtitle effects. */
+	/** Rendered overlay dimensions (used to compute animation slide distances). */
+	overlayWidth: number;
+	overlayHeight: number;
+	/** In/out animation config — set when the effect has non-none animations. */
 	animation?: {
-		animIn: SubtitleAnimation;
-		animOut: SubtitleAnimation;
+		animIn: OverlayAnimation;
+		animOut: OverlayAnimation;
 		animDuration: number;
-		width: number;   // rendered PNG width (for slide calculations)
-		height: number;  // rendered PNG height
+		width: number;   // rendered overlay width (for slide calculations)
+		height: number;  // rendered overlay height
 	};
 }
 
@@ -344,6 +347,9 @@ export async function resolveOverlappingEffects(
 		const localStart = Math.max(0, effect.startTime - clipCompStart);
 		const localEnd = Math.min(clipDur, effectEnd - clipCompStart);
 
+		// Resolve the overlay for this effect type
+		let resolved: ResolvedEffect | null = null;
+
 		if (effect.type === 'twitch-chat') {
 			// Render scrolling chat panel as transparent WebM
 			if (!clipContext) continue;
@@ -374,10 +380,47 @@ export async function resolveOverlappingEffects(
 				const y = Math.round(effect.y * videoHeight);
 				// Scale is baked into the render — no FFmpeg upscale needed
 				const rawVideo = result.raw ? { width: result.width, height: result.height, fps: result.fps } : undefined;
-				results.push({ videoPath: result.videoPath, x, y, localStart, localEnd, rawVideo });
+				resolved = { videoPath: result.videoPath, x, y, localStart, localEnd, rawVideo,
+					overlayWidth: result.width, overlayHeight: result.height };
 			} catch (err) {
 				console.warn(`[exporter] Failed to render twitch-chat effect ${ei}:`, err instanceof Error ? err.message : err);
 			}
+		} else if (effect.type === 'image') {
+			// image: load uploaded image, optionally scale, apply opacity
+			if (!effect.imageId) continue;
+
+			const imgDir = path.resolve(process.cwd(), 'data', 'overlays');
+			const imgFilePath = path.join(imgDir, effect.imageId);
+			if (!fs.existsSync(imgFilePath)) {
+				console.warn(`[exporter] Image overlay file not found: ${imgFilePath}`);
+				continue;
+			}
+
+			const { createCanvas, loadImage } = await import('@napi-rs/canvas');
+			const img = await loadImage(imgFilePath);
+			const scale = effect.imageScale ?? 1;
+			const opacity = effect.imageOpacity ?? 1;
+			const scaledW = Math.round(img.width * scale);
+			const scaledH = Math.round(img.height * scale);
+
+			const pngPath = path.join(tempDir, `image_${clipIdx}_${ei}.png`);
+
+			if (scale !== 1 || opacity < 1 || !imgFilePath.toLowerCase().endsWith('.png')) {
+				// Re-render via canvas at scaled size with opacity
+				const canvas = createCanvas(scaledW, scaledH);
+				const ctx = canvas.getContext('2d');
+				ctx.globalAlpha = opacity;
+				ctx.drawImage(img, 0, 0, scaledW, scaledH);
+				fs.writeFileSync(pngPath, canvas.toBuffer('image/png'));
+			} else {
+				// Use directly
+				fs.copyFileSync(imgFilePath, pngPath);
+			}
+
+			const x = Math.round(effect.x * videoWidth);
+			const y = Math.round(effect.y * videoHeight);
+			resolved = { pngPath, x, y, localStart, localEnd,
+				overlayWidth: scaledW, overlayHeight: scaledH };
 		} else if (effect.type === 'subtitle') {
 			// subtitle: render styled text as PNG
 			if (!effect.subtitleText) continue;
@@ -398,13 +441,8 @@ export async function resolveOverlappingEffects(
 			// Center horizontally at the specified x position
 			const x = Math.round(effect.x * videoWidth - result.width / 2);
 			const y = Math.round(effect.y * videoHeight);
-			const animIn = effect.subtitleAnimIn ?? 'none';
-			const animOut = effect.subtitleAnimOut ?? 'none';
-			const animDuration = effect.subtitleAnimDuration ?? 0.3;
-			const animation = (animIn !== 'none' || animOut !== 'none')
-				? { animIn, animOut, animDuration, width: result.width, height: result.height }
-				: undefined;
-			results.push({ pngPath, x, y, localStart, localEnd, animation });
+			resolved = { pngPath, x, y, localStart, localEnd,
+				overlayWidth: result.width, overlayHeight: result.height };
 		} else {
 			// chat-message: render static PNG
 			if (!effect.twitchId) continue;
@@ -418,8 +456,22 @@ export async function resolveOverlappingEffects(
 
 			const x = Math.round(effect.x * videoWidth);
 			const y = Math.round(effect.y * videoHeight);
-			results.push({ pngPath, x, y, localStart, localEnd });
+			resolved = { pngPath, x, y, localStart, localEnd,
+				overlayWidth: result.width, overlayHeight: result.height };
 		}
+
+		if (!resolved) continue;
+
+		// Attach animation if the effect has in/out animations (works for all overlay types)
+		const animIn = effect.animIn ?? 'none';
+		const animOut = effect.animOut ?? 'none';
+		const animDuration = effect.animDuration ?? 0.3;
+		if (animIn !== 'none' || animOut !== 'none') {
+			resolved.animation = { animIn, animOut, animDuration,
+				width: resolved.overlayWidth, height: resolved.overlayHeight };
+		}
+
+		results.push(resolved);
 	}
 	return results;
 }
@@ -624,7 +676,7 @@ export function buildAnimatedOverlay(
  * For 'out' phase: progress goes 0→1 over [phaseStart, phaseEnd]
  */
 function buildPositionAnim(
-	animType: SubtitleAnimation,
+	animType: OverlayAnimation,
 	phase: 'in' | 'out',
 	axis: 'x' | 'y',
 	baseX: number, baseY: number,

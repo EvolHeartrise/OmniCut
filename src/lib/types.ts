@@ -24,7 +24,7 @@ export interface CameraBoundsEntry {
 /** An effect placed on the composition timeline. */
 export interface EffectEntry {
 	id: string;               // unique ID (nanoid)
-	type: 'chat-message' | 'twitch-chat' | 'zoom' | 'subtitle';
+	type: 'chat-message' | 'twitch-chat' | 'zoom' | 'subtitle' | 'image';
 	/** Composition-time start (seconds from composition start). */
 	startTime: number;
 	/** Duration the effect is visible (seconds). */
@@ -70,15 +70,25 @@ export interface EffectEntry {
 	subtitleMaxWidth?: number;
 	/** For subtitle type: text alignment (default 'center'). */
 	subtitleTextAlign?: 'left' | 'center' | 'right';
-	/** For subtitle type: entrance animation (default 'none'). */
-	subtitleAnimIn?: SubtitleAnimation;
-	/** For subtitle type: exit animation (default 'none'). */
-	subtitleAnimOut?: SubtitleAnimation;
-	/** For subtitle type: animation duration in seconds (default 0.3). */
-	subtitleAnimDuration?: number;
+	/** For image type: ID of the uploaded image (filename in data/overlays/). */
+	imageId?: string;
+	/** For image type: display scale multiplier (default 1). */
+	imageScale?: number;
+	/** For image type: opacity 0-1 (default 1). */
+	imageOpacity?: number;
+	/** For image type: natural width in pixels (stored on upload). */
+	imageWidth?: number;
+	/** For image type: natural height in pixels (stored on upload). */
+	imageHeight?: number;
+	/** Entrance animation for overlay effects (default 'none'). */
+	animIn?: OverlayAnimation;
+	/** Exit animation for overlay effects (default 'none'). */
+	animOut?: OverlayAnimation;
+	/** Animation duration in seconds (default 0.3). */
+	animDuration?: number;
 }
 
-export type SubtitleAnimation =
+export type OverlayAnimation =
 	| 'none'
 	| 'fade'
 	| 'pop'
@@ -87,6 +97,9 @@ export type SubtitleAnimation =
 	| 'slide-left'
 	| 'slide-right'
 	| 'bounce';
+
+/** @deprecated Use OverlayAnimation instead. */
+export type SubtitleAnimation = OverlayAnimation;
 
 /** Per-clip entry in a video composition. */
 export interface ClipEntry {

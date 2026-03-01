@@ -66,6 +66,7 @@ export interface LineSegment {
 	text?: string;
 	color?: string;
 	bold?: boolean;
+	censor?: boolean;
 	image?: Image | null;
 	animated?: AnimatedImage;
 	width: number;
@@ -143,6 +144,54 @@ export function getAnimFrame(anim: AnimatedImage, elapsedMs: number): Image {
 }
 
 // ---------------------------------------------------------------------------
+// Censoring — split text segments on explicit terms
+// ---------------------------------------------------------------------------
+
+function escapeRegex(s: string): string {
+	return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+export function applyCensoring(
+	segments: LineSegment[],
+	censorTerms: string[],
+	measureCtx: SKRSContext2D,
+	chatFont: string,
+	chatBoldFont: string
+): LineSegment[] {
+	if (!censorTerms.length) return segments;
+	const escaped = censorTerms.map(escapeRegex).sort((a, b) => b.length - a.length);
+	const re = new RegExp(`(${escaped.join('|')})`, 'gi');
+
+	const result: LineSegment[] = [];
+	for (const seg of segments) {
+		if (seg.type !== 'text' || !seg.text) { result.push(seg); continue; }
+		let lastIndex = 0;
+		let hadMatch = false;
+		for (const match of seg.text.matchAll(re)) {
+			hadMatch = true;
+			const idx = match.index!;
+			if (idx > lastIndex) {
+				const slice = seg.text.slice(lastIndex, idx);
+				measureCtx.font = seg.bold ? chatBoldFont : chatFont;
+				result.push({ ...seg, text: slice, width: measureCtx.measureText(slice).width });
+			}
+			const mText = match[0];
+			measureCtx.font = seg.bold ? chatBoldFont : chatFont;
+			result.push({ ...seg, text: mText, width: measureCtx.measureText(mText).width, censor: true });
+			lastIndex = idx + mText.length;
+		}
+		if (!hadMatch) {
+			result.push(seg);
+		} else if (lastIndex < seg.text.length) {
+			const slice = seg.text.slice(lastIndex);
+			measureCtx.font = seg.bold ? chatBoldFont : chatFont;
+			result.push({ ...seg, text: slice, width: measureCtx.measureText(slice).width });
+		}
+	}
+	return result;
+}
+
+// ---------------------------------------------------------------------------
 // Message preparation (word-wrapping + layout)
 // ---------------------------------------------------------------------------
 
@@ -153,7 +202,8 @@ export function prepareMessages(
 	imageCache: Map<string, CachedImage>,
 	measureCtx: SKRSContext2D,
 	overrideMaxWidth?: number,
-	fontWeight?: number
+	fontWeight?: number,
+	censorTerms?: string[]
 ): { prepared: PreparedMessage[]; hasAnimated: boolean } {
 	const PANEL_W = 340;
 	const maxWidth = overrideMaxWidth ?? (PANEL_W - CHAT_PAD_X * 2);
@@ -203,6 +253,7 @@ export function prepareMessages(
 		});
 
 		// Message content
+		const contentSegs: LineSegment[] = [];
 		for (const seg of segments) {
 			if (seg.type === 'emote' && seg.emoteUrl) {
 				const cached = imageCache.get(seg.emoteUrl) ?? null;
@@ -211,7 +262,7 @@ export function prepareMessages(
 					const first = cached.frames[0];
 					const ar = first.width / Math.max(1, first.height);
 					const w = CHAT_EMOTE_HEIGHT * ar;
-					flatSegs.push({
+					contentSegs.push({
 						type: 'emote',
 						animated: cached,
 						text: seg.text,
@@ -221,7 +272,7 @@ export function prepareMessages(
 				} else if (cached) {
 					const ar = cached.width / Math.max(1, cached.height);
 					const w = CHAT_EMOTE_HEIGHT * ar;
-					flatSegs.push({
+					contentSegs.push({
 						type: 'emote',
 						image: cached,
 						text: seg.text,
@@ -232,7 +283,7 @@ export function prepareMessages(
 					// Fallback: render emote name as text
 					measureCtx.font = chatFont;
 					const tw = measureCtx.measureText(seg.text).width;
-					flatSegs.push({
+					contentSegs.push({
 						type: 'text',
 						text: seg.text,
 						color: CHAT_TEXT_COLOR,
@@ -247,7 +298,7 @@ export function prepareMessages(
 					if (!word) continue;
 					measureCtx.font = chatFont;
 					const tw = measureCtx.measureText(word).width;
-					flatSegs.push({
+					contentSegs.push({
 						type: 'text',
 						text: word,
 						color: CHAT_TEXT_COLOR,
@@ -257,6 +308,12 @@ export function prepareMessages(
 				}
 			}
 		}
+
+		// Apply censoring to message content segments
+		const censoredSegs = censorTerms?.length
+			? applyCensoring(contentSegs, censorTerms, measureCtx, chatFont, chatBoldFont)
+			: contentSegs;
+		for (const s of censoredSegs) flatSegs.push(s);
 
 		// Word-wrap into lines
 		const lines: PreparedLine[] = [];

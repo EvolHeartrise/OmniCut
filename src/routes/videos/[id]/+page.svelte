@@ -15,7 +15,11 @@
 		deleteVideoCmd,
 		exportVideoFromVideoCmd,
 		getMultiStreamTranscriptions,
-		getChatMessageByTwitchId
+		getChatMessageByTwitchId,
+		uploadOverlayImageCmd,
+		getCensorTerms,
+		addCensorTermCmd,
+		removeCensorTermCmd
 	} from '$lib/streams.remote';
 	import { getCameraBounds } from '$lib/stores/streams.js';
 	import { untrack } from 'svelte';
@@ -63,6 +67,29 @@
 
 	// Chat panel state
 	let chatPanelOpen = $state(false);
+
+	// Censor terms state
+	let censorTerms = $state<string[]>([]);
+	let newCensorTerm = $state('');
+	let censorExpanded = $state(false);
+
+	// Load censor terms on mount
+	$effect(() => {
+		getCensorTerms().then((terms) => { censorTerms = terms; });
+	});
+
+	async function handleAddCensorTerm() {
+		const term = newCensorTerm.trim();
+		if (!term) return;
+		await addCensorTermCmd({ term });
+		newCensorTerm = '';
+		censorTerms = await getCensorTerms();
+	}
+
+	async function handleRemoveCensorTerm(term: string) {
+		await removeCensorTermCmd({ term });
+		censorTerms = await getCensorTerms();
+	}
 
 	// --- Vertical (9:16) canvas preview ---
 	const VERT_OUT_W = 1080;
@@ -404,24 +431,83 @@
 			subtitleFontWeight: 700,
 			subtitleMaxWidth: 900,
 			subtitleTextAlign: 'center',
-			subtitleAnimIn: 'pop',
-			subtitleAnimOut: 'pop',
-			subtitleAnimDuration: 0.3,
+			animIn: 'pop',
+			animOut: 'pop',
+			animDuration: 0.3,
 		};
 		effectEntries = [...effectEntries, entry];
 		selectedEffectId = id;
 	}
 
-	/** Compute inline CSS for subtitle in/out animation based on current composition time. */
-	function subtitleAnimStyle(entry: EffectEntry, t: number): string {
-		const animIn = entry.subtitleAnimIn ?? 'none';
-		const animOut = entry.subtitleAnimOut ?? 'none';
-		const dur = entry.subtitleAnimDuration ?? 0.3;
+	let droppingImage = $state(false);
+
+	function handleImageDragOver(e: DragEvent) {
+		if (!e.dataTransfer?.types.includes('Files')) return;
+		e.preventDefault();
+		e.dataTransfer.dropEffect = 'copy';
+		droppingImage = true;
+	}
+
+	function handleImageDragLeave() {
+		droppingImage = false;
+	}
+
+	async function handleImageDrop(e: DragEvent) {
+		e.preventDefault();
+		droppingImage = false;
+		const files = e.dataTransfer?.files;
+		if (!files || files.length === 0) return;
+		const file = files[0];
+		if (!file.type.startsWith('image/')) return;
+
+		// Read file as base64
+		const arrayBuf = await file.arrayBuffer();
+		const base64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuf)));
+
+		// Upload to server
+		const result = await uploadOverlayImageCmd({ data: base64, filename: file.name });
+
+		// Compute drop position as normalized 0-1
+		let x = 0.5, y = 0.5;
+		if (overlayContainerEl) {
+			const rect = overlayContainerEl.getBoundingClientRect();
+			x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+			y = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
+		}
+
+		const id = nanoid(12);
+		const entry: EffectEntry = {
+			id,
+			type: 'image',
+			startTime: compositionTime,
+			duration: 5,
+			x,
+			y,
+			imageId: result.id,
+			imageWidth: result.width,
+			imageHeight: result.height,
+			imageScale: 1,
+			imageOpacity: 1,
+		};
+		effectEntries = [...effectEntries, entry];
+		selectedEffectId = id;
+	}
+
+	/** Compute inline CSS for overlay in/out animation based on current composition time.
+	 *  Works for all overlay effect types. Pass centered=true for subtitle-style centering. */
+	function overlayAnimStyle(entry: EffectEntry, t: number, centered = false): string {
+		const animIn = entry.animIn ?? 'none';
+		const animOut = entry.animOut ?? 'none';
+		const dur = entry.animDuration ?? 0.3;
 		const effectEnd = entry.startTime + entry.duration;
 
+		if (animIn === 'none' && animOut === 'none') {
+			return centered ? 'transform: translateX(-50%)' : '';
+		}
+
 		let opacity = 1;
-		let translateX = '-50%'; // base centering
-		let translateY = '0';
+		let offsetX = 0; // px offset from base position
+		let offsetY = 0;
 		let scale = 1;
 
 		// In-animation phase
@@ -436,17 +522,17 @@
 			if (animIn === 'pop') {
 				scale = 0.3 + 0.7 * eased;
 			} else if (animIn === 'slide-up') {
-				translateY = `${(1 - eased) * 80}px`;
+				offsetY = (1 - eased) * 80;
 			} else if (animIn === 'slide-down') {
-				translateY = `${-(1 - eased) * 80}px`;
+				offsetY = -(1 - eased) * 80;
 			} else if (animIn === 'slide-left') {
-				translateX = `calc(-50% + ${(1 - eased) * 200}px)`;
+				offsetX = (1 - eased) * 200;
 			} else if (animIn === 'slide-right') {
-				translateX = `calc(-50% - ${(1 - eased) * 200}px)`;
+				offsetX = -(1 - eased) * 200;
 			} else if (animIn === 'bounce') {
 				const bounce = 1 - (1 - p) * (1 - p) * Math.cos(p * Math.PI * 2);
 				const clamped = Math.min(bounce, 1.15);
-				translateY = `${(1 - clamped) * 80}px`;
+				offsetY = (1 - clamped) * 80;
 			}
 		}
 
@@ -462,20 +548,23 @@
 			if (animOut === 'pop') {
 				scale *= (1 - eased * 0.7);
 			} else if (animOut === 'slide-up') {
-				translateY = `${-eased * 80}px`;
+				offsetY = -eased * 80;
 			} else if (animOut === 'slide-down') {
-				translateY = `${eased * 80}px`;
+				offsetY = eased * 80;
 			} else if (animOut === 'slide-left') {
-				translateX = `calc(-50% - ${eased * 200}px)`;
+				offsetX = -eased * 200;
 			} else if (animOut === 'slide-right') {
-				translateX = `calc(-50% + ${eased * 200}px)`;
+				offsetX = eased * 200;
 			} else if (animOut === 'bounce') {
-				translateY = `${-eased * eased * 80}px`;
+				offsetY = -eased * eased * 80;
 			}
 		}
 
 		const parts: string[] = [];
-		parts.push(`transform: translateX(${translateX}) translateY(${translateY}) scale(${scale.toFixed(3)})`);
+		const baseX = centered ? '-50%' : '0';
+		const tx = offsetX !== 0 ? `calc(${baseX} + ${offsetX.toFixed(1)}px)` : baseX;
+		const ty = offsetY !== 0 ? `${offsetY.toFixed(1)}px` : '0';
+		parts.push(`transform: translateX(${tx}) translateY(${ty}) scale(${scale.toFixed(3)})`);
 		if (opacity < 1) parts.push(`opacity: ${opacity.toFixed(3)}`);
 		return parts.join('; ');
 	}
@@ -1526,7 +1615,7 @@
 			<!-- TOP ROW: Preview + Properties -->
 			<div class="preview-panel">
 				<div class="preview-main">
-				<div class="preview-player-area" bind:this={previewPlayerAreaEl}>
+				<div class="preview-player-area" class:image-drop-active={droppingImage} bind:this={previewPlayerAreaEl} ondragover={handleImageDragOver} ondragleave={handleImageDragLeave} ondrop={handleImageDrop}>
 					<!-- svelte-ignore a11y_media_has_caption -->
 					<video
 						bind:this={previewVideoEl}
@@ -1559,7 +1648,7 @@
 								<div
 									class="chat-panel-placeholder"
 									class:bubble-selected={selectedEffectId === entry.id}
-									style="left: {entry.x * 100}%; top: {entry.y * 100}%; width: {pw * videoScale * cs}px; height: {ph * videoScale * cs}px"
+									style="left: {entry.x * 100}%; top: {entry.y * 100}%; width: {pw * videoScale * cs}px; height: {ph * videoScale * cs}px; {overlayAnimStyle(entry, compositionTime)}"
 									onpointerdown={(e) => handleOverlayPointerDown(e, entry.id)}
 									onpointermove={handleOverlayPointerMove}
 									onpointerup={handleOverlayPointerUp}
@@ -1573,6 +1662,7 @@
 												currentTime={chatLocalTime}
 												chatOffset={entry.chatOffset ?? 0}
 												fontWeight={entry.chatFontWeight ?? 400}
+												{censorTerms}
 											/>
 										{:else}
 											<span class="chat-panel-label">Chat Panel</span>
@@ -1603,12 +1693,32 @@
 									<div class="zoom-dim zoom-dim-right" style="top: {cy * 100}%; height: {ch * 100}%; width: {Math.max(0, (1 - cx - cw)) * 100}%"></div>
 									<div class="zoom-region" style="left: {cx * 100}%; top: {cy * 100}%; width: {cw * 100}%; height: {ch * 100}%"></div>
 								</div>
+							{:else if entry.type === 'image'}
+								<!-- svelte-ignore a11y_no_static_element_interactions -->
+								<div
+									class="image-overlay"
+									class:bubble-selected={selectedEffectId === entry.id}
+									style="left: {entry.x * 100}%; top: {entry.y * 100}%; {overlayAnimStyle(entry, compositionTime)}"
+									onpointerdown={(e) => handleOverlayPointerDown(e, entry.id)}
+									onpointermove={handleOverlayPointerMove}
+									onpointerup={handleOverlayPointerUp}
+								>
+									{#if entry.imageId}
+										{@const imgScale = videoScale * (entry.imageScale ?? 1)}
+										<img
+											src="/api/overlay-image/{entry.imageId}"
+											alt="overlay"
+											style="width: {(entry.imageWidth ?? 100) * imgScale}px; height: {(entry.imageHeight ?? 100) * imgScale}px; opacity: {entry.imageOpacity ?? 1}; display: block;"
+											draggable="false"
+										/>
+									{/if}
+								</div>
 							{:else if entry.type === 'subtitle'}
 								<!-- svelte-ignore a11y_no_static_element_interactions -->
 								<div
 									class="subtitle-overlay"
 									class:bubble-selected={selectedEffectId === entry.id}
-									style="left: {entry.x * 100}%; top: {entry.y * 100}%; max-width: {(entry.subtitleMaxWidth ?? 900) * videoScale}px; font-size: {(entry.subtitleFontSize ?? 48) * videoScale}px; font-weight: {entry.subtitleFontWeight ?? 700}; color: {entry.subtitleFontColor ?? '#FFFFFF'}; -webkit-text-stroke: {(entry.subtitleOutlineWidth ?? 4) * videoScale}px {entry.subtitleOutlineColor ?? '#000000'}; paint-order: stroke fill; text-align: {entry.subtitleTextAlign ?? 'center'}; {subtitleAnimStyle(entry, compositionTime)}"
+									style="left: {entry.x * 100}%; top: {entry.y * 100}%; max-width: {(entry.subtitleMaxWidth ?? 900) * videoScale}px; font-size: {(entry.subtitleFontSize ?? 48) * videoScale}px; font-weight: {entry.subtitleFontWeight ?? 700}; color: {entry.subtitleFontColor ?? '#FFFFFF'}; -webkit-text-stroke: {(entry.subtitleOutlineWidth ?? 4) * videoScale}px {entry.subtitleOutlineColor ?? '#000000'}; paint-order: stroke fill; text-align: {entry.subtitleTextAlign ?? 'center'}; {overlayAnimStyle(entry, compositionTime, true)}"
 									onpointerdown={(e) => handleOverlayPointerDown(e, entry.id)}
 									onpointermove={handleOverlayPointerMove}
 									onpointerup={handleOverlayPointerUp}
@@ -1620,7 +1730,7 @@
 									<div
 										class="chat-bubble"
 										class:bubble-selected={selectedEffectId === entry.id}
-										style="left: {entry.x * 100}%; top: {entry.y * 100}%"
+										style="left: {entry.x * 100}%; top: {entry.y * 100}%; {overlayAnimStyle(entry, compositionTime)}"
 										onpointerdown={(e) => handleOverlayPointerDown(e, entry.id)}
 										onpointermove={handleOverlayPointerMove}
 										onpointerup={handleOverlayPointerUp}
@@ -1694,6 +1804,7 @@
 						{@const isChatPanel = selEffect.type === 'twitch-chat'}
 						{@const isZoom = selEffect.type === 'zoom'}
 						{@const isSubtitle = selEffect.type === 'subtitle'}
+						{@const isImage = selEffect.type === 'image'}
 						<div class="props-header">
 							<h3 class="props-title">Effect Properties</h3>
 							<button class="btn-deselect" onclick={() => selectedEffectId = null} title="Deselect">&times;</button>
@@ -1702,7 +1813,7 @@
 						<div class="props-info">
 							<div class="props-row">
 								<span class="props-label">Type</span>
-								<span class="props-value">{isZoom ? 'Zoom & Pan' : isChatPanel ? 'Chat Panel' : isSubtitle ? 'Subtitle' : 'Chat Message'}</span>
+								<span class="props-value">{isZoom ? 'Zoom & Pan' : isChatPanel ? 'Chat Panel' : isSubtitle ? 'Subtitle' : isImage ? 'Image' : 'Chat Message'}</span>
 							</div>
 							{#if selEffect.type === 'chat-message'}
 								<div class="props-row">
@@ -1968,59 +2079,96 @@
 										<option value="right">Right</option>
 									</select>
 								</div>
-								<div class="prop-field" style="margin-top: 8px">
-									<label class="prop-label" style="font-weight:600;color:#34d399">Animation</label>
-								</div>
+							{:else if isImage}
+								{#if selEffect.imageId}
+									<div class="prop-field">
+										<label class="prop-label">Preview</label>
+										<img src="/api/overlay-image/{selEffect.imageId}" alt="overlay" style="max-width: 100%; max-height: 80px; border-radius: 4px; margin-top: 2px" />
+									</div>
+								{/if}
 								<div class="prop-field">
-									<label class="prop-label">In Effect</label>
-									<select
-										class="prop-input"
-										value={selEffect.subtitleAnimIn ?? 'none'}
-										onchange={(e) => updateEffectEntry(selEffect.id, { subtitleAnimIn: (e.target as HTMLSelectElement).value as any })}
-									>
-										<option value="none">None</option>
-										<option value="fade">Fade In</option>
-										<option value="pop">Pop</option>
-										<option value="slide-up">Slide Up</option>
-										<option value="slide-down">Slide Down</option>
-										<option value="slide-left">Slide Left</option>
-										<option value="slide-right">Slide Right</option>
-										<option value="bounce">Bounce</option>
-									</select>
-								</div>
-								<div class="prop-field">
-									<label class="prop-label">Out Effect</label>
-									<select
-										class="prop-input"
-										value={selEffect.subtitleAnimOut ?? 'none'}
-										onchange={(e) => updateEffectEntry(selEffect.id, { subtitleAnimOut: (e.target as HTMLSelectElement).value as any })}
-									>
-										<option value="none">None</option>
-										<option value="fade">Fade Out</option>
-										<option value="pop">Pop</option>
-										<option value="slide-up">Slide Up</option>
-										<option value="slide-down">Slide Down</option>
-										<option value="slide-left">Slide Left</option>
-										<option value="slide-right">Slide Right</option>
-										<option value="bounce">Bounce</option>
-									</select>
-								</div>
-								<div class="prop-field">
-									<label class="prop-label">Anim Duration (s)</label>
+									<label class="prop-label">Scale</label>
 									<input
 										type="number"
 										class="prop-input"
 										min="0.1"
-										max="2"
-										step="0.05"
-										value={selEffect.subtitleAnimDuration ?? 0.3}
-										onchange={(e) => updateEffectEntry(selEffect.id, { subtitleAnimDuration: +(e.target as HTMLInputElement).value })}
+										max="5"
+										step="0.1"
+										value={selEffect.imageScale ?? 1}
+										onchange={(e) => updateEffectEntry(selEffect.id, { imageScale: +(e.target as HTMLInputElement).value })}
 									/>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Opacity</label>
+									<input
+										type="range"
+										class="prop-input"
+										min="0"
+										max="1"
+										step="0.05"
+										value={selEffect.imageOpacity ?? 1}
+										oninput={(e) => updateEffectEntry(selEffect.id, { imageOpacity: +(e.target as HTMLInputElement).value })}
+									/>
+									<span style="font-size: 0.6rem; color: #94a3b8">{(selEffect.imageOpacity ?? 1).toFixed(2)}</span>
 								</div>
 							{/if}
 						</div>
 
-						{#if !isChatPanel && !isZoom && !isSubtitle && msg}
+						{#if !isZoom}
+						<div class="props-section">
+							<div class="prop-field" style="margin-top: 4px">
+								<label class="prop-label" style="font-weight:600;color:#94a3b8">Animation</label>
+							</div>
+							<div class="prop-field">
+								<label class="prop-label">In Effect</label>
+								<select
+									class="prop-input"
+									value={selEffect.animIn ?? 'none'}
+									onchange={(e) => updateEffectEntry(selEffect.id, { animIn: (e.target as HTMLSelectElement).value as any })}
+								>
+									<option value="none">None</option>
+									<option value="fade">Fade In</option>
+									<option value="pop">Pop</option>
+									<option value="slide-up">Slide Up</option>
+									<option value="slide-down">Slide Down</option>
+									<option value="slide-left">Slide Left</option>
+									<option value="slide-right">Slide Right</option>
+									<option value="bounce">Bounce</option>
+								</select>
+							</div>
+							<div class="prop-field">
+								<label class="prop-label">Out Effect</label>
+								<select
+									class="prop-input"
+									value={selEffect.animOut ?? 'none'}
+									onchange={(e) => updateEffectEntry(selEffect.id, { animOut: (e.target as HTMLSelectElement).value as any })}
+								>
+									<option value="none">None</option>
+									<option value="fade">Fade Out</option>
+									<option value="pop">Pop</option>
+									<option value="slide-up">Slide Up</option>
+									<option value="slide-down">Slide Down</option>
+									<option value="slide-left">Slide Left</option>
+									<option value="slide-right">Slide Right</option>
+									<option value="bounce">Bounce</option>
+								</select>
+							</div>
+							<div class="prop-field">
+								<label class="prop-label">Anim Duration (s)</label>
+								<input
+									type="number"
+									class="prop-input"
+									min="0.1"
+									max="2"
+									step="0.05"
+									value={selEffect.animDuration ?? 0.3}
+									onchange={(e) => updateEffectEntry(selEffect.id, { animDuration: +(e.target as HTMLInputElement).value })}
+								/>
+							</div>
+						</div>
+						{/if}
+
+						{#if !isChatPanel && !isZoom && !isSubtitle && !isImage && msg}
 							<div class="props-section">
 								<label class="prop-label">Message Preview</label>
 								<div class="effect-msg-preview">
@@ -2143,6 +2291,36 @@
 						{/if}
 					</div>
 
+					<div class="props-section">
+						<button class="prop-label censor-toggle" onclick={() => censorExpanded = !censorExpanded}>
+							Censor Terms ({censorTerms.length}) {censorExpanded ? '\u25B4' : '\u25BE'}
+						</button>
+						{#if censorExpanded}
+							<div class="censor-add">
+								<input
+									type="text"
+									class="prop-input"
+									placeholder="Add term..."
+									bind:value={newCensorTerm}
+									onkeydown={(e) => { if (e.key === 'Enter') handleAddCensorTerm(); }}
+								/>
+								<button class="btn-censor-add" onclick={handleAddCensorTerm}>+</button>
+							</div>
+							{#if censorTerms.length > 0}
+								<div class="censor-list">
+									{#each censorTerms as term}
+										<div class="censor-item">
+											<span class="censor-term">{term}</span>
+											<button class="btn-censor-del" onclick={() => handleRemoveCensorTerm(term)}>&times;</button>
+										</div>
+									{/each}
+								</div>
+							{:else}
+								<span class="censor-empty">No terms added</span>
+							{/if}
+						{/if}
+					</div>
+
 					<div class="props-summary">
 						<span>{entries.length} clip{entries.length !== 1 ? 's' : ''}</span>
 						<span class="props-dot">&middot;</span>
@@ -2199,6 +2377,7 @@
 					<button class="btn-tl btn-tl-sm btn-fx-subtitle" onclick={addSubtitleEffect} title="Add subtitle text overlay">
 						+ Subtitle
 					</button>
+					<span class="btn-tl btn-tl-sm btn-fx-image" title="Drag an image file onto the video preview to add an image overlay" style="cursor: default; opacity: 0.7">+ Image (Drop)</span>
 					<button class="btn-tl btn-tl-sm" class:btn-chat-active={chatPanelOpen} onclick={() => { chatPanelOpen = !chatPanelOpen; }} title="Toggle chat panel">
 						{chatPanelOpen ? 'Hide Chat' : 'Chat'}
 					</button>
@@ -2305,6 +2484,7 @@
 												class:effect-chat-panel={isChatPanel}
 												class:effect-zoom={entry.type === 'zoom'}
 												class:effect-subtitle={entry.type === 'subtitle'}
+																class:effect-image={entry.type === 'image'}
 												style="left: {leftPx}px; width: {widthPx}px"
 												onclick={(e) => handleEffectClick(e, entry.id)}
 												onmousedown={(e) => handleEffectMoveStart(e, entry.id)}
@@ -2318,6 +2498,8 @@
 														Chat Panel
 													{:else if entry.type === 'subtitle'}
 														{entry.subtitleText?.slice(0, 20) ?? 'Subtitle'}{(entry.subtitleText?.length ?? 0) > 20 ? '...' : ''}
+													{:else if entry.type === 'image'}
+														Image
 													{:else}
 														{emsg?.username ?? entry.twitchId?.slice(0, 8) ?? '?'}
 													{/if}
@@ -2826,6 +3008,76 @@
 		background: #4ade80;
 	}
 
+	/* Censor terms UI */
+	.censor-toggle {
+		cursor: pointer;
+		background: none;
+		border: none;
+		width: 100%;
+		text-align: left;
+		padding: 0;
+	}
+
+	.censor-add {
+		display: flex;
+		gap: 4px;
+		margin-bottom: 6px;
+	}
+
+	.censor-add .prop-input {
+		flex: 1;
+	}
+
+	.btn-censor-add {
+		background: #3b82f6;
+		color: #fff;
+		border: none;
+		border-radius: 4px;
+		width: 28px;
+		cursor: pointer;
+		font-size: 16px;
+	}
+
+	.btn-censor-add:hover {
+		background: #2563eb;
+	}
+
+	.censor-list {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 4px;
+	}
+
+	.censor-item {
+		display: inline-flex;
+		align-items: center;
+		gap: 2px;
+		background: #374151;
+		border-radius: 4px;
+		padding: 2px 6px;
+		font-size: 0.7rem;
+		color: #d1d5db;
+	}
+
+	.btn-censor-del {
+		background: none;
+		border: none;
+		color: #9ca3af;
+		cursor: pointer;
+		font-size: 14px;
+		padding: 0 2px;
+		line-height: 1;
+	}
+
+	.btn-censor-del:hover {
+		color: #ef4444;
+	}
+
+	.censor-empty {
+		font-size: 0.65rem;
+		color: #6b7280;
+	}
+
 	/* ============================================================
 	   TIMELINE AREA (bottom, spans both columns)
 	   ============================================================ */
@@ -3326,6 +3578,43 @@
 	.effect-subtitle {
 		background: rgba(52, 211, 153, 0.3);
 		border-color: rgba(52, 211, 153, 0.4);
+	}
+
+	.effect-image {
+		background: rgba(245, 158, 11, 0.3);
+		border-color: rgba(245, 158, 11, 0.4);
+	}
+
+	.btn-fx-image {
+		color: #f59e0b;
+		border: 1px solid rgba(245, 158, 11, 0.3);
+		background: rgba(245, 158, 11, 0.1);
+	}
+
+	/* Image overlay on video preview */
+	.image-overlay {
+		position: absolute;
+		cursor: grab;
+		pointer-events: auto;
+		line-height: 0;
+	}
+
+	.image-overlay.bubble-selected {
+		outline: 2px solid #f59e0b;
+		outline-offset: 2px;
+		border-radius: 2px;
+	}
+
+	.image-overlay img {
+		display: block;
+		pointer-events: none;
+	}
+
+	/* Drop zone visual feedback */
+	.image-drop-active {
+		outline: 2px dashed #f59e0b;
+		outline-offset: -2px;
+		background: rgba(245, 158, 11, 0.1);
 	}
 
 	/* Zoom preview overlay */

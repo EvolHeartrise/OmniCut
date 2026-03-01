@@ -240,6 +240,12 @@ export async function initDatabase(): Promise<void> {
 		-- Purge old-format thumbnail rows (schema changed to unified layer system)
 		DELETE FROM thumbnails;
 
+		CREATE TABLE IF NOT EXISTS censor_terms (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			term TEXT NOT NULL UNIQUE COLLATE NOCASE,
+			added_at INTEGER NOT NULL DEFAULT (unixepoch())
+		);
+
 		CREATE TABLE IF NOT EXISTS youtube_uploads (
 			id TEXT PRIMARY KEY,
 			export_id TEXT NOT NULL,

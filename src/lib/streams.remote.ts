@@ -41,7 +41,10 @@ import {
 	resolveCameraBounds as dbResolveCameraBounds,
 	deleteCameraBounds as dbDeleteCameraBounds,
 	loadCameraBoundsForChannel as dbLoadCameraBoundsForChannel,
-	loadChatMessageByTwitchId as dbLoadChatMessageByTwitchId
+	loadChatMessageByTwitchId as dbLoadChatMessageByTwitchId,
+	loadAllCensorTerms as dbLoadAllCensorTerms,
+	addCensorTerm as dbAddCensorTerm,
+	removeCensorTerm as dbRemoveCensorTerm
 } from '$lib/server/db/index.js';
 import {
 	twitchGql,
@@ -252,6 +255,11 @@ export const getWatchlist = query(async () => {
 	return { watchlist: dbLoadWatchlist() };
 });
 
+/** Load all censor terms from the database. */
+export const getCensorTerms = query(async () => {
+	return dbLoadAllCensorTerms();
+});
+
 // ---------------------------------------------------------------------------
 // Commands — Stream Management
 // ---------------------------------------------------------------------------
@@ -428,6 +436,20 @@ export const addToWatchlistCmd = command('unchecked', async (args: { login: stri
 export const removeFromWatchlistCmd = command('unchecked', async (args: { login: string; platform?: string }) => {
 	if (!args.login || typeof args.login !== 'string') throw new Error('Missing or invalid "login" field');
 	dbRemoveFromWatchlist(args.login.toLowerCase().trim(), args.platform || 'twitch');
+});
+
+/** Add a censor term. */
+export const addCensorTermCmd = command('unchecked', async (args: { term: string }) => {
+	if (!args.term?.trim()) throw new Error('term required');
+	dbAddCensorTerm(args.term.trim());
+	await getCensorTerms().refresh();
+});
+
+/** Remove a censor term. */
+export const removeCensorTermCmd = command('unchecked', async (args: { term: string }) => {
+	if (!args.term?.trim()) throw new Error('term required');
+	dbRemoveCensorTerm(args.term.trim());
+	await getCensorTerms().refresh();
 });
 
 // ---------------------------------------------------------------------------
@@ -694,6 +716,27 @@ export const aiEditImageCmd = command('unchecked', async (args: {
 	const { aiEditImage } = await import('$lib/server/thumbnailStore.js');
 	const resultBase64 = await aiEditImage(args.pngBase64, args.prompt);
 	return { pngBase64: resultBase64 };
+});
+
+/** Upload an overlay image (base64 data) → saves to data/overlays/ and returns ID + dimensions. */
+export const uploadOverlayImageCmd = command('unchecked', async (args: { data: string; filename: string }) => {
+	const { newOverlayImageId } = await import('$lib/ids.js');
+	const { loadImage } = await import('@napi-rs/canvas');
+	const path = await import('node:path');
+	const fs = await import('node:fs');
+
+	const OVERLAYS_DIR = path.resolve(process.cwd(), 'data', 'overlays');
+	if (!fs.existsSync(OVERLAYS_DIR)) fs.mkdirSync(OVERLAYS_DIR, { recursive: true });
+
+	const ext = path.extname(args.filename).toLowerCase() || '.png';
+	const id = newOverlayImageId();
+	const filePath = path.join(OVERLAYS_DIR, `${id}${ext}`);
+
+	const buffer = Buffer.from(args.data, 'base64');
+	fs.writeFileSync(filePath, buffer);
+
+	const img = await loadImage(buffer);
+	return { id: `${id}${ext}`, width: img.width, height: img.height };
 });
 
 /** Export selected clips by IDs (in order). */
