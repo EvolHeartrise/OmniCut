@@ -6,7 +6,7 @@
 import type { StreamInfo, ChatMessage } from './types.js';
 import type { VideoRecord } from '../types.js';
 import type { WordTimestamp } from './transcriber.js';
-import * as db from './persistence.js';
+import * as db from './db/index.js';
 
 // SSE clients for real-time updates
 const sseClients = new Set<(data: string) => void>();

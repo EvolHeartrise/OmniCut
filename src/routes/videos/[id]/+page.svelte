@@ -14,14 +14,20 @@
 		updateVideoCmd,
 		deleteVideoCmd,
 		exportVideoFromVideoCmd,
-		getMultiStreamTranscriptions
+		getMultiStreamTranscriptions,
+		getChatMessageByTwitchId
 	} from '$lib/streams.remote';
 	import { untrack } from 'svelte';
-	import { formatDuration, getClipLocalBounds, setupHls } from '$lib/utils.js';
-	import type { ClipEntry } from '$lib/types.js';
+	import { formatDuration, getClipLocalBounds, setupHls, usernameColor } from '$lib/utils.js';
+	import type { ClipEntry, EffectEntry } from '$lib/types.js';
 	import type { ClipRegion } from '$lib/stores/streams.js';
 	import { computeTickInterval, handleTimelineWheel, zoomIn as tzZoomIn, zoomOut as tzZoomOut } from '$lib/timeline.js';
 	import { TRACK_COLORS } from '$lib/constants.js';
+	import { nanoid } from 'nanoid';
+	import { parseEmotes, getThirdPartyEmotes, type ChatSegment, type EmoteMap } from '$lib/emoteParser.js';
+	import { resolveBadges, fetchTwitchBadges, type BadgeInfo } from '$lib/badgeParser.js';
+	import ClipChatPanel from '$lib/components/ClipChatPanel.svelte';
+	import ChatPanelPreview from '$lib/components/ChatPanelPreview.svelte';
 
 	let videoId = $derived(page.params.id as string);
 
@@ -31,9 +37,30 @@
 	// Local editable state (initialized from video, auto-saved on change)
 	let title = $state('');
 	let description = $state('');
-	let format = $state<'standard' | 'mobile_short' | 'chat_overlay'>('standard');
+	let format = $state<'standard' | 'mobile_short'>('standard');
 	let entries = $state<ClipEntry[]>([]);
 	let loaded = $state(false);
+
+	// --- Effect entries state ---
+	let effectEntries = $state<EffectEntry[]>([]);
+	let selectedEffectId = $state<string | null>(null);
+	let addingEffect = $state(false);
+	let addEffectTwitchId = $state('');
+	let draggingOverlay = $state<string | null>(null);
+	let dragOffset = $state({ x: 0, y: 0 });
+
+	interface ResolvedChatMessage {
+		username: string;
+		text: string;
+		color: string | null;
+		segments: ChatSegment[];
+		badges: BadgeInfo[];
+		twitchId: string;
+	}
+	let chatMessageCache = $state<Map<string, ResolvedChatMessage>>(new Map());
+
+	// Chat panel state
+	let chatPanelOpen = $state(false);
 
 	// Track whether we've initialized local state from the video
 	let initialized = $state(false);
@@ -45,8 +72,13 @@
 			description = video.description || '';
 			format = video.format;
 			entries = structuredClone(video.clipEntries);
+			effectEntries = structuredClone(video.effectEntries ?? []);
 			initialized = true;
 			loaded = true;
+			// Fetch chat message data for all effect entries
+			for (const entry of video.effectEntries ?? []) {
+				if (entry.twitchId) fetchChatMessage(entry.twitchId);
+			}
 		}
 	});
 
@@ -85,6 +117,7 @@
 				title: title.trim() || 'Untitled',
 				description: description.trim() || undefined,
 				clipEntries: entries,
+				effectEntries,
 				format
 			});
 			lastSavedAt = Date.now();
@@ -101,6 +134,7 @@
 		void description;
 		void format;
 		void JSON.stringify(entries);
+		void JSON.stringify(effectEntries);
 		if (initialized) scheduleSave();
 	});
 
@@ -264,15 +298,289 @@
 		entries = [...entries, { clipId }];
 	}
 
+	// --- Effect entry management ---
+	async function fetchChatMessage(twitchId: string) {
+		if (chatMessageCache.has(twitchId)) return;
+		try {
+			const msg = await getChatMessageByTwitchId({ twitchId });
+			if (!msg) return;
+			const stream = streamMap.get(msg.streamId);
+			const channel = stream?.channel ?? null;
+			const [badgeMap, thirdPartyEmotes] = await Promise.all([
+				fetchTwitchBadges(channel),
+				channel ? getThirdPartyEmotes(channel) : Promise.resolve(new Map() as EmoteMap)
+			]);
+			const segments = parseEmotes(msg.text, msg.emotes, thirdPartyEmotes);
+			const badges = resolveBadges(msg.badges, badgeMap);
+			chatMessageCache = new Map(chatMessageCache).set(twitchId, {
+				username: msg.username,
+				text: msg.text,
+				color: msg.color ?? null,
+				segments,
+				badges,
+				twitchId: msg.twitchId
+			});
+		} catch (err) {
+			console.error('Failed to fetch chat message:', err);
+		}
+	}
+
+	function addEffectEntry(twitchId: string) {
+		const id = nanoid(12);
+		const entry: EffectEntry = {
+			id,
+			type: 'chat-message',
+			startTime: compositionTime,
+			duration: 5,
+			x: 0.5,
+			y: 0.5,
+			twitchId
+		};
+		effectEntries = [...effectEntries, entry];
+		selectedEffectId = id;
+		fetchChatMessage(twitchId);
+	}
+
+	function addTwitchChatEffect() {
+		const id = nanoid(12);
+		const entry: EffectEntry = {
+			id,
+			type: 'twitch-chat',
+			startTime: compositionTime,
+			duration: 10,
+			x: 0.82,
+			y: 0.5,
+			panelWidth: 340,
+			panelHeight: 1080
+		};
+		effectEntries = [...effectEntries, entry];
+		selectedEffectId = id;
+	}
+
+	function addZoomEffect() {
+		const id = nanoid(12);
+		const entry: EffectEntry = {
+			id,
+			type: 'zoom',
+			startTime: compositionTime,
+			duration: 3,
+			x: 0, y: 0,
+			zoomStartX: 0, zoomStartY: 0, zoomStartW: 1,
+			zoomEndX: 0.25, zoomEndY: 0.25, zoomEndW: 0.5
+		};
+		effectEntries = [...effectEntries, entry];
+		selectedEffectId = id;
+	}
+
+	function removeEffectEntry(id: string) {
+		effectEntries = effectEntries.filter((e) => e.id !== id);
+		if (selectedEffectId === id) selectedEffectId = null;
+	}
+
+	function updateEffectEntry(id: string, updates: Partial<EffectEntry>) {
+		effectEntries = effectEntries.map((e) => (e.id === id ? { ...e, ...updates } : e));
+	}
+
+	// Effects visible at current composition time (sorted by track: lower tracks first = rendered behind)
+	let visibleEffects = $derived(
+		effectEntries
+			.filter((e) => compositionTime >= e.startTime && compositionTime < e.startTime + e.duration)
+			.sort((a, b) => (a.track ?? 0) - (b.track ?? 0))
+	);
+
+	// Effects track count: N+1 where N is the number of tracks that have any effects
+	let effectTrackCount = $derived.by(() => {
+		const usedTracks = new Set(effectEntries.map((e) => e.track ?? 0));
+		return usedTracks.size + 1;
+	});
+
+	// --- Effect timeline drag state ---
+	let effectDragMode = $state<'none' | 'move' | 'trim-start' | 'trim-end'>('none');
+	let effectDragId = $state<string | null>(null);
+	let effectDragStartX = $state(0);
+	let effectDragStartY = $state(0);
+	let effectDragStartTrack = $state(0);
+	let effectDragStartValue = $state(0);
+	let effectDragEndTime = $state(0); // end time at drag start (for trim-start)
+
+	function handleEffectClick(e: MouseEvent, id: string) {
+		e.stopPropagation();
+		selectedEffectId = id;
+		selectedIndex = null; // deselect clip
+	}
+
+	function handleEffectMoveStart(e: MouseEvent, id: string) {
+		if ((e.target as HTMLElement).closest('.trim-handle')) return;
+		e.stopPropagation();
+		e.preventDefault();
+		effectDragMode = 'move';
+		effectDragId = id;
+		effectDragStartX = e.clientX;
+		effectDragStartY = e.clientY;
+		const entry = effectEntries.find((ee) => ee.id === id);
+		effectDragStartValue = entry?.startTime ?? 0;
+		effectDragStartTrack = entry?.track ?? 0;
+		selectedEffectId = id;
+		selectedIndex = null;
+		window.addEventListener('mousemove', handleEffectDragMove);
+		window.addEventListener('mouseup', handleEffectDragEnd);
+	}
+
+	function handleEffectTrimStart(e: MouseEvent, id: string) {
+		e.stopPropagation();
+		e.preventDefault();
+		effectDragMode = 'trim-start';
+		effectDragId = id;
+		effectDragStartX = e.clientX;
+		const entry = effectEntries.find((ee) => ee.id === id);
+		effectDragStartValue = entry?.startTime ?? 0;
+		effectDragEndTime = (entry?.startTime ?? 0) + (entry?.duration ?? 5);
+		window.addEventListener('mousemove', handleEffectDragMove);
+		window.addEventListener('mouseup', handleEffectDragEnd);
+	}
+
+	function handleEffectTrimEnd(e: MouseEvent, id: string) {
+		e.stopPropagation();
+		e.preventDefault();
+		effectDragMode = 'trim-end';
+		effectDragId = id;
+		effectDragStartX = e.clientX;
+		const entry = effectEntries.find((ee) => ee.id === id);
+		effectDragStartValue = entry?.duration ?? 5;
+		window.addEventListener('mousemove', handleEffectDragMove);
+		window.addEventListener('mouseup', handleEffectDragEnd);
+	}
+
+	function handleEffectDragMove(e: MouseEvent) {
+		if (!effectDragId) return;
+		const deltaSec = (e.clientX - effectDragStartX) / pixelsPerSecond;
+		if (effectDragMode === 'move') {
+			// Vertical: each track row is 30px; dragging up = higher track (rows go high→low)
+			const deltaRows = Math.round((effectDragStartY - e.clientY) / 30);
+			const newTrack = Math.max(0, effectDragStartTrack + deltaRows);
+			updateEffectEntry(effectDragId, { startTime: Math.max(0, effectDragStartValue + deltaSec), track: newTrack });
+		} else if (effectDragMode === 'trim-start') {
+			const newStart = Math.max(0, effectDragStartValue + deltaSec);
+			const newDur = effectDragEndTime - newStart;
+			if (newDur >= 0.1) {
+				updateEffectEntry(effectDragId, { startTime: newStart, duration: newDur });
+			}
+		} else if (effectDragMode === 'trim-end') {
+			const newDur = Math.max(0.1, effectDragStartValue + deltaSec);
+			updateEffectEntry(effectDragId, { duration: newDur });
+		}
+	}
+
+	function handleEffectDragEnd() {
+		effectDragMode = 'none';
+		effectDragId = null;
+		window.removeEventListener('mousemove', handleEffectDragMove);
+		window.removeEventListener('mouseup', handleEffectDragEnd);
+	}
+
+	// --- Overlay drag (position on video) ---
+	let overlayContainerEl = $state<HTMLDivElement | null>(null);
+
+	function handleOverlayPointerDown(e: PointerEvent, id: string) {
+		e.preventDefault();
+		e.stopPropagation();
+		draggingOverlay = id;
+		const entry = effectEntries.find((ee) => ee.id === id);
+		if (!entry || !overlayContainerEl) return;
+		const rect = overlayContainerEl.getBoundingClientRect();
+		dragOffset = {
+			x: e.clientX - rect.left - entry.x * rect.width,
+			y: e.clientY - rect.top - entry.y * rect.height
+		};
+		(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+	}
+
+	function handleOverlayPointerMove(e: PointerEvent) {
+		if (!draggingOverlay || !overlayContainerEl) return;
+		const rect = overlayContainerEl.getBoundingClientRect();
+		const x = Math.max(0, Math.min(1, (e.clientX - rect.left - dragOffset.x) / rect.width));
+		const y = Math.max(0, Math.min(1, (e.clientY - rect.top - dragOffset.y) / rect.height));
+		updateEffectEntry(draggingOverlay, { x, y });
+	}
+
+	function handleOverlayPointerUp() {
+		draggingOverlay = null;
+	}
+
 	// --- Preview ---
 	let previewVideoEl = $state<HTMLVideoElement | null>(null);
+	let previewPlayerAreaEl = $state<HTMLDivElement | null>(null);
 	let previewHls: Hls | null = null;
 	let previewPlaying = $state(false);
 	let previewProgress = $state(0);
 	let previewCurrentTime = $state('0:00');
+
+	// Track the video's actual rendered bounds within the player area (object-fit: contain)
+	let videoBounds = $state({ left: 0, top: 0, width: 0, height: 0 });
+	// Source video dimensions — updated alongside videoBounds so they stay in sync
+	let sourceVideoSize = $state({ w: 1920, h: 1080 });
+	let videoScale = $derived(videoBounds.width > 0 ? videoBounds.width / sourceVideoSize.w : 1);
+
+	function updateVideoBounds() {
+		const video = previewVideoEl;
+		const container = previewPlayerAreaEl;
+		if (!video || !container) return;
+		const vw = video.videoWidth;
+		const vh = video.videoHeight;
+		if (!vw || !vh) return;
+		const rect = container.getBoundingClientRect();
+		const containerAR = rect.width / rect.height;
+		const videoAR = vw / vh;
+		let renderW: number, renderH: number, renderX: number, renderY: number;
+		if (videoAR > containerAR) {
+			// Video is wider — pillarboxed top/bottom (actually letterboxed means bars on sides, but here video fills width)
+			renderW = rect.width;
+			renderH = rect.width / videoAR;
+			renderX = 0;
+			renderY = (rect.height - renderH) / 2;
+		} else {
+			// Video is taller — pillarboxed left/right
+			renderH = rect.height;
+			renderW = rect.height * videoAR;
+			renderX = (rect.width - renderW) / 2;
+			renderY = 0;
+		}
+		videoBounds = { left: renderX, top: renderY, width: renderW, height: renderH };
+		sourceVideoSize = { w: vw, h: vh };
+	}
+
+	// Keep video bounds updated on resize
+	$effect(() => {
+		const container = previewPlayerAreaEl;
+		const video = previewVideoEl;
+		if (!container || !video) return;
+		const ro = new ResizeObserver(() => updateVideoBounds());
+		ro.observe(container);
+		const onMeta = () => updateVideoBounds();
+		video.addEventListener('loadedmetadata', onMeta);
+		video.addEventListener('resize', onMeta);
+		return () => {
+			ro.disconnect();
+			video.removeEventListener('loadedmetadata', onMeta);
+			video.removeEventListener('resize', onMeta);
+		};
+	});
 	let isSeeking = $state(false);
 	let currentPreviewIndex = $state(0);
 	let previewReady = $state(false);
+
+	// --- Chat panel derived state ---
+	let currentClipRegion = $derived(
+		entries[currentPreviewIndex] ? resolveClip(entries[currentPreviewIndex].clipId) ?? null : null
+	);
+	let currentClipBounds = $derived(
+		currentClipRegion ? clipBounds(currentClipRegion) : null
+	);
+	let chatLocalTime = $state(0);
+
+	function handleChatSeek(localTime: number) {
+		if (previewVideoEl) previewVideoEl.currentTime = localTime;
+	}
 
 	// --- Waveform + transcription (per-clip) ---
 	const WAVEFORM_BINS = 800;
@@ -304,8 +612,16 @@
 	}
 
 	// Auto-initialize preview on load
+	// Guard: also wait for streamMap to have the first clip's stream data.
+	// On direct page load, refreshStreams() in the layout may not have completed yet
+	// when `initialized` becomes true, so streamMap would be empty and loadPreviewClip
+	// would silently fail. By reading streamMap.size here, the effect re-runs when
+	// streams arrive.
 	$effect(() => {
 		if (initialized && entries.length > 0 && previewVideoEl && !previewReady) {
+			// Ensure the first clip's stream is available
+			const firstClip = resolveClip(entries[0].clipId);
+			if (!firstClip || !streamMap.get(firstClip.streamId)) return;
 			previewReady = true;
 			loadPreviewClip(0, false);
 		}
@@ -499,6 +815,7 @@
 
 	function handlePreviewTimeUpdate() {
 		if (!previewVideoEl || entries.length === 0) return;
+		chatLocalTime = previewVideoEl.currentTime;
 		const entry = entries[currentPreviewIndex];
 		if (!entry) return;
 		const clip = resolveClip(entry.clipId);
@@ -600,12 +917,20 @@
 		previewPlaying = !previewPlaying;
 	}
 
-	// Clip-change detection: reset waveform, start new scan, fetch transcription
-	let prevWaveformIndex = -1;
+	// Clip-change detection: reset waveform, start new scan, fetch transcription.
+	// We build a reactive key from the preview index + whether the clip/stream data
+	// is available. This way the effect re-fires when stores populate (e.g. on direct
+	// page load where refreshStreams() completes after initial render).
+	let prevWaveformKey = '';
 	$effect(() => {
 		const idx = currentPreviewIndex;
-		if (idx === prevWaveformIndex) return;
-		prevWaveformIndex = idx;
+		const entry = entries[idx];
+		const clip = entry ? resolveClip(entry.clipId) : undefined;
+		const stream = clip ? streamMap.get(clip.streamId) : undefined;
+		// Build a key that changes when the index changes OR when data becomes available
+		const key = `${idx}:${clip?.id ?? ''}:${stream?.id ?? ''}`;
+		if (key === prevWaveformKey) return;
+		prevWaveformKey = key;
 
 		// Reset waveform
 		clipProgress = 0;
@@ -614,8 +939,6 @@
 		stopWaveformScan();
 		transcriptionRegions = [];
 
-		const entry = entries[idx];
-		const clip = entry ? untrack(() => resolveClip(entry.clipId)) : undefined;
 		if (!entry || !clip) {
 			clipDurationText = '0:00';
 			return;
@@ -878,13 +1201,17 @@
 			doZoomOut();
 		} else if (e.key === 'Delete' || e.key === 'Backspace') {
 			e.preventDefault();
-			if (selectedIndex !== null) {
+			if (selectedEffectId) {
+				removeEffectEntry(selectedEffectId);
+			} else if (selectedIndex !== null) {
 				removeEntry(selectedIndex);
 			}
 		} else if (e.key === 'Escape') {
 			e.preventDefault();
 			selectedIndex = null;
+			selectedEffectId = null;
 			showClipPicker = false;
+			addingEffect = false;
 		}
 	}
 
@@ -921,7 +1248,8 @@
 		<div class="nle-layout">
 			<!-- TOP ROW: Preview + Properties -->
 			<div class="preview-panel">
-				<div class="preview-player-area">
+				<div class="preview-main">
+				<div class="preview-player-area" bind:this={previewPlayerAreaEl}>
 					<!-- svelte-ignore a11y_media_has_caption -->
 					<video
 						bind:this={previewVideoEl}
@@ -929,6 +1257,82 @@
 						playsinline
 						class="preview-video"
 					></video>
+					<!-- Effect overlays on video — positioned to match the video's actual rendered area -->
+					<!-- svelte-ignore a11y_no_static_element_interactions -->
+					<div
+						class="effect-overlay-container"
+						bind:this={overlayContainerEl}
+						style="left:{videoBounds.left}px;top:{videoBounds.top}px;width:{videoBounds.width}px;height:{videoBounds.height}px;right:auto;bottom:auto"
+					>
+						{#each visibleEffects as entry (entry.id)}
+							{#if entry.type === 'twitch-chat'}
+								{@const pw = entry.panelWidth ?? 340}
+								{@const ph = entry.panelHeight ?? 1080}
+								{@const cs = entry.chatScale ?? 1}
+								<!-- svelte-ignore a11y_no_static_element_interactions -->
+								<div
+									class="chat-panel-placeholder"
+									class:bubble-selected={selectedEffectId === entry.id}
+									style="left: {entry.x * 100}%; top: {entry.y * 100}%; width: {pw * videoScale * cs}px; height: {ph * videoScale * cs}px"
+									onpointerdown={(e) => handleOverlayPointerDown(e, entry.id)}
+									onpointermove={handleOverlayPointerMove}
+									onpointerup={handleOverlayPointerUp}
+								>
+									<div class="chat-panel-scaler" style="width:{pw}px;height:{ph}px;transform:scale({videoScale * cs});transform-origin:0 0">
+										{#if currentClipRegion && currentClipBounds}
+											<ChatPanelPreview
+												streamId={currentClipRegion.streamId}
+												localStart={currentClipBounds.localStart}
+												localEnd={currentClipBounds.localEnd}
+												currentTime={chatLocalTime}
+												chatOffset={entry.chatOffset ?? 0}
+												fontWeight={entry.chatFontWeight ?? 400}
+											/>
+										{:else}
+											<span class="chat-panel-label">Chat Panel</span>
+										{/if}
+									</div>
+								</div>
+							{:else if entry.type === 'zoom'}
+								{@const progress = Math.max(0, Math.min(1, (compositionTime - entry.startTime) / Math.max(0.001, entry.duration)))}
+								{@const sx = entry.zoomStartX ?? 0}
+								{@const sy = entry.zoomStartY ?? 0}
+								{@const sw = entry.zoomStartW ?? 1}
+								{@const ex = entry.zoomEndX ?? 0}
+								{@const ey = entry.zoomEndY ?? 0}
+								{@const ew = entry.zoomEndW ?? 1}
+								{@const cx = sx + (ex - sx) * progress}
+								{@const cy = sy + (ey - sy) * progress}
+								{@const cw = sw + (ew - sw) * progress}
+								{@const ch = cw}
+								<!-- svelte-ignore a11y_no_static_element_interactions -->
+								<div
+									class="zoom-overlay"
+									class:zoom-selected={selectedEffectId === entry.id}
+									onclick={() => selectedEffectId = entry.id}
+								>
+									<div class="zoom-dim zoom-dim-top" style="height: {cy * 100}%"></div>
+									<div class="zoom-dim zoom-dim-bottom" style="height: {Math.max(0, (1 - cy - ch)) * 100}%"></div>
+									<div class="zoom-dim zoom-dim-left" style="top: {cy * 100}%; height: {ch * 100}%; width: {cx * 100}%"></div>
+									<div class="zoom-dim zoom-dim-right" style="top: {cy * 100}%; height: {ch * 100}%; width: {Math.max(0, (1 - cx - cw)) * 100}%"></div>
+									<div class="zoom-region" style="left: {cx * 100}%; top: {cy * 100}%; width: {cw * 100}%; height: {ch * 100}%"></div>
+								</div>
+							{:else}
+								{@const msg = entry.twitchId ? chatMessageCache.get(entry.twitchId) : undefined}
+								{#if msg}
+									<!-- svelte-ignore a11y_no_static_element_interactions -->
+									<div
+										class="chat-bubble"
+										class:bubble-selected={selectedEffectId === entry.id}
+										style="left: {entry.x * 100}%; top: {entry.y * 100}%"
+										onpointerdown={(e) => handleOverlayPointerDown(e, entry.id)}
+										onpointermove={handleOverlayPointerMove}
+										onpointerup={handleOverlayPointerUp}
+									>{#each msg.badges as badge}<img class="bubble-badge" src={badge.imageUrl} alt={badge.title} title={badge.title} />{/each}<span class="bubble-user" style="color: {msg.color || usernameColor(msg.username)}">{msg.username}</span><span class="bubble-sep">: </span>{#each msg.segments as seg}{#if seg.type === 'emote' && seg.emoteUrl}<img class="bubble-emote" src={seg.emoteUrl} alt={seg.text} title={seg.text} />{:else}<span class="bubble-text">{seg.text}</span>{/if}{/each}</div>
+								{/if}
+							{/if}
+						{/each}
+					</div>
 				</div>
 				<div class="video-controls">
 					<div class="timeline-row">
@@ -976,10 +1380,227 @@
 						<span class="vid-time">{clipDurationText}</span>
 					</div>
 				</div>
+				</div>
+				{#if chatPanelOpen}
+					<ClipChatPanel
+						clip={currentClipRegion}
+						currentLocalTime={chatLocalTime}
+						onseek={handleChatSeek}
+					/>
+				{/if}
 			</div>
 
 			<div class="properties-panel">
-				{#if selectedIndex !== null && entries[selectedIndex]}
+				{#if selectedEffectId}
+					{@const selEffect = effectEntries.find((e) => e.id === selectedEffectId)}
+					{#if selEffect}
+						{@const msg = selEffect.twitchId ? chatMessageCache.get(selEffect.twitchId) : undefined}
+						{@const isChatPanel = selEffect.type === 'twitch-chat'}
+						{@const isZoom = selEffect.type === 'zoom'}
+						<div class="props-header">
+							<h3 class="props-title">Effect Properties</h3>
+							<button class="btn-deselect" onclick={() => selectedEffectId = null} title="Deselect">&times;</button>
+						</div>
+
+						<div class="props-info">
+							<div class="props-row">
+								<span class="props-label">Type</span>
+								<span class="props-value">{isZoom ? 'Zoom & Pan' : isChatPanel ? 'Chat Panel' : 'Chat Message'}</span>
+							</div>
+							{#if selEffect.type === 'chat-message'}
+								<div class="props-row">
+									<span class="props-label">Twitch ID</span>
+									<span class="props-value" style="font-size: 0.55rem; word-break: break-all">{selEffect.twitchId ?? '—'}</span>
+								</div>
+							{/if}
+						</div>
+
+						<div class="props-section">
+							<div class="prop-field">
+								<label class="prop-label">Track</label>
+								<input
+									type="number"
+									class="prop-input"
+									min="0"
+									step="1"
+									value={selEffect.track ?? 0}
+									onchange={(e) => updateEffectEntry(selEffect.id, { track: Math.max(0, Math.round(+(e.target as HTMLInputElement).value)) })}
+								/>
+							</div>
+							<div class="prop-field">
+								<label class="prop-label">Start Time (s)</label>
+								<input
+									type="number"
+									class="prop-input"
+									min="0"
+									step="0.1"
+									value={selEffect.startTime}
+									onchange={(e) => updateEffectEntry(selEffect.id, { startTime: +(e.target as HTMLInputElement).value })}
+								/>
+							</div>
+							<div class="prop-field">
+								<label class="prop-label">Duration (s)</label>
+								<input
+									type="number"
+									class="prop-input"
+									min="0.1"
+									step="0.1"
+									value={selEffect.duration}
+									onchange={(e) => updateEffectEntry(selEffect.id, { duration: +(e.target as HTMLInputElement).value })}
+								/>
+							</div>
+							{#if !isZoom}
+							<div class="prop-field">
+								<label class="prop-label">X Position (0-1)</label>
+								<input
+									type="number"
+									class="prop-input"
+									min="0"
+									max="1"
+									step="0.01"
+									value={selEffect.x}
+									onchange={(e) => updateEffectEntry(selEffect.id, { x: +(e.target as HTMLInputElement).value })}
+								/>
+							</div>
+							<div class="prop-field">
+								<label class="prop-label">Y Position (0-1)</label>
+								<input
+									type="number"
+									class="prop-input"
+									min="0"
+									max="1"
+									step="0.01"
+									value={selEffect.y}
+									onchange={(e) => updateEffectEntry(selEffect.id, { y: +(e.target as HTMLInputElement).value })}
+								/>
+							</div>
+							{/if}
+							{#if isZoom}
+								<div class="prop-field">
+									<label class="prop-label" style="font-weight:600;color:#fbbf24">Start Region</label>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">X</label>
+									<input type="number" class="prop-input" min="0" max="1" step="0.01"
+										value={selEffect.zoomStartX ?? 0}
+										onchange={(e) => updateEffectEntry(selEffect.id, { zoomStartX: +(e.target as HTMLInputElement).value })}
+									/>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Y</label>
+									<input type="number" class="prop-input" min="0" max="1" step="0.01"
+										value={selEffect.zoomStartY ?? 0}
+										onchange={(e) => updateEffectEntry(selEffect.id, { zoomStartY: +(e.target as HTMLInputElement).value })}
+									/>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Width</label>
+									<input type="number" class="prop-input" min="0.05" max="1" step="0.01"
+										value={selEffect.zoomStartW ?? 1}
+										onchange={(e) => updateEffectEntry(selEffect.id, { zoomStartW: +(e.target as HTMLInputElement).value })}
+									/>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label" style="font-weight:600;color:#fbbf24;margin-top:4px">End Region</label>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">X</label>
+									<input type="number" class="prop-input" min="0" max="1" step="0.01"
+										value={selEffect.zoomEndX ?? 0}
+										onchange={(e) => updateEffectEntry(selEffect.id, { zoomEndX: +(e.target as HTMLInputElement).value })}
+									/>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Y</label>
+									<input type="number" class="prop-input" min="0" max="1" step="0.01"
+										value={selEffect.zoomEndY ?? 0}
+										onchange={(e) => updateEffectEntry(selEffect.id, { zoomEndY: +(e.target as HTMLInputElement).value })}
+									/>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Width</label>
+									<input type="number" class="prop-input" min="0.05" max="1" step="0.01"
+										value={selEffect.zoomEndW ?? 1}
+										onchange={(e) => updateEffectEntry(selEffect.id, { zoomEndW: +(e.target as HTMLInputElement).value })}
+									/>
+								</div>
+							{:else if isChatPanel}
+								<div class="prop-field">
+									<label class="prop-label">Panel Width (px)</label>
+									<input
+										type="number"
+										class="prop-input"
+										min="100"
+										max="1920"
+										step="10"
+										value={selEffect.panelWidth ?? 340}
+										onchange={(e) => updateEffectEntry(selEffect.id, { panelWidth: +(e.target as HTMLInputElement).value })}
+									/>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Panel Height (px)</label>
+									<input
+										type="number"
+										class="prop-input"
+										min="100"
+										max="1920"
+										step="10"
+										value={selEffect.panelHeight ?? 1080}
+										onchange={(e) => updateEffectEntry(selEffect.id, { panelHeight: +(e.target as HTMLInputElement).value })}
+									/>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Chat Offset (s)</label>
+									<input
+										type="number"
+										class="prop-input"
+										step="1"
+										value={selEffect.chatOffset ?? 0}
+										onchange={(e) => updateEffectEntry(selEffect.id, { chatOffset: +(e.target as HTMLInputElement).value })}
+									/>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Scale</label>
+									<input
+										type="number"
+										class="prop-input"
+										min="0.1"
+										max="5"
+										step="0.1"
+										value={selEffect.chatScale ?? 1}
+										onchange={(e) => updateEffectEntry(selEffect.id, { chatScale: +(e.target as HTMLInputElement).value })}
+									/>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Font Weight</label>
+									<input
+										type="number"
+										class="prop-input"
+										min="100"
+										max="900"
+										step="100"
+										value={selEffect.chatFontWeight ?? 400}
+										onchange={(e) => updateEffectEntry(selEffect.id, { chatFontWeight: +(e.target as HTMLInputElement).value })}
+									/>
+								</div>
+							{/if}
+						</div>
+
+						{#if !isChatPanel && !isZoom && msg}
+							<div class="props-section">
+								<label class="prop-label">Message Preview</label>
+								<div class="effect-msg-preview">
+									<span class="bubble-user" style="color: {msg.color || usernameColor(msg.username)}">{msg.username}</span>:
+									{msg.text}
+								</div>
+							</div>
+						{/if}
+
+						<button class="btn-remove-clip" onclick={() => removeEffectEntry(selEffect.id)}>
+							Remove Effect
+						</button>
+					{/if}
+				{:else if selectedIndex !== null && entries[selectedIndex]}
 					{@const selEntry = entries[selectedIndex]}
 					{@const selClip = resolveClip(selEntry.clipId)}
 					<div class="props-header">
@@ -1058,7 +1679,6 @@
 							<select id="v-format" class="prop-select" bind:value={format}>
 								<option value="standard">Standard (16:9)</option>
 								<option value="mobile_short">Mobile Short (9:16)</option>
-								<option value="chat_overlay">Chat Overlay</option>
 							</select>
 						</div>
 					</div>
@@ -1107,6 +1727,18 @@
 					<button class="btn-tl btn-tl-sm" onclick={() => { showClipPicker = !showClipPicker; }} title="Add clips">
 						{showClipPicker ? 'Done' : '+ Add Clips'}
 					</button>
+					<button class="btn-tl btn-tl-sm btn-fx" onclick={() => { addingEffect = !addingEffect; }} title="Add chat message effect">
+						{addingEffect ? 'Cancel' : '+ Chat Msg'}
+					</button>
+					<button class="btn-tl btn-tl-sm btn-fx-chat" onclick={addTwitchChatEffect} title="Add scrolling chat panel effect">
+						+ Chat Panel
+					</button>
+					<button class="btn-tl btn-tl-sm btn-fx-zoom" onclick={addZoomEffect} title="Add zoom & pan effect">
+						+ Zoom & Pan
+					</button>
+					<button class="btn-tl btn-tl-sm" class:btn-chat-active={chatPanelOpen} onclick={() => { chatPanelOpen = !chatPanelOpen; }} title="Toggle chat panel">
+						{chatPanelOpen ? 'Hide Chat' : 'Chat'}
+					</button>
 					<div class="tl-spacer"></div>
 					<button class="btn-tl btn-tl-sm" onclick={doZoomOut} title="Zoom out (-)">−</button>
 					<span class="tl-zoom">{pixelsPerSecond.toFixed(0)} px/s</span>
@@ -1138,11 +1770,37 @@
 					</div>
 				{/if}
 
+				<!-- Add effect input -->
+				{#if addingEffect}
+					<div class="add-effect-bar">
+						<span class="add-effect-label">Twitch Message ID:</span>
+						<input
+							type="text"
+							class="add-effect-input"
+							bind:value={addEffectTwitchId}
+							placeholder="Paste twitchId and press Enter..."
+							onkeydown={(e) => {
+								if (e.key === 'Enter' && addEffectTwitchId.trim()) {
+									addEffectEntry(addEffectTwitchId.trim());
+									addEffectTwitchId = '';
+									addingEffect = false;
+								} else if (e.key === 'Escape') {
+									addingEffect = false;
+								}
+							}}
+						/>
+					</div>
+				{/if}
+
 				<!-- Timeline body -->
 				<div class="tl-body">
 					<!-- Track labels -->
 					<div class="tl-labels">
 						<div class="tl-ruler-spacer"></div>
+						{#each { length: effectTrackCount } as _, i}
+							{@const trackIdx = effectTrackCount - 1 - i}
+							<div class="tl-label-row" style="height: 30px"><span class="tl-label-icon" style="color: #38bdf8">[FX{trackIdx > 0 ? trackIdx : ''}]</span><span class="tl-label-text">Effects</span></div>
+						{/each}
 						<div class="tl-label-row" style="height: 40px"><span class="tl-label-icon">[V]</span><span class="tl-label-text">Video</span></div>
 					</div>
 
@@ -1164,6 +1822,47 @@
 									</div>
 								{/each}
 							</div>
+
+							<!-- [FX] Effects Tracks (highest track at top = renders on top) -->
+							{#each { length: effectTrackCount } as _, i}
+								{@const trackIdx = effectTrackCount - 1 - i}
+								<div class="tl-track tl-track-effects" style="height: 30px">
+									{#each effectEntries.filter((e) => (e.track ?? 0) === trackIdx) as entry (entry.id)}
+										{@const leftPx = entry.startTime * pixelsPerSecond}
+										{@const widthPx = entry.duration * pixelsPerSecond}
+										{@const isVisible = leftPx + widthPx > viewportLeft - CULL_MARGIN && leftPx < viewportLeft + viewportWidth + CULL_MARGIN}
+										{@const isSelected = selectedEffectId === entry.id}
+										{@const emsg = entry.twitchId ? chatMessageCache.get(entry.twitchId) : undefined}
+										{@const isChatPanel = entry.type === 'twitch-chat'}
+										{#if isVisible}
+											<!-- svelte-ignore a11y_no_static_element_interactions -->
+											<div
+												class="effect-block"
+												class:selected={isSelected}
+												class:effect-chat-panel={isChatPanel}
+												class:effect-zoom={entry.type === 'zoom'}
+												style="left: {leftPx}px; width: {widthPx}px"
+												onclick={(e) => handleEffectClick(e, entry.id)}
+												onmousedown={(e) => handleEffectMoveStart(e, entry.id)}
+											>
+												<!-- svelte-ignore a11y_no_static_element_interactions -->
+												<div class="trim-handle trim-handle-start" onmousedown={(e) => handleEffectTrimStart(e, entry.id)}></div>
+												<span class="clip-label" style="font-size: 0.55rem">
+													{#if entry.type === 'zoom'}
+														Zoom & Pan
+													{:else if isChatPanel}
+														Chat Panel
+													{:else}
+														{emsg?.username ?? entry.twitchId?.slice(0, 8) ?? '?'}
+													{/if}
+												</span>
+												<!-- svelte-ignore a11y_no_static_element_interactions -->
+												<div class="trim-handle trim-handle-end" onmousedown={(e) => handleEffectTrimEnd(e, entry.id)}></div>
+											</div>
+										{/if}
+									{/each}
+								</div>
+							{/each}
 
 							<!-- [V] Video Track -->
 							<div class="tl-track tl-track-video" style="height: 40px">
@@ -1269,10 +1968,18 @@
 		grid-column: 1;
 		grid-row: 1;
 		display: flex;
-		flex-direction: column;
+		flex-direction: row;
 		overflow: hidden;
 		border-right: 1px solid #1a1a2e;
 		background: #0a0a1a;
+	}
+
+	.preview-main {
+		flex: 1;
+		min-width: 0;
+		display: flex;
+		flex-direction: column;
+		overflow: hidden;
 	}
 
 	.preview-player-area {
@@ -1282,6 +1989,7 @@
 		justify-content: center;
 		background: #000;
 		min-height: 0;
+		position: relative;
 	}
 
 	.preview-video {
@@ -2012,5 +2720,270 @@
 		color: #555;
 		font-size: 0.8rem;
 		pointer-events: none;
+	}
+
+	/* ============================================================
+	   EFFECTS TRACK & OVERLAYS
+	   ============================================================ */
+
+	/* --- Add effect bar --- */
+	.add-effect-bar {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		padding: 6px 12px;
+		background: #0f0f23;
+		border-bottom: 1px solid #1a1a2e;
+		flex-shrink: 0;
+	}
+
+	.add-effect-label {
+		font-size: 0.7rem;
+		color: #38bdf8;
+		white-space: nowrap;
+		font-weight: 600;
+	}
+
+	.add-effect-input {
+		flex: 1;
+		background: #1a1a2e;
+		border: 1px solid #2a2a4a;
+		color: #e0e0ff;
+		font-size: 0.75rem;
+		padding: 5px 10px;
+		border-radius: 4px;
+		outline: none;
+		font-family: monospace;
+	}
+
+	.add-effect-input:focus {
+		border-color: #38bdf8;
+	}
+
+	/* --- Effect blocks on timeline --- */
+	.tl-track-effects {
+		background: rgba(56, 189, 248, 0.03);
+	}
+
+	.effect-block {
+		position: absolute;
+		top: 3px;
+		height: calc(100% - 6px);
+		border-radius: 4px;
+		cursor: grab;
+		overflow: hidden;
+		display: flex;
+		align-items: center;
+		background: rgba(56, 189, 248, 0.3);
+		border: 1px solid rgba(56, 189, 248, 0.4);
+		transition: opacity 0.1s;
+	}
+
+	.effect-block:hover {
+		filter: brightness(1.15);
+	}
+
+	.effect-block.selected {
+		outline: 2px solid #fff;
+		outline-offset: -1px;
+		z-index: 2;
+	}
+
+	.btn-fx {
+		color: #38bdf8;
+		border: 1px solid rgba(56, 189, 248, 0.3);
+		background: rgba(56, 189, 248, 0.1);
+	}
+
+	.btn-fx:hover {
+		background: rgba(56, 189, 248, 0.2);
+		color: #7dd3fc;
+	}
+
+	.btn-fx-chat {
+		color: #c084fc;
+		border: 1px solid rgba(192, 132, 252, 0.3);
+		background: rgba(192, 132, 252, 0.1);
+	}
+
+	.btn-fx-chat:hover {
+		background: rgba(192, 132, 252, 0.2);
+		color: #d8b4fe;
+	}
+
+	.effect-chat-panel {
+		background: rgba(168, 85, 247, 0.3);
+		border-color: rgba(168, 85, 247, 0.4);
+	}
+
+	.btn-fx-zoom {
+		color: #fbbf24;
+		border: 1px solid rgba(251, 191, 36, 0.3);
+		background: rgba(251, 191, 36, 0.1);
+	}
+
+	.btn-fx-zoom:hover {
+		background: rgba(251, 191, 36, 0.2);
+		color: #fde68a;
+	}
+
+	.effect-zoom {
+		background: rgba(251, 191, 36, 0.3);
+		border-color: rgba(251, 191, 36, 0.4);
+	}
+
+	/* Zoom preview overlay */
+	.zoom-overlay {
+		position: absolute;
+		inset: 0;
+		pointer-events: auto;
+		cursor: pointer;
+	}
+
+	.zoom-dim {
+		position: absolute;
+		background: rgba(0, 0, 0, 0.5);
+	}
+
+	.zoom-dim-top {
+		top: 0;
+		left: 0;
+		width: 100%;
+	}
+
+	.zoom-dim-bottom {
+		bottom: 0;
+		left: 0;
+		width: 100%;
+	}
+
+	.zoom-dim-left {
+		left: 0;
+	}
+
+	.zoom-dim-right {
+		right: 0;
+	}
+
+	.zoom-region {
+		position: absolute;
+		border: 2px solid #fbbf24;
+		border-radius: 2px;
+		box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.3);
+	}
+
+	.zoom-selected .zoom-region {
+		border-color: #fff;
+		box-shadow: 0 0 8px rgba(251, 191, 36, 0.6), 0 0 0 1px rgba(0, 0, 0, 0.3);
+	}
+
+	.chat-panel-placeholder {
+		position: absolute;
+		background: rgba(168, 85, 247, 0.2);
+		border: 2px dashed rgba(168, 85, 247, 0.6);
+		border-radius: 4px;
+		overflow: hidden;
+		cursor: move;
+		pointer-events: auto;
+		touch-action: none;
+	}
+
+	.chat-panel-scaler {
+		overflow: hidden;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.chat-panel-placeholder.bubble-selected {
+		border-color: #fff;
+		box-shadow: 0 0 8px rgba(168, 85, 247, 0.5);
+	}
+
+	.chat-panel-label {
+		color: rgba(255, 255, 255, 0.6);
+		font-size: 0.7rem;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.5px;
+		pointer-events: none;
+	}
+
+	.btn-chat-active {
+		background: rgba(145, 71, 255, 0.2);
+		border: 1px solid rgba(145, 71, 255, 0.4);
+		color: #bf94ff;
+	}
+
+	/* --- Effect overlay on video --- */
+	.effect-overlay-container {
+		position: absolute;
+		top: 0;
+		left: 0;
+		right: 0;
+		bottom: 0;
+		pointer-events: none;
+	}
+
+	.chat-bubble {
+		position: absolute;
+		pointer-events: auto;
+		background: rgba(24, 24, 27, 0.85);
+		padding: 4px 8px;
+		max-width: 400px;
+		font-size: 13px;
+		line-height: 1.4;
+		word-break: break-word;
+		cursor: grab;
+		user-select: none;
+		touch-action: none;
+		color: #efeff1;
+		font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+		text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+	}
+
+	.chat-bubble.bubble-selected {
+		outline: 2px solid #38bdf8;
+		outline-offset: 1px;
+	}
+
+	.bubble-badge {
+		display: inline-block;
+		width: 18px;
+		height: 18px;
+		vertical-align: middle;
+		margin-right: 3px;
+		border-radius: 2px;
+	}
+
+	.bubble-user {
+		font-weight: 700;
+		font-size: 13px;
+	}
+
+	.bubble-sep {
+		color: #efeff1;
+		margin-right: 4px;
+	}
+
+	.bubble-text {
+		color: #efeff1;
+	}
+
+	.bubble-emote {
+		display: inline-block;
+		height: 1.75em;
+		vertical-align: middle;
+		margin: -2px 2px;
+	}
+
+	.effect-msg-preview {
+		background: #1a1a2e;
+		padding: 6px 8px;
+		border-radius: 4px;
+		font-size: 0.7rem;
+		color: #ccc;
+		line-height: 1.3;
+		word-break: break-word;
 	}
 </style>

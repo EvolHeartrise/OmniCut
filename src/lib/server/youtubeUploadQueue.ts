@@ -5,8 +5,8 @@
  */
 
 import { newUploadId } from '../ids.js';
-import * as db from './persistence.js';
-import type { YouTubeUploadRecord } from './persistence.js';
+import * as db from './db/index.js';
+import type { YouTubeUploadRecord } from './db/index.js';
 import { uploadVideo, addToPlaylist, setThumbnail } from './youtubeClient.js';
 import { broadcastYouTubeUploadStatus } from './sseBroadcaster.js';
 import { SequentialQueue } from './sequentialQueue.js';

@@ -5,13 +5,15 @@
  */
 
 import * as path from 'node:path';
-import * as fs from 'node:fs';
-import type { ClipRegion, CameraBoundsEntry, ClipEntry } from '../types.js';
-import { parseRelevantSegments, ffmpegConcatEscape, buildConcatContent } from './hlsUtils.js';
+import type { ClipRegion, CameraBoundsEntry, ClipEntry, EffectEntry } from '../types.js';
 import { runFfmpeg } from './ffmpeg.js';
-import { detectNvenc, probeVideo, type StreamLookup } from './exporter.js';
-
-const EXPORTS_DIR = path.resolve(process.env.EXPORTS_DIR || path.join(process.cwd(), 'exports'));
+import { detectNvenc, probeVideo, resolveOverlappingEffects, resolveZoomEffects, buildZoomFilter, ZOOM_SUPERSAMPLE, type StreamLookup, type ClipContext } from './exporter.js';
+import { clearEffectRendererCache } from './effectRenderer.js';
+import { clearChatEffectCache } from './chatEffectRenderer.js';
+import {
+	resolveClip, buildAudioArgs, buildVideoEncoderArgs, createTempDir, cleanupTempDir,
+	concatClipFiles, buildOutputPath
+} from './exporterCommon.js';
 
 // Output dimensions
 const OUT_W = 1080;
@@ -33,62 +35,34 @@ export async function exportVerticalVideo(
 	verticalClips: VerticalClip[],
 	streamMap: Map<string, StreamLookup>,
 	filename: string,
-	onProgress: (message: string, step: number, totalSteps: number) => void
+	onProgress: (message: string, step: number, totalSteps: number) => void,
+	effectEntries?: EffectEntry[],
+	compOffsets?: number[],
+	channelMap?: Map<string, string>
 ): Promise<{ outputPath: string }> {
 	if (verticalClips.length === 0) {
 		throw new Error('No clips with camera bounds to export');
 	}
 
-	fs.mkdirSync(EXPORTS_DIR, { recursive: true });
-
 	const totalSteps = verticalClips.length + 1;
 	onProgress(`Starting vertical export: ${verticalClips.length} clips`, 0, totalSteps);
 
 	const useNvenc = await detectNvenc();
-	const tempDir = path.join(EXPORTS_DIR, `temp_vert_${Date.now()}`);
-	fs.mkdirSync(tempDir, { recursive: true });
+	const tempDir = createTempDir('vert');
 
 	try {
 		const verticalFiles: string[] = [];
 
 		for (let i = 0; i < verticalClips.length; i++) {
 			const { clip, cam, entry } = verticalClips[i];
-			const stream = streamMap.get(clip.streamId);
-			if (!stream) {
-				console.warn(`[vertical-export] Skipping clip ${i + 1} — stream ${clip.streamId} not found`);
-				continue;
-			}
+			const resolved = resolveClip(
+				clip, entry, streamMap.get(clip.streamId),
+				i, verticalClips.length, tempDir, 'vertical-export'
+			);
+			if (!resolved) continue;
 
-			// Apply trim offsets from clip entry
-			const trimStartOffset = entry?.trimStart ?? 0;
-			const trimEndOffset = entry?.trimEnd ?? 0;
-			const effectiveStart = clip.startTime + trimStartOffset;
-			const effectiveEnd = clip.endTime - trimEndOffset;
-			const speed = entry?.speed ?? 1;
-
-			if (effectiveEnd <= effectiveStart) {
-				console.warn(`[vertical-export] Skipping clip ${i + 1} — trim makes duration ≤ 0`);
-				continue;
-			}
-
-			const dur = effectiveEnd - effectiveStart;
+			const { dur, clipDur, speed, trimStart, concatPath, segments, localStart: clipLocalStart, localEnd: clipLocalEnd } = resolved;
 			onProgress(`Encoding clip ${i + 1}/${verticalClips.length} as vertical (${dur.toFixed(1)}s)`, i, totalSteps);
-
-			const anchor = stream.startedAt / 1000;
-			const localStart = effectiveStart - anchor + stream.offset;
-			const localEnd = effectiveEnd - anchor + stream.offset;
-			const playlistPath = path.join(stream.recordingDir, 'playlist.m3u8');
-
-			const segments = parseRelevantSegments(playlistPath, stream.recordingDir, localStart, localEnd);
-			if (segments.length === 0) {
-				console.warn(`[vertical-export] Skipping clip ${i + 1} — no segments`);
-				continue;
-			}
-
-			const concatPath = path.join(tempDir, `clip_${i}.concat.txt`);
-			fs.writeFileSync(concatPath, buildConcatContent(segments));
-
-			const trimStart = Math.max(0, localStart - segments[0].startTime);
 
 			// Probe source resolution from first segment
 			const probe = await probeVideo(segments[0].file);
@@ -106,63 +80,115 @@ export async function exportVerticalVideo(
 			// Compute cam panel height: scale cam to fill OUT_W, preserving aspect ratio, capped at MAX_CAM_H
 			const camAR = cw / Math.max(1, ch);
 			let camH = Math.round(OUT_W / camAR);
-			// Ensure even dimensions for h264
 			camH = Math.min(camH, MAX_CAM_H) & ~1;
 			const gameH = (OUT_H - camH) & ~1;
 
+			// Find overlapping effects for this clip
+			const clipCompStart = compOffsets?.[i] ?? 0;
+			const clipCompEnd = clipCompStart + clipDur;
+
+			// Resolve zoom effects first so we know if we need to supersample overlays
+			const clipZooms = resolveZoomEffects(effectEntries, clipCompStart, clipCompEnd, clipDur);
+			const hasZoom = clipZooms.length > 0;
+
+			const clipCtx: ClipContext | undefined = channelMap?.get(clip.streamId) ? {
+				streamId: clip.streamId,
+				channel: channelMap.get(clip.streamId)!,
+				streamLocalStart: clipLocalStart,
+				streamLocalEnd: clipLocalEnd
+			} : undefined;
+			const overlappingEffects = await resolveOverlappingEffects(
+				effectEntries, clipCompStart, clipCompEnd, clipDur, tempDir, i,
+				OUT_W, OUT_H, clipCtx,
+				hasZoom ? ZOOM_SUPERSAMPLE : 1
+			);
+
+			const extraInputs: string[] = [];
+			for (const eff of overlappingEffects) {
+				const itsoffset = ['-itsoffset', (trimStart + eff.localStart).toFixed(3)];
+				if (eff.rawVideo) {
+					extraInputs.push(
+						...itsoffset,
+						'-f', 'rawvideo', '-pix_fmt', 'rgba',
+						'-s', `${eff.rawVideo.width}x${eff.rawVideo.height}`,
+						'-r', `${eff.rawVideo.fps}`,
+						'-i', eff.videoPath!
+					);
+				} else {
+					extraInputs.push(...itsoffset, '-i', eff.videoPath ?? eff.pngPath!);
+				}
+			}
+
 			// Build filter graph — single pass from raw segments
 			const speedFilter = speed !== 1 ? `,setpts=PTS/${speed}` : '';
-			const filterGraph = [
+
+			// When zoom effects are present, composite at supersample resolution
+			// so overlays (chat panels, text) stay crisp when zoomed.
+			const ss = hasZoom ? ZOOM_SUPERSAMPLE : 1;
+			const compW = OUT_W * ss;
+			const compH = OUT_H * ss;
+			const scaleUp = hasZoom ? `,scale=${compW}:${compH}` : '';
+
+			let filterGraph = [
 				`[0:v]split=2[gameplay][camsrc]`,
 				`[camsrc]crop=${cw}:${ch}:${cx}:${cy},scale=${OUT_W}:-2,crop=${OUT_W}:${camH}[cam]`,
 				`[gameplay]scale=${OUT_W}:${gameH}:force_original_aspect_ratio=increase,crop=${OUT_W}:${gameH}[game]`,
-				`[game][cam]vstack=inputs=2${speedFilter},format=yuv420p[outv]`
+				`[game][cam]vstack=inputs=2${speedFilter},format=yuv420p${scaleUp}[vbase]`
 			].join(';');
 
-			// Build audio filter for speed
-			const aFilters: string[] = [];
-			if (speed !== 1) {
-				let remaining = speed;
-				while (remaining > 2.0) { aFilters.push('atempo=2.0'); remaining /= 2.0; }
-				while (remaining < 0.5) { aFilters.push('atempo=0.5'); remaining /= 0.5; }
-				aFilters.push(`atempo=${remaining.toFixed(4)}`);
+			let finalLabel = 'vbase';
+			const fps = probe.fps > 0 ? probe.fps : 30;
+
+			// 1. Overlay chain (composited at ss resolution when zoom is present)
+			for (let ei = 0; ei < overlappingEffects.length; ei++) {
+				const eff = overlappingEffects[ei];
+				const inputIdx = ei + 1;
+				const isLastOverlay = ei === overlappingEffects.length - 1;
+				const nextLabel = isLastOverlay && !hasZoom ? 'outv' : `ov${ei}`;
+				const enableStart = (trimStart + eff.localStart).toFixed(3);
+				const enableEnd = (trimStart + eff.localEnd).toFixed(3);
+				const alphaFmt = 'format=yuva420p';
+				const ox = eff.x * ss;
+				const oy = eff.y * ss;
+				let overlayInput: string;
+				const effScale = (eff.scale && eff.scale !== 1) ? eff.scale : 1;
+				const pngSsScale = !eff.rawVideo && ss > 1 ? ss : 1;
+				const totalScale = effScale * pngSsScale;
+				if (totalScale !== 1) {
+					const scaledLabel = `vs${ei}`;
+					filterGraph += `;[${inputIdx}:v]scale=iw*${totalScale}:ih*${totalScale},${alphaFmt}[${scaledLabel}]`;
+					overlayInput = scaledLabel;
+				} else {
+					const prepLabel = `vp${ei}`;
+					filterGraph += `;[${inputIdx}:v]${alphaFmt}[${prepLabel}]`;
+					overlayInput = prepLabel;
+				}
+				filterGraph += `;[${finalLabel}][${overlayInput}]overlay=${ox}:${oy}:enable='between(t,${enableStart},${enableEnd})'[${nextLabel}]`;
+				finalLabel = nextLabel;
 			}
 
-			const fps = probe.fps > 0 ? probe.fps : 30;
+			// 2. Zoom chain (after all overlays — zooms the composited frame)
+			for (let zi = 0; zi < clipZooms.length; zi++) {
+				const isLast = zi === clipZooms.length - 1;
+				const nextLabel = isLast ? 'outv' : `vz${zi}`;
+				filterGraph += buildZoomFilter(finalLabel, nextLabel, clipZooms[zi], trimStart, OUT_W, OUT_H, fps);
+				finalLabel = nextLabel;
+			}
+
+			if (overlappingEffects.length === 0 && !hasZoom) {
+				filterGraph = filterGraph.replace('[vbase]', '[outv]');
+			}
+
+			const audioArgs = buildAudioArgs(speed);
 			const gop = Math.round(fps * 2);
 			const outFile = path.join(tempDir, `clip_${i}.mp4`);
 
-			let videoArgs: string[];
-			if (useNvenc) {
-				videoArgs = [
-					'-c:v', 'h264_nvenc',
-					'-preset', 'p4',
-					'-profile:v', 'high',
-					'-qp', '18',
-					'-rc-lookahead', '32',
-					'-bf', '2',
-					'-g', `${gop}`,
-					'-flags', '+cgop'
-				];
-			} else {
-				videoArgs = [
-					'-c:v', 'libx264',
-					'-preset', 'medium',
-					'-profile:v', 'high',
-					'-crf', '18',
-					'-bf', '2',
-					'-g', `${gop}`,
-					'-flags', '+cgop'
-				];
-			}
-
-			const audioArgs = aFilters.length > 0
-				? ['-af', aFilters.join(','), '-c:a', 'aac', '-ar', '48000', '-b:a', '192k']
-				: ['-c:a', 'aac', '-ar', '48000', '-b:a', '192k'];
+			const videoArgs = buildVideoEncoderArgs(useNvenc, gop);
 
 			await runFfmpeg([
 				'-fflags', '+genpts',
 				'-f', 'concat', '-safe', '0', '-i', concatPath,
+				...extraInputs,
 				'-ss', trimStart.toFixed(3),
 				'-t', dur.toFixed(3),
 				'-filter_complex', filterGraph,
@@ -178,38 +204,20 @@ export async function exportVerticalVideo(
 			verticalFiles.push(outFile);
 		}
 
+		clearEffectRendererCache();
+		clearChatEffectCache();
+
 		if (verticalFiles.length === 0) {
 			throw new Error('All clips failed to encode — nothing to export');
 		}
 
 		onProgress(`Concatenating ${verticalFiles.length} vertical clips`, verticalClips.length, totalSteps);
-
-		const safeName = path.basename(filename).replace(/[<>:"/\\|?*]/g, '_');
-		const outputPath = path.join(EXPORTS_DIR, `${safeName}.mp4`);
-
-		if (verticalFiles.length === 1) {
-			fs.renameSync(verticalFiles[0], outputPath);
-		} else {
-			const concatListPath = path.join(tempDir, 'concat.txt');
-			const concatContent = verticalFiles.map((f) => ffmpegConcatEscape(f)).join('\n');
-			fs.writeFileSync(concatListPath, concatContent);
-
-			await runFfmpeg([
-				'-fflags', '+genpts',
-				'-f', 'concat', '-safe', '0', '-i', concatListPath,
-				'-c', 'copy',
-				'-movflags', '+faststart',
-				'-y', outputPath
-			], 1000);
-		}
+		const outputPath = buildOutputPath(filename, 'mp4');
+		await concatClipFiles(verticalFiles, tempDir, outputPath);
 
 		onProgress(`Done — saved to ${outputPath}`, totalSteps, totalSteps);
 		return { outputPath };
 	} finally {
-		try {
-			fs.rmSync(tempDir, { recursive: true, force: true });
-		} catch {
-			/* best effort */
-		}
+		cleanupTempDir(tempDir);
 	}
 }

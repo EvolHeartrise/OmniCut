@@ -1,5 +1,4 @@
 <script lang="ts">
-	import Hls from 'hls.js';
 	import { goto } from '$app/navigation';
 	import {
 		streams,
@@ -9,9 +8,10 @@
 		deleteClipRegion,
 		type ClipRegion
 	} from '$lib/stores/streams.js';
-	import { formatDuration, formatEpochDate, getClipLocalBounds, setupHls } from '$lib/utils.js';
+	import { formatDuration, formatEpochDate } from '$lib/utils.js';
 	import { exportSelectedClipsCmd, createVideoCmd, loadCameraBoundsForChannel } from '$lib/streams.remote';
 	import type { CameraBoundsEntry } from '$lib/types.js';
+	import ClipPreviewPlayer from './ClipPreviewPlayer.svelte';
 
 	// --- Filter state ---
 	let filterChannel = $state<string>('');
@@ -35,13 +35,6 @@
 	// --- Preview ---
 	let previewClipId = $state<string | null>(null);
 	let previewClip = $derived($clipRegions.find((c) => c.id === previewClipId) ?? null);
-	let previewVideoEl = $state<HTMLVideoElement | null>(null);
-	let previewHls: Hls | null = null;
-	let previewPlaying = $state(false);
-	let previewProgress = $state(0); // 0-1 within clip bounds
-	let previewCurrentTime = $state('0:00');
-	let previewDuration = $state('0:00');
-	let isSeeking = $state(false);
 
 	// --- Stream lookup map (avoids O(n²) .find() in filters/deriveds) ---
 	let streamMap = $derived(new Map($streams.map((s) => [s.id, s])));
@@ -84,7 +77,7 @@
 
 	// --- Video & Export creation ---
 	let exportTitle = $state('');
-	let exportFormat = $state<'standard' | 'mobile_short' | 'chat_overlay'>('standard');
+	let exportFormat = $state<'standard' | 'mobile_short'>('standard');
 	let exporting = $state(false);
 	let creatingVideo = $state(false);
 	let exportResult = $state<{ success: boolean; message: string } | null>(null);
@@ -237,114 +230,12 @@
 	}
 
 	// --- Preview ---
-	function openPreview(clip: ClipRegion) {
-		// Close existing preview if different
-		if (previewClipId === clip.id) {
-			closePreview();
-			return;
-		}
-		previewClipId = clip.id;
-		previewPlaying = false;
-		previewProgress = 0;
-		previewCurrentTime = '0:00';
-		const clipDur = clip.endTime - clip.startTime;
-		previewDuration = formatDuration(clipDur);
-
-		// Wait for DOM to render the video element
-		requestAnimationFrame(() => {
-			setupPreviewPlayer(clip);
-		});
-	}
-
-	function setupPreviewPlayer(clip: ClipRegion) {
-		if (!previewVideoEl) return;
-		const bounds = clipLocalBounds(clip);
-		if (!bounds) return;
-
-		if (previewHls) {
-			previewHls.destroy();
-			previewHls = null;
-		}
-
-		const url = `/hls/${clip.streamId}/playlist.m3u8`;
-
-		previewHls = setupHls(Hls, previewVideoEl, url, bounds.localStart, () => {
-			previewVideoEl!.play().then(() => { previewPlaying = true; }).catch(() => {});
-		});
+	function togglePreview(clip: ClipRegion) {
+		previewClipId = previewClipId === clip.id ? null : clip.id;
 	}
 
 	function closePreview() {
-		if (previewHls) {
-			previewHls.destroy();
-			previewHls = null;
-		}
 		previewClipId = null;
-		previewPlaying = false;
-	}
-
-	function togglePreviewPlay() {
-		if (!previewVideoEl) return;
-		if (previewPlaying) {
-			previewVideoEl.pause();
-		} else {
-			previewVideoEl.play().catch(() => {});
-		}
-		previewPlaying = !previewPlaying;
-	}
-
-	function clipLocalBounds(clip: ClipRegion) {
-		return getClipLocalBounds(clip, streamMap.get(clip.streamId), $syncOffsets[clip.streamId] || 0);
-	}
-
-
-	// Clamp preview playback to clip bounds + update progress
-	function handlePreviewTimeUpdate() {
-		if (!previewVideoEl || !previewClip) return;
-		const bounds = clipLocalBounds(previewClip);
-		if (!bounds) return;
-		const { localStart, localEnd } = bounds;
-		const clipDur = localEnd - localStart;
-
-		if (previewVideoEl.currentTime >= localEnd) {
-			previewVideoEl.pause();
-			previewPlaying = false;
-			previewVideoEl.currentTime = localStart;
-			previewProgress = 0;
-			previewCurrentTime = '0:00';
-		} else if (!isSeeking) {
-			const elapsed = previewVideoEl.currentTime - localStart;
-			previewProgress = clipDur > 0 ? Math.max(0, Math.min(1, elapsed / clipDur)) : 0;
-			previewCurrentTime = formatDuration(elapsed);
-		}
-		previewDuration = formatDuration(clipDur);
-	}
-
-	function handleSeekInput(e: Event) {
-		isSeeking = true;
-		const value = +(e.target as HTMLInputElement).value;
-		previewProgress = value;
-		if (previewClip) {
-			const bounds = clipLocalBounds(previewClip);
-			if (bounds) {
-				const elapsed = value * (bounds.localEnd - bounds.localStart);
-				previewCurrentTime = formatDuration(elapsed);
-			}
-		}
-	}
-
-	function handleSeekCommit() {
-		if (!previewVideoEl || !previewClip) {
-			isSeeking = false;
-			return;
-		}
-		const bounds = clipLocalBounds(previewClip);
-		if (!bounds) {
-			isSeeking = false;
-			return;
-		}
-		const { localStart, localEnd } = bounds;
-		previewVideoEl.currentTime = localStart + previewProgress * (localEnd - localStart);
-		isSeeking = false;
 	}
 
 	// --- Create Video ---
@@ -381,48 +272,6 @@
 			exporting = false;
 		}
 	}
-
-	// React to clip bounds changing while previewing (e.g. MCP upsert_clip via SSE)
-	$effect(() => {
-		const clip = previewClip;
-		if (!clip || !previewVideoEl) return;
-		const bounds = clipLocalBounds(clip);
-		if (!bounds) return;
-		const { localStart, localEnd } = bounds;
-		const clipDur = localEnd - localStart;
-		previewDuration = formatDuration(clipDur);
-
-		// If the video's current position is now outside the new bounds, re-clamp
-		if (previewVideoEl.currentTime >= localEnd) {
-			previewVideoEl.currentTime = localStart;
-			previewProgress = 0;
-			previewCurrentTime = '0:00';
-			if (previewPlaying) {
-				previewVideoEl.pause();
-				previewPlaying = false;
-			}
-		} else if (previewVideoEl.currentTime < localStart) {
-			previewVideoEl.currentTime = localStart;
-			previewProgress = 0;
-			previewCurrentTime = '0:00';
-		} else {
-			// Recalculate progress within new bounds
-			const elapsed = previewVideoEl.currentTime - localStart;
-			previewProgress = clipDur > 0 ? Math.max(0, Math.min(1, elapsed / clipDur)) : 0;
-			previewCurrentTime = formatDuration(elapsed);
-		}
-	});
-
-	// Cleanup on unmount
-	$effect(() => {
-		return () => {
-			if (previewHls) {
-				previewHls.destroy();
-				previewHls = null;
-			}
-		};
-	});
-
 
 	function clipChannel(clip: ClipRegion): string {
 		return streamMap.get(clip.streamId)?.channel || 'unknown';
@@ -498,7 +347,6 @@
 						<select class="format-select" bind:value={exportFormat}>
 							<option value="standard">Standard (16:9)</option>
 							<option value="mobile_short">Mobile Short (9:16)</option>
-							<option value="chat_overlay">Chat Overlay (transparent)</option>
 						</select>
 						<button class="btn-create-video" onclick={createVideo} disabled={creatingVideo || selectedIds.size === 0}>
 							{creatingVideo ? 'Creating...' : `Create Video`}
@@ -593,7 +441,7 @@
 										title={clip.favourite ? 'Remove favourite' : 'Mark as favourite'}
 									>{clip.favourite ? '\u2605' : '\u2606'}</button>
 									<button class="btn-icon" onclick={() => copyClipId(clip.id)} title="Copy clip ID"> ID </button>
-									<button class="btn-icon" onclick={() => openPreview(clip)} title="Preview">
+									<button class="btn-icon" onclick={() => togglePreview(clip)} title="Preview">
 										{isPreviewing ? '✕' : '▶'}
 									</button>
 									<a class="btn-icon btn-review" href="/review?clip={clip.id}" title="Edit in Review">
@@ -623,33 +471,12 @@
 						</div>
 
 						{#if isPreviewing}
-							<div class="preview-container">
-								<!-- svelte-ignore a11y_media_has_caption -->
-								<video
-									bind:this={previewVideoEl}
-									ontimeupdate={handlePreviewTimeUpdate}
-									playsinline
-									class="preview-video"
-								></video>
-								<div class="preview-controls">
-									<button class="btn-ctl" onclick={togglePreviewPlay}>
-										{previewPlaying ? '⏸' : '▶'}
-									</button>
-									<span class="preview-time">{previewCurrentTime}</span>
-									<input
-										type="range"
-										class="preview-seek"
-										min="0"
-										max="1"
-										step="0.001"
-										value={previewProgress}
-										oninput={handleSeekInput}
-										onchange={handleSeekCommit}
-									/>
-									<span class="preview-time">{previewDuration}</span>
-									<button class="btn-ctl" onclick={closePreview}>Close</button>
-								</div>
-							</div>
+							<ClipPreviewPlayer
+								{clip}
+								stream={streamMap.get(clip.streamId)}
+								syncOffset={$syncOffsets[clip.streamId] || 0}
+								onclose={closePreview}
+							/>
 						{/if}
 					</div>
 				{/each}
@@ -1101,90 +928,6 @@
 
 	.btn-cancel:hover {
 		background: #3a3a5a;
-	}
-
-	/* Preview */
-	.preview-container {
-		padding: 0 20px 10px 48px;
-	}
-
-	.preview-video {
-		width: 100%;
-		max-height: 300px;
-		background: #000;
-		border-radius: 4px;
-		display: block;
-	}
-
-	.preview-controls {
-		display: flex;
-		align-items: center;
-		gap: 6px;
-		margin-top: 6px;
-	}
-
-	.preview-time {
-		font-size: 0.65rem;
-		color: #888;
-		font-variant-numeric: tabular-nums;
-		font-family: monospace;
-		min-width: 3em;
-		text-align: center;
-	}
-
-	.preview-seek {
-		flex: 1;
-		height: 4px;
-		-webkit-appearance: none;
-		appearance: none;
-		background: #2a2a4a;
-		border-radius: 2px;
-		outline: none;
-		cursor: pointer;
-	}
-
-	.preview-seek::-webkit-slider-thumb {
-		-webkit-appearance: none;
-		width: 12px;
-		height: 12px;
-		border-radius: 50%;
-		background: #7c3aed;
-		cursor: pointer;
-	}
-
-	.preview-seek::-moz-range-thumb {
-		width: 12px;
-		height: 12px;
-		border-radius: 50%;
-		background: #7c3aed;
-		border: none;
-		cursor: pointer;
-	}
-
-	.preview-seek::-webkit-slider-runnable-track {
-		height: 4px;
-		border-radius: 2px;
-	}
-
-	.preview-seek::-moz-range-track {
-		height: 4px;
-		background: #2a2a4a;
-		border-radius: 2px;
-	}
-
-	.btn-ctl {
-		background: #2a2a4a;
-		border: none;
-		color: #ccc;
-		padding: 4px 10px;
-		border-radius: 4px;
-		cursor: pointer;
-		font-size: 0.75rem;
-	}
-
-	.btn-ctl:hover {
-		background: #3a3a5a;
-		color: #fff;
 	}
 
 	.filter-fav-btn {

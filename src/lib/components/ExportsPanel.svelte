@@ -17,7 +17,7 @@
 		error?: string;
 		createdAt: number;
 		completedAt?: number;
-		format?: 'standard' | 'mobile_short' | 'chat_overlay';
+		format?: 'standard' | 'mobile_short';
 	}
 
 	let exports = $state<ExportRecord[]>([]);
@@ -368,7 +368,7 @@
 								{@const linkedVideo = $videos.find((v) => v.id === exp.videoId)}
 								<a class="btn-video-link" href="/videos/{exp.videoId}" title={linkedVideo?.title ?? 'Video'}>{linkedVideo?.title ?? 'Video'}</a>
 							{/if}
-							<span class="format-badge">{exp.format === 'mobile_short' ? '9:16' : exp.format === 'chat_overlay' ? 'Chat' : '16:9'}</span>
+							<span class="format-badge">{exp.format === 'mobile_short' ? '9:16' : '16:9'}</span>
 							<div class="export-item-actions">
 								{#if exp.clipIds.length > 0}
 									<button

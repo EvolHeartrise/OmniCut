@@ -7,8 +7,8 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { newThumbnailId } from '../ids.js';
-import * as db from './persistence.js';
-import type { ThumbnailRecord, LayerConfig } from './persistence.js';
+import * as db from './db/index.js';
+import type { ThumbnailRecord, LayerConfig } from './db/index.js';
 
 const EXPORTS_DIR = path.resolve(process.env.EXPORTS_DIR || path.join(process.cwd(), 'exports'));
 const THUMBNAILS_DIR = path.join(EXPORTS_DIR, 'thumbnails');

@@ -1,6 +1,6 @@
 import * as fs from 'node:fs';
 import type { RequestHandler } from './$types.js';
-import { loadThumbnail } from '$lib/server/persistence.js';
+import { loadThumbnail } from '$lib/server/db/index.js';
 
 /**
  * GET /api/thumbnail/:id

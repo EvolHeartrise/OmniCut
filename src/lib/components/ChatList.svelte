@@ -1,77 +1,42 @@
 <script lang="ts">
-	import { streams, syncOffsets, type ClipRegion } from '$lib/stores/streams.js';
-	import { getMultiStreamChat } from '$lib/streams.remote';
-	import { usernameColor, getClipLocalBounds } from '$lib/utils.js';
-	import { parseEmotes, getThirdPartyEmotes, type ChatSegment, type EmoteMap } from '$lib/emoteParser.js';
-	import { fetchTwitchBadges, resolveBadges, type BadgeInfo, type BadgeMap } from '$lib/badgeParser.js';
+	import type { ChatSegment } from '$lib/emoteParser.js';
+	import type { BadgeInfo } from '$lib/badgeParser.js';
 
-	let {
-		clip,
-		currentLocalTime,
-		onseek
-	}: {
-		clip: ClipRegion;
-		currentLocalTime: number;
-		onseek: (localTime: number) => void;
-	} = $props();
-
-	let searchQuery = $state('');
-	let thirdPartyEmotes = $state<EmoteMap | undefined>(undefined);
-	let badgeMap = $state<BadgeMap>(new Map());
-	let listEl = $state<HTMLDivElement | null>(null);
-	let userScrolled = $state(false);
-	let scrollTimeout: ReturnType<typeof setTimeout> | null = null;
-
-	interface ChatEntry {
+	export interface ChatEntry {
 		id: number;
 		username: string;
 		text: string;
-		localTime: number;
+		time: number;
 		userColor: string;
 		segments: ChatSegment[];
 		badges: BadgeInfo[];
+		twitchId?: string;
+		[key: string]: unknown;
 	}
 
-	// Fetch badges and third-party emotes for the clip's channel
-	$effect(() => {
-		const stream = $streams.find((s) => s.id === clip.streamId);
-		if (!stream || stream.platform !== 'twitch') return;
-		getThirdPartyEmotes(stream.channel).then((map) => {
-			thirdPartyEmotes = map;
-		});
-		fetchTwitchBadges(stream.channel).then((map) => {
-			badgeMap = map;
-		});
-	});
+	let {
+		entries,
+		currentTime,
+		playing = false,
+		maxVisible = 200,
+		title = 'Chat',
+		onseek,
+		oncopyid
+	}: {
+		entries: ChatEntry[];
+		currentTime: number;
+		playing?: boolean;
+		maxVisible?: number;
+		title?: string;
+		onseek?: (entry: ChatEntry) => void;
+		oncopyid?: (twitchId: string) => void;
+	} = $props();
 
-	// Derive clip-local bounds
-	let clipBounds = $derived(
-		getClipLocalBounds(clip, $streams.find((s) => s.id === clip.streamId), $syncOffsets[clip.streamId] || 0)
-	);
-
-	// Fetch all chat for the clip range
-	const rawMessages = $derived(
-		clipBounds
-			? await getMultiStreamChat({
-					ranges: [{ streamId: clip.streamId, from: clipBounds.localStart, to: clipBounds.localEnd }]
-				})
-			: []
-	);
-
-	let entries = $derived.by(() => {
-		if (!rawMessages || rawMessages.length === 0) return [] as ChatEntry[];
-		const _emotes = thirdPartyEmotes;
-		const _badges = badgeMap;
-		return rawMessages.map((m) => ({
-			id: m.id,
-			username: m.username,
-			text: m.text,
-			localTime: m.timestamp,
-			userColor: m.color || usernameColor(m.username),
-			segments: parseEmotes(m.text, m.emotes, _emotes),
-			badges: resolveBadges(m.badges, _badges)
-		}));
-	});
+	let searchQuery = $state('');
+	let listEl = $state<HTMLDivElement | null>(null);
+	let userScrolled = $state(false);
+	let scrollTimeout: ReturnType<typeof setTimeout> | null = null;
+	let copiedId = $state<string | null>(null);
 
 	let filteredEntries = $derived.by(() => {
 		if (!searchQuery.trim()) return entries;
@@ -81,24 +46,22 @@
 		);
 	});
 
-	// Only show messages at or before the current playhead
 	let displayEntries = $derived.by(() => {
-		const now = currentLocalTime;
+		const now = currentTime;
 		let lo = 0,
 			hi = filteredEntries.length;
 		while (lo < hi) {
 			const mid = (lo + hi) >>> 1;
-			if (filteredEntries[mid].localTime <= now) lo = mid + 1;
+			if (filteredEntries[mid].time <= now) lo = mid + 1;
 			else hi = mid;
 		}
 		const all = filteredEntries.slice(0, lo);
-		return all.length > 200 ? all.slice(all.length - 200) : all;
+		return all.length > maxVisible ? all.slice(all.length - maxVisible) : all;
 	});
 
-	// Auto-scroll to bottom
 	$effect(() => {
 		const _len = displayEntries.length;
-		if (!listEl || userScrolled) return;
+		if (!listEl || userScrolled || (playing === false && _len > 0)) return;
 		listEl.scrollTop = listEl.scrollHeight;
 	});
 
@@ -134,11 +97,19 @@
 	function clearSearch() {
 		searchQuery = '';
 	}
+
+	function copyTwitchId(twitchId: string) {
+		navigator.clipboard.writeText(twitchId).then(() => {
+			copiedId = twitchId;
+			setTimeout(() => { copiedId = null; }, 1500);
+		});
+		oncopyid?.(twitchId);
+	}
 </script>
 
 <div class="chat-panel">
 	<div class="chat-header">
-		<span class="header-title">Chat</span>
+		<span class="header-title">{title}</span>
 		<span class="msg-count">{displayEntries.length}</span>
 	</div>
 
@@ -151,10 +122,21 @@
 
 	<div class="chat-log" bind:this={listEl} onscroll={handleListScroll}>
 		{#each displayEntries as entry (entry.id)}
-			<button class="chat-line" onclick={() => onseek(entry.localTime)}>
-				{#each entry.badges as badge}<img class="badge" src={badge.imageUrl} alt={badge.title} title={badge.title} />{/each}<span class="user" style="color:{entry.userColor}">{entry.username}</span><span class="sep">:</span>
-				<span class="msg">{#each entry.segments as seg}{#if seg.type === 'emote'}<img class="emote" src={seg.emoteUrl} alt={seg.text} title={seg.text} />{:else}{seg.text}{/if}{/each}</span>
-			</button>
+			<div class="chat-line-wrap">
+				<button class="chat-line" onclick={() => onseek?.(entry)}>
+					{#each entry.badges as badge}<img class="badge" src={badge.imageUrl} alt={badge.title} title={badge.title} />{/each}<span class="user" style="color:{entry.userColor}">{entry.username}</span><span class="sep">:</span>
+					<span class="msg">{#each entry.segments as seg}{#if seg.type === 'emote'}<img class="emote" src={seg.emoteUrl} alt={seg.text} title={seg.text} />{:else}{seg.text}{/if}{/each}</span>
+				</button>
+				{#if oncopyid && entry.twitchId}
+					<button
+						class="copy-id-btn"
+						title="Copy Twitch message ID"
+						onclick={(e) => { e.stopPropagation(); copyTwitchId(entry.twitchId!); }}
+					>
+						{copiedId === entry.twitchId ? 'Copied' : 'ID'}
+					</button>
+				{/if}
+			</div>
 		{/each}
 
 		{#if displayEntries.length === 0}
@@ -280,8 +262,24 @@
 		border-radius: 3px;
 	}
 
+	.chat-line-wrap {
+		display: flex;
+		align-items: flex-start;
+		position: relative;
+	}
+
+	.chat-line-wrap:hover {
+		background: #26262c;
+	}
+
+	.chat-line-wrap:hover .copy-id-btn {
+		opacity: 1;
+	}
+
 	.chat-line {
 		display: block;
+		flex: 1;
+		min-width: 0;
 		width: 100%;
 		text-align: left;
 		background: none;
@@ -295,8 +293,26 @@
 		word-break: break-word;
 	}
 
-	.chat-line:hover {
-		background: #26262c;
+	.copy-id-btn {
+		flex-shrink: 0;
+		opacity: 0;
+		background: #3a3a3e;
+		border: none;
+		color: #adadb8;
+		font-size: 0.55rem;
+		font-weight: 600;
+		padding: 2px 5px;
+		border-radius: 3px;
+		cursor: pointer;
+		margin: 3px 6px 0 0;
+		white-space: nowrap;
+		transition: opacity 0.1s;
+		font-family: monospace;
+	}
+
+	.copy-id-btn:hover {
+		background: #53535f;
+		color: #efeff1;
 	}
 
 	.badge {

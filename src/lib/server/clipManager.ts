@@ -4,7 +4,7 @@
  */
 
 import type { ClipRegion } from '../types.js';
-import * as db from './persistence.js';
+import * as db from './db/index.js';
 import { broadcastClipUpsert, broadcastClipDelete } from './sseBroadcaster.js';
 
 // In-memory store of clip regions keyed by ID (hot cache; persisted to SQLite)

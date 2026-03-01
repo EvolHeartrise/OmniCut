@@ -3,11 +3,11 @@
  * In-memory store of video compositions backed by SQLite persistence.
  */
 
-import type { VideoRecord, ClipEntry } from '../types.js';
+import type { VideoRecord, ClipEntry, EffectEntry } from '../types.js';
 import { newVideoId } from '../ids.js';
-import * as db from './persistence.js';
+import * as db from './db/index.js';
 import { broadcastVideoCreate, broadcastVideoUpdate, broadcastVideoDelete } from './sseBroadcaster.js';
-import { getClipRegion } from './clipManager.js';
+import { validateClipIds } from './clipValidation.js';
 
 // In-memory store of videos keyed by ID (hot cache; persisted to SQLite)
 const videosStore = new Map<string, VideoRecord>();
@@ -30,18 +30,10 @@ export function createVideo(data: {
 	title: string;
 	description?: string;
 	clipEntries: ClipEntry[];
+	effectEntries?: EffectEntry[];
 	format?: VideoRecord['format'];
 }): VideoRecord {
-	// Validate all clip IDs exist
-	const missing: string[] = [];
-	for (const entry of data.clipEntries) {
-		if (!getClipRegion(entry.clipId)) {
-			missing.push(entry.clipId);
-		}
-	}
-	if (missing.length > 0) {
-		throw new Error(`Clip IDs not found: ${missing.join(', ')}`);
-	}
+	validateClipIds(data.clipEntries.map((e) => e.clipId));
 
 	const now = Math.floor(Date.now() / 1000);
 	const video: VideoRecord = {
@@ -49,6 +41,7 @@ export function createVideo(data: {
 		title: data.title,
 		...(data.description && { description: data.description }),
 		clipEntries: data.clipEntries,
+		...(data.effectEntries && data.effectEntries.length > 0 && { effectEntries: data.effectEntries }),
 		format: data.format ?? 'standard',
 		createdAt: now,
 		updatedAt: now
@@ -66,24 +59,15 @@ export function createVideo(data: {
  */
 export function updateVideo(
 	id: string,
-	updates: Partial<Pick<VideoRecord, 'title' | 'description' | 'clipEntries' | 'format'>>
+	updates: Partial<Pick<VideoRecord, 'title' | 'description' | 'clipEntries' | 'effectEntries' | 'format'>>
 ): VideoRecord {
 	const existing = videosStore.get(id);
 	if (!existing) {
 		throw new Error(`Video not found: ${id}`);
 	}
 
-	// Validate clip IDs if updating entries
 	if (updates.clipEntries) {
-		const missing: string[] = [];
-		for (const entry of updates.clipEntries) {
-			if (!getClipRegion(entry.clipId)) {
-				missing.push(entry.clipId);
-			}
-		}
-		if (missing.length > 0) {
-			throw new Error(`Clip IDs not found: ${missing.join(', ')}`);
-		}
+		validateClipIds(updates.clipEntries.map((e) => e.clipId));
 	}
 
 	const updated: VideoRecord = {

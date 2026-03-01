@@ -8,8 +8,8 @@ import { google } from 'googleapis';
 import type { OAuth2Client } from 'google-auth-library';
 import * as fs from 'node:fs';
 import { newYouTubeAccountId } from '../ids.js';
-import * as db from './persistence.js';
-import type { YouTubeAccount } from './persistence.js';
+import * as db from './db/index.js';
+import type { YouTubeAccount } from './db/index.js';
 
 // --- Environment ---
 

@@ -21,6 +21,41 @@ export interface CameraBoundsEntry {
 	camH: number;
 }
 
+/** An effect placed on the composition timeline. */
+export interface EffectEntry {
+	id: string;               // unique ID (nanoid)
+	type: 'chat-message' | 'twitch-chat' | 'zoom';
+	/** Composition-time start (seconds from composition start). */
+	startTime: number;
+	/** Duration the effect is visible (seconds). */
+	duration: number;
+	/** Normalized position on video (0-1). */
+	x: number;
+	y: number;
+	/** For chat-message type: Twitch message ID. */
+	twitchId?: string;
+	/** For twitch-chat type: panel width in pixels (default 340). */
+	panelWidth?: number;
+	/** For twitch-chat type: panel height in pixels (default 1080). */
+	panelHeight?: number;
+	/** For twitch-chat type: shift the chat timeline in seconds (default 0). */
+	chatOffset?: number;
+	/** For twitch-chat type: uniform scale multiplier (default 1). */
+	chatScale?: number;
+	/** For twitch-chat type: CSS font-weight for chat text (default 400). */
+	chatFontWeight?: number;
+	/** Effects track index (0-based, default 0). Higher tracks render on top. */
+	track?: number;
+	/** For zoom type: start crop region (normalized 0-1). Width = height fraction (aspect-ratio locked). */
+	zoomStartX?: number;
+	zoomStartY?: number;
+	zoomStartW?: number;  // fraction of video width (default 1 = full frame)
+	/** For zoom type: end crop region (normalized 0-1). */
+	zoomEndX?: number;
+	zoomEndY?: number;
+	zoomEndW?: number;
+}
+
 /** Per-clip entry in a video composition. */
 export interface ClipEntry {
 	clipId: string;
@@ -37,7 +72,8 @@ export interface VideoRecord {
 	title: string;
 	description?: string;
 	clipEntries: ClipEntry[];
-	format: 'standard' | 'mobile_short' | 'chat_overlay';
+	format: 'standard' | 'mobile_short';
+	effectEntries?: EffectEntry[];
 	createdAt: number;
 	updatedAt: number;
 }

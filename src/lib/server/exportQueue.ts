@@ -5,15 +5,15 @@
  */
 
 import { newExportId } from '../ids.js';
-import type { ClipEntry } from '../types.js';
+import type { ClipEntry, EffectEntry } from '../types.js';
 import { getClipRegion } from './clipManager.js';
+import { validateClipIds } from './clipValidation.js';
 import { getVideo } from './videoManager.js';
 import { exportVideo, type StreamLookup } from './exporter.js';
 import { exportVerticalVideo, type VerticalClip } from './verticalExporter.js';
-import { exportChatOverlay } from './chatOverlayExporter.js';
 import { cleanupFiles } from './fsUtils.js';
-import * as db from './persistence.js';
-import type { ExportRecord } from './persistence.js';
+import * as db from './db/index.js';
+import type { ExportRecord } from './db/index.js';
 import { broadcastExportStatus } from './sseBroadcaster.js';
 import { getStream, getStreamRecordingDir } from './streamManager.js';
 import { SequentialQueue } from './sequentialQueue.js';
@@ -28,17 +28,8 @@ const sq = new SequentialQueue(runExport);
  * Create and enqueue a new export. Returns the ExportRecord.
  * Validates that all clip IDs exist before creating.
  */
-export function createAndQueueExport(clipIds: string[], title: string, description?: string, format?: 'standard' | 'mobile_short' | 'chat_overlay'): ExportRecord {
-	// Validate all clip IDs exist
-	const missing: string[] = [];
-	for (const clipId of clipIds) {
-		if (!getClipRegion(clipId)) {
-			missing.push(clipId);
-		}
-	}
-	if (missing.length > 0) {
-		throw new Error(`Clip IDs not found: ${missing.join(', ')}`);
-	}
+export function createAndQueueExport(clipIds: string[], title: string, description?: string, format?: 'standard' | 'mobile_short'): ExportRecord {
+	validateClipIds(clipIds);
 
 	const id = newExportId();
 	const record: ExportRecord = {
@@ -65,23 +56,17 @@ export function createAndQueueExportFromVideo(videoId: string): ExportRecord {
 	const video = getVideo(videoId);
 	if (!video) throw new Error(`Video not found: ${videoId}`);
 
-	// Validate all clip IDs in the video still exist
-	const missing: string[] = [];
-	for (const entry of video.clipEntries) {
-		if (!getClipRegion(entry.clipId)) missing.push(entry.clipId);
-	}
-	if (missing.length > 0) {
-		throw new Error(`Clip IDs not found: ${missing.join(', ')}`);
-	}
+	const clipIds = video.clipEntries.map((e) => e.clipId);
+	validateClipIds(clipIds);
 
 	const id = newExportId();
-	const clipIds = video.clipEntries.map((e) => e.clipId);
 	const record: ExportRecord = {
 		id,
 		title: video.title,
 		...(video.description && { description: video.description }),
 		clipIds,
 		clipEntries: video.clipEntries,
+		...(video.effectEntries && video.effectEntries.length > 0 && { effectEntries: video.effectEntries }),
 		status: 'pending',
 		createdAt: Math.floor(Date.now() / 1000),
 		format: video.format,
@@ -181,6 +166,19 @@ async function runExport(exportId: string): Promise<void> {
 	// Collect the ordered clip entries (for exporters that support effects)
 	const clipEntries = clips.map((clip) => entryMap.get(clip.id));
 
+	// Compute composition-time offsets for each clip (used to map effectEntries to per-clip windows)
+	const compOffsets: number[] = [];
+	let compTime = 0;
+	for (let i = 0; i < clips.length; i++) {
+		compOffsets.push(compTime);
+		const entry = clipEntries[i];
+		const trimStart = entry?.trimStart ?? 0;
+		const trimEnd = entry?.trimEnd ?? 0;
+		const speed = entry?.speed ?? 1;
+		const dur = (clips[i].endTime - clips[i].startTime - trimStart - trimEnd) / speed;
+		compTime += Math.max(0, dur);
+	}
+
 	// Update status → exporting
 	db.updateExportStatus(exportId, 'exporting');
 	broadcastExportStatus(exportId, 'exporting');
@@ -199,6 +197,14 @@ async function runExport(exportId: string): Promise<void> {
 					offset: stream.offset
 				});
 			}
+		}
+
+		// Build channel map (streamId → channel login) for twitch-chat effects
+		const channelMap = new Map<string, string>();
+		for (const clip of clips) {
+			if (channelMap.has(clip.streamId)) continue;
+			const stream = getStream(clip.streamId);
+			if (stream) channelMap.set(clip.streamId, stream.channel);
 		}
 
 		let outputPath: string;
@@ -222,18 +228,9 @@ async function runExport(exportId: string): Promise<void> {
 			if (verticalClips.length === 0) {
 				throw new Error('No clips have camera bounds set — cannot create vertical export');
 			}
-			({ outputPath } = await exportVerticalVideo(verticalClips, streamMap, exportId, () => {}));
-		} else if (record.format === 'chat_overlay') {
-			// Build channel map (streamId → channel login) for emote/badge resolution
-			const channelMap = new Map<string, string>();
-			for (const clip of clips) {
-				if (channelMap.has(clip.streamId)) continue;
-				const stream = getStream(clip.streamId);
-				if (stream) channelMap.set(clip.streamId, stream.channel);
-			}
-			({ outputPath } = await exportChatOverlay(clips, streamMap, channelMap, exportId, () => {}, clipEntries));
+			({ outputPath } = await exportVerticalVideo(verticalClips, streamMap, exportId, () => {}, record.effectEntries, compOffsets, channelMap));
 		} else {
-			({ outputPath } = await exportVideo(clips, streamMap, exportId, () => {}, clipEntries));
+			({ outputPath } = await exportVideo(clips, streamMap, exportId, () => {}, clipEntries, record.effectEntries, compOffsets, channelMap));
 		}
 
 		db.updateExportStatus(exportId, 'ready', outputPath);

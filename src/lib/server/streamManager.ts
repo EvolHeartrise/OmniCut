@@ -6,7 +6,7 @@ import { startTranscription, stopTranscription, transcribeFullRecording, shutdow
 import { startChatCollection } from './chatCollector.js';
 import { startVodChatFetch, extractVideoId, extractDouyuRoomId } from './vodChatFetcher.js';
 import type { StreamInfo, ChatMessage } from './types.js';
-import * as db from './persistence.js';
+import * as db from './db/index.js';
 import {
 	addSSEClient as sseAddClient,
 	broadcastUpdate,

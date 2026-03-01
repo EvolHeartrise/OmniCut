@@ -5,12 +5,14 @@
 
 import * as path from 'node:path';
 import * as fs from 'node:fs';
-import type { ClipRegion, ClipEntry } from '../types.js';
-import type { StreamInfo } from './types.js';
-import { parseRelevantSegments, ffmpegConcatEscape, buildConcatContent } from './hlsUtils.js';
+import type { ClipRegion, ClipEntry, EffectEntry } from '../types.js';
 import { runFfmpeg } from './ffmpeg.js';
-
-const EXPORTS_DIR = path.resolve(process.env.EXPORTS_DIR || path.join(process.cwd(), 'exports'));
+import { renderEffectOverlay, clearEffectRendererCache } from './effectRenderer.js';
+import { renderChatEffectVideo, clearChatEffectCache } from './chatEffectRenderer.js';
+import {
+	resolveClip, buildAudioArgs, buildVideoEncoderArgs, createTempDir, cleanupTempDir,
+	concatClipFiles, buildOutputPath
+} from './exporterCommon.js';
 
 /** Resolved stream info needed for encoding a clip from raw segments. */
 export interface StreamLookup {
@@ -28,123 +30,165 @@ export async function exportVideo(
 	streamMap: Map<string, StreamLookup>,
 	filename: string,
 	onProgress: (message: string, step: number, totalSteps: number) => void,
-	clipEntries?: (ClipEntry | undefined)[]
+	clipEntries?: (ClipEntry | undefined)[],
+	effectEntries?: EffectEntry[],
+	compOffsets?: number[],
+	channelMap?: Map<string, string>
 ): Promise<{ outputPath: string }> {
 	if (clips.length === 0) {
 		throw new Error('No clip regions to export');
 	}
 
-	fs.mkdirSync(EXPORTS_DIR, { recursive: true });
-
-	const totalSteps = clips.length + 1; // per-clip encode + final concat
+	const totalSteps = clips.length + 1;
 	onProgress(`Starting export: ${clips.length} clips`, 0, totalSteps);
 
 	const useNvenc = await detectNvenc();
-	const tempDir = path.join(EXPORTS_DIR, `temp_${Date.now()}`);
-	fs.mkdirSync(tempDir, { recursive: true });
+	const tempDir = createTempDir('std');
 
 	try {
 		const clipFiles: string[] = [];
 		let skipped = 0;
 
 		for (let i = 0; i < clips.length; i++) {
-			const clip = clips[i];
-			const entry = clipEntries?.[i];
-			const stream = streamMap.get(clip.streamId);
-			if (!stream) {
-				console.warn(`Export: skipping clip ${i + 1}/${clips.length} — stream ${clip.streamId} not found`);
-				onProgress(`Skipping clip ${i + 1}/${clips.length} (stream not found)`, i, totalSteps);
-				skipped++;
-				continue;
-			}
+			const resolved = resolveClip(
+				clips[i], clipEntries?.[i], streamMap.get(clips[i].streamId),
+				i, clips.length, tempDir, 'export'
+			);
+			if (!resolved) { skipped++; continue; }
 
-			// Apply trim offsets from clip entry
-			const trimStartOffset = entry?.trimStart ?? 0;
-			const trimEndOffset = entry?.trimEnd ?? 0;
-			const effectiveStart = clip.startTime + trimStartOffset;
-			const effectiveEnd = clip.endTime - trimEndOffset;
-			const speed = entry?.speed ?? 1;
-
-			if (effectiveEnd <= effectiveStart) {
-				console.warn(`Export: skipping clip ${i + 1}/${clips.length} — trim makes duration ≤ 0`);
-				skipped++;
-				continue;
-			}
-
-			const dur = effectiveEnd - effectiveStart;
+			const { dur, clipDur, speed, trimStart, concatPath, segments, localStart: clipLocalStart, localEnd: clipLocalEnd } = resolved;
 			onProgress(`Encoding clip ${i + 1}/${clips.length} (${dur.toFixed(1)}s)`, i, totalSteps);
 
-			const anchor = stream.startedAt / 1000;
-			const localStart = effectiveStart - anchor + stream.offset;
-			const localEnd = effectiveEnd - anchor + stream.offset;
-			const playlistPath = path.join(stream.recordingDir, 'playlist.m3u8');
-
-			const segments = parseRelevantSegments(playlistPath, stream.recordingDir, localStart, localEnd);
-			if (segments.length === 0) {
-				console.warn(`Export: skipping clip ${i + 1}/${clips.length} — no segments`);
-				onProgress(`Skipping clip ${i + 1}/${clips.length} (no segments)`, i, totalSteps);
-				skipped++;
-				continue;
-			}
-
-			const concatPath = path.join(tempDir, `clip_${i}.concat.txt`);
-			fs.writeFileSync(concatPath, buildConcatContent(segments));
-
-			const trimStart = Math.max(0, localStart - segments[0].startTime);
 			const outFile = path.join(tempDir, `clip_${i}.mp4`);
 
-			// Build video filter chain
-			const vFilters: string[] = [];
-			if (speed !== 1) {
-				vFilters.push(`setpts=PTS/${speed}`);
-			}
-			vFilters.push('format=yuv420p');
+			// Probe actual source resolution (no scaling in standard export)
+			const probe = await probeVideo(segments[0].file);
+			const srcW = probe.width || 1920;
+			const srcH = probe.height || 1080;
 
-			// Build audio filter chain
-			const aFilters: string[] = [];
-			if (speed !== 1) {
-				// atempo only supports 0.5-2.0 range, chain multiple for wider range
-				let remaining = speed;
-				const parts: string[] = [];
-				while (remaining > 2.0) { parts.push('atempo=2.0'); remaining /= 2.0; }
-				while (remaining < 0.5) { parts.push('atempo=0.5'); remaining /= 0.5; }
-				parts.push(`atempo=${remaining.toFixed(4)}`);
-				aFilters.push(...parts);
-			}
+			// Find overlapping effects for this clip
+			const clipCompStart = compOffsets?.[i] ?? 0;
+			const clipCompEnd = clipCompStart + clipDur;
 
-			let videoArgs: string[];
-			if (useNvenc) {
-				videoArgs = [
-					'-vf', vFilters.join(','),
-					'-c:v', 'h264_nvenc',
-					'-preset', 'p4',
-					'-profile:v', 'high',
-					'-qp', '18',
-					'-rc-lookahead', '32',
-					'-bf', '2'
+			// Resolve zoom effects first so we know if we need to supersample overlays
+			const clipZooms = resolveZoomEffects(effectEntries, clipCompStart, clipCompEnd, clipDur);
+			const hasZoom = clipZooms.length > 0;
+
+			const clipCtx: ClipContext | undefined = channelMap?.get(clips[i].streamId) ? {
+				streamId: clips[i].streamId,
+				channel: channelMap.get(clips[i].streamId)!,
+				streamLocalStart: clipLocalStart,
+				streamLocalEnd: clipLocalEnd
+			} : undefined;
+			const overlappingEffects = await resolveOverlappingEffects(
+				effectEntries, clipCompStart, clipCompEnd, clipDur, tempDir, i,
+				srcW, srcH, clipCtx,
+				hasZoom ? ZOOM_SUPERSAMPLE : 1
+			);
+
+			const audioArgs = buildAudioArgs(speed);
+
+			// Build ffmpeg args — use filter_complex when effects or zooms present
+			const extraInputs: string[] = [];
+			let videoFilterArgs: string[];
+			const hasOverlays = overlappingEffects.length > 0;
+
+			if (hasOverlays || hasZoom) {
+				for (const eff of overlappingEffects) {
+					const itsoffset = ['-itsoffset', (trimStart + eff.localStart).toFixed(3)];
+					if (eff.rawVideo) {
+						extraInputs.push(
+							...itsoffset,
+							'-f', 'rawvideo', '-pix_fmt', 'rgba',
+							'-s', `${eff.rawVideo.width}x${eff.rawVideo.height}`,
+							'-r', `${eff.rawVideo.fps}`,
+							'-i', eff.videoPath!
+						);
+					} else {
+						extraInputs.push(...itsoffset, '-i', eff.videoPath ?? eff.pngPath!);
+					}
+				}
+
+				// When zoom effects are present, composite at supersample resolution.
+				// This way overlays (chat panels, text) are rendered at 2x and composited
+				// at 2x, so the zoompan filter has native-resolution pixels to crop from
+				// instead of bilinear-upscaling already-rasterized overlays.
+				const ss = hasZoom ? ZOOM_SUPERSAMPLE : 1;
+
+				const speedFilter = speed !== 1 ? `setpts=PTS/${speed},` : '';
+				const scaleUp = hasZoom ? `,scale=${srcW * ss}:${srcH * ss}` : '';
+				let filterGraph = `[0:v]${speedFilter}format=yuv420p${scaleUp}[base]`;
+				let prevLabel = 'base';
+
+				// 1. Overlay chain (composited at ss resolution when zoom is present)
+				for (let ei = 0; ei < overlappingEffects.length; ei++) {
+					const eff = overlappingEffects[ei];
+					const inputIdx = ei + 1;
+					const isLastOverlay = ei === overlappingEffects.length - 1;
+					const nextLabel = isLastOverlay && !hasZoom ? 'outv' : `v${ei}`;
+					const enableStart = (trimStart + eff.localStart).toFixed(3);
+					const enableEnd = (trimStart + eff.localEnd).toFixed(3);
+					const alphaFmt = 'format=yuva420p';
+					// Adjust overlay position for supersample resolution
+					const ox = eff.x * ss;
+					const oy = eff.y * ss;
+					let overlayInput: string;
+					const effScale = (eff.scale && eff.scale !== 1) ? eff.scale : 1;
+					// Raw video overlays (twitch-chat) are already rendered at ss via chatScaleBoost.
+					// Non-raw overlays (PNGs) need FFmpeg scaling to match the ss composite.
+					const pngSsScale = !eff.rawVideo && ss > 1 ? ss : 1;
+					const totalScale = effScale * pngSsScale;
+					if (totalScale !== 1) {
+						const scaledLabel = `s${ei}`;
+						filterGraph += `;[${inputIdx}:v]scale=iw*${totalScale}:ih*${totalScale},${alphaFmt}[${scaledLabel}]`;
+						overlayInput = scaledLabel;
+					} else {
+						const prepLabel = `p${ei}`;
+						filterGraph += `;[${inputIdx}:v]${alphaFmt}[${prepLabel}]`;
+						overlayInput = prepLabel;
+					}
+					filterGraph += `;[${prevLabel}][${overlayInput}]overlay=${ox}:${oy}:enable='between(t,${enableStart},${enableEnd})'[${nextLabel}]`;
+					prevLabel = nextLabel;
+				}
+
+				// 2. Zoom chain (after all overlays — zooms the composited frame)
+				const zoomFps = probe.fps > 0 ? probe.fps : 30;
+				for (let zi = 0; zi < clipZooms.length; zi++) {
+					const isLast = zi === clipZooms.length - 1;
+					const nextLabel = isLast ? 'outv' : `zm${zi}`;
+					filterGraph += buildZoomFilter(prevLabel, nextLabel, clipZooms[zi], trimStart, srcW, srcH, zoomFps);
+					prevLabel = nextLabel;
+				}
+
+				// If no overlays and no zooms produced outv (shouldn't happen), rename
+				if (prevLabel === 'base') {
+					filterGraph = filterGraph.replace('[base]', '[outv]');
+				}
+
+					videoFilterArgs = [
+					'-filter_complex', filterGraph,
+					'-map', '[outv]', '-map', '0:a:0',
+					...buildVideoEncoderArgs(useNvenc)
 				];
 			} else {
-				videoArgs = [
+				const vFilters: string[] = [];
+				if (speed !== 1) vFilters.push(`setpts=PTS/${speed}`);
+				vFilters.push('format=yuv420p');
+
+				videoFilterArgs = [
 					'-vf', vFilters.join(','),
-					'-c:v', 'libx264',
-					'-preset', 'medium',
-					'-profile:v', 'high',
-					'-crf', '18',
-					'-bf', '2'
+					'-map', '0:v:0', '-map', '0:a:0',
+					...buildVideoEncoderArgs(useNvenc)
 				];
 			}
-
-			const audioArgs = aFilters.length > 0
-				? ['-af', aFilters.join(','), '-c:a', 'aac', '-ar', '48000', '-b:a', '192k']
-				: ['-c:a', 'aac', '-ar', '48000', '-b:a', '192k'];
 
 			await runFfmpeg([
 				'-fflags', '+genpts',
 				'-f', 'concat', '-safe', '0', '-i', concatPath,
+				...extraInputs,
 				'-ss', trimStart.toFixed(3),
 				'-t', dur.toFixed(3),
-				'-map', '0:v:0', '-map', '0:a:0',
-				...videoArgs,
+				...videoFilterArgs,
 				'-fps_mode', 'cfr',
 				...audioArgs,
 				'-video_track_timescale', '90000',
@@ -155,41 +199,26 @@ export async function exportVideo(
 			clipFiles.push(outFile);
 		}
 
+		clearEffectRendererCache();
+		clearChatEffectCache();
+
 		if (clipFiles.length === 0) {
 			throw new Error('All clips failed to encode — nothing to export');
 		}
 
-		const safeName = path.basename(filename).replace(/[<>:"/\\|?*]/g, '_');
-		const outputPath = path.join(EXPORTS_DIR, `${safeName}.mp4`);
+		const outputPath = buildOutputPath(filename, 'mp4');
 
-		if (clipFiles.length === 1) {
-			// Single clip — just move it
-			fs.renameSync(clipFiles[0], outputPath);
-		} else {
+		if (clipFiles.length > 1) {
 			const skipMsg = skipped > 0 ? ` (${skipped} skipped)` : '';
 			onProgress(`Concatenating ${clipFiles.length} clips${skipMsg}`, clips.length, totalSteps);
-
-			// Concat with stream copy — all clips are encoded with identical settings
-			const concatListPath = path.join(tempDir, 'final_concat.txt');
-			fs.writeFileSync(concatListPath, clipFiles.map((f) => ffmpegConcatEscape(f)).join('\n'));
-
-			await runFfmpeg([
-				'-fflags', '+genpts',
-				'-f', 'concat', '-safe', '0', '-i', concatListPath,
-				'-c', 'copy',
-				'-movflags', '+faststart',
-				'-y', outputPath
-			], 1000);
 		}
+
+		await concatClipFiles(clipFiles, tempDir, outputPath);
 
 		onProgress(`Done — saved to ${outputPath}`, totalSteps, totalSteps);
 		return { outputPath };
 	} finally {
-		try {
-			fs.rmSync(tempDir, { recursive: true, force: true });
-		} catch {
-			/* best effort */
-		}
+		cleanupTempDir(tempDir);
 	}
 }
 
@@ -217,6 +246,202 @@ export async function probeVideo(filePath: string): Promise<{ width: number; hei
 	} catch {
 		return { width: 0, height: 0, fps: 0 };
 	}
+}
+
+// --- Effect overlay helpers ---
+
+export interface ResolvedEffect {
+	pngPath?: string;    // for chat-message (static PNG)
+	videoPath?: string;  // for twitch-chat (raw RGBA or encoded video)
+	x: number;
+	y: number;
+	localStart: number;
+	localEnd: number;
+	scale?: number;      // uniform scale multiplier (default 1)
+	/** If set, videoPath is a raw RGBA file — needs explicit format args on input. */
+	rawVideo?: { width: number; height: number; fps: number };
+}
+
+/** Info about a clip needed for resolving twitch-chat effects. */
+export interface ClipContext {
+	streamId: string;
+	channel: string;
+	/** Stream-local start time (seconds since capture startedAt). */
+	streamLocalStart: number;
+	/** Stream-local end time. */
+	streamLocalEnd: number;
+}
+
+/**
+ * Find effects that overlap a clip's composition time window,
+ * render them as PNGs or WebMs, and return overlay parameters.
+ * Assumes 1920x1080 source resolution for pixel position calculation.
+ */
+export async function resolveOverlappingEffects(
+	effectEntries: EffectEntry[] | undefined,
+	clipCompStart: number,
+	clipCompEnd: number,
+	clipDur: number,
+	tempDir: string,
+	clipIdx: number,
+	videoWidth = 1920,
+	videoHeight = 1080,
+	clipContext?: ClipContext,
+	chatScaleBoost = 1
+): Promise<ResolvedEffect[]> {
+	if (!effectEntries || effectEntries.length === 0) return [];
+
+	// Sort by track so lower tracks render first (behind higher tracks)
+	const sorted = [...effectEntries].sort((a, b) => (a.track ?? 0) - (b.track ?? 0));
+
+	const results: ResolvedEffect[] = [];
+	for (let ei = 0; ei < sorted.length; ei++) {
+		const effect = sorted[ei];
+		if (effect.type === 'zoom') continue; // Zoom handled separately after all overlays
+		const effectEnd = effect.startTime + effect.duration;
+		// Check overlap
+		if (effect.startTime >= clipCompEnd || effectEnd <= clipCompStart) continue;
+
+		// Compute local time window within the clip
+		const localStart = Math.max(0, effect.startTime - clipCompStart);
+		const localEnd = Math.min(clipDur, effectEnd - clipCompStart);
+
+		if (effect.type === 'twitch-chat') {
+			// Render scrolling chat panel as transparent WebM
+			if (!clipContext) continue;
+
+			// Map the overlap window to stream-local time
+			const clipStreamDur = clipContext.streamLocalEnd - clipContext.streamLocalStart;
+			const overlapFracStart = localStart / clipDur;
+			const overlapFracEnd = localEnd / clipDur;
+			const streamStart = clipContext.streamLocalStart + overlapFracStart * clipStreamDur;
+			const streamEnd = clipContext.streamLocalStart + overlapFracEnd * clipStreamDur;
+
+			const videoOutPath = path.join(tempDir, `chatfx_${clipIdx}_${ei}.webm`);
+			try {
+				const result = await renderChatEffectVideo({
+					streamId: clipContext.streamId,
+					channel: clipContext.channel,
+					localStart: streamStart,
+					localEnd: streamEnd,
+					outputPath: videoOutPath,
+					panelWidth: effect.panelWidth,
+					panelHeight: effect.panelHeight,
+					chatOffset: effect.chatOffset,
+					fontWeight: effect.chatFontWeight,
+					chatScale: (effect.chatScale ?? 1) * chatScaleBoost
+				});
+
+				const x = Math.round(effect.x * videoWidth);
+				const y = Math.round(effect.y * videoHeight);
+				// Scale is baked into the render — no FFmpeg upscale needed
+				const rawVideo = result.raw ? { width: result.width, height: result.height, fps: result.fps } : undefined;
+				results.push({ videoPath: result.videoPath, x, y, localStart, localEnd, rawVideo });
+			} catch (err) {
+				console.warn(`[exporter] Failed to render twitch-chat effect ${ei}:`, err instanceof Error ? err.message : err);
+			}
+		} else {
+			// chat-message: render static PNG
+			if (!effect.twitchId) continue;
+
+			const pngPath = path.join(tempDir, `effect_${clipIdx}_${ei}.png`);
+			const result = await renderEffectOverlay({
+				twitchId: effect.twitchId,
+				outputPath: pngPath
+			});
+			if (!result) continue;
+
+			const x = Math.round(effect.x * videoWidth);
+			const y = Math.round(effect.y * videoHeight);
+			results.push({ pngPath, x, y, localStart, localEnd });
+		}
+	}
+	return results;
+}
+
+// --- Zoom effect helpers ---
+
+export interface ResolvedZoom {
+	localStart: number;
+	localEnd: number;
+	startW: number; // visible width fraction (0-1, 1 = full frame = no zoom)
+	endW: number;
+	startX: number; // normalized 0-1
+	startY: number;
+	endX: number;
+	endY: number;
+}
+
+/**
+ * Find zoom effects that overlap a clip's composition window.
+ * Returns normalized zoom parameters for each zoom.
+ */
+export function resolveZoomEffects(
+	effectEntries: EffectEntry[] | undefined,
+	clipCompStart: number,
+	clipCompEnd: number,
+	clipDur: number
+): ResolvedZoom[] {
+	if (!effectEntries) return [];
+	const results: ResolvedZoom[] = [];
+	for (const effect of effectEntries) {
+		if (effect.type !== 'zoom') continue;
+		const effectEnd = effect.startTime + effect.duration;
+		if (effect.startTime >= clipCompEnd || effectEnd <= clipCompStart) continue;
+
+		const localStart = Math.max(0, effect.startTime - clipCompStart);
+		const localEnd = Math.min(clipDur, effectEnd - clipCompStart);
+		results.push({
+			localStart, localEnd,
+			startW: Math.max(0.1, effect.zoomStartW ?? 1),
+			endW: Math.max(0.1, effect.zoomEndW ?? 1),
+			startX: effect.zoomStartX ?? 0,
+			startY: effect.zoomStartY ?? 0,
+			endX: effect.zoomEndX ?? 0,
+			endY: effect.zoomEndY ?? 0,
+		});
+	}
+	return results;
+}
+
+/**
+ * Build an FFmpeg zoompan filter for an animated zoom.
+ * Uses zoompan instead of crop+scale because crop locks output dimensions at init.
+ * Scales input up by SUPERSAMPLE before zoompan so integer x/y rounding gives
+ * sub-pixel precision, eliminating pan jitter.
+ */
+export const ZOOM_SUPERSAMPLE = 2;
+
+export function buildZoomFilter(
+	inputLabel: string,
+	outputLabel: string,
+	zoom: ResolvedZoom,
+	trimStart: number,
+	videoW: number,
+	videoH: number,
+	fps: number
+): string {
+	const T0 = (trimStart + zoom.localStart).toFixed(3);
+	const T1 = (trimStart + zoom.localEnd).toFixed(3);
+	const durExpr = `(${T1}-${T0}+0.001)`; // +epsilon avoids division by zero
+
+	function lerp(start: number, end: number, fallback: string) {
+		const frac = `clip((in_time-${T0})/${durExpr},0,1)`;
+		return `if(between(in_time,${T0},${T1}),${start}+(${end - start})*${frac},${fallback})`;
+	}
+
+	// Linearly interpolate the visible width fraction, then derive z = 1/w.
+	// This keeps zoom and pan visually in sync (both linear in screen space).
+	const wExpr = lerp(zoom.startW, zoom.endW, '1');
+	const zExpr = `1/(${wExpr})`;
+	const xExpr = lerp(zoom.startX, zoom.endX, '0');
+	const yExpr = lerp(zoom.startY, zoom.endY, '0');
+
+	// Scale up by SUPERSAMPLE → zoompan in high-res space (sub-pixel precision) → output at original size
+	const ssW = videoW * ZOOM_SUPERSAMPLE;
+	const ssH = videoH * ZOOM_SUPERSAMPLE;
+
+	return `;[${inputLabel}]scale=${ssW}:${ssH}:flags=bilinear,zoompan=z='${zExpr}':x='(${xExpr})*iw':y='(${yExpr})*ih':d=1:s=${videoW}x${videoH}:fps=${fps}[${outputLabel}]`;
 }
 
 let nvencCached: boolean | null = null;

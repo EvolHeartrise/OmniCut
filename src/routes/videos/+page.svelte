@@ -43,7 +43,6 @@
 	function formatLabel(format: string): string {
 		switch (format) {
 			case 'mobile_short': return '9:16';
-			case 'chat_overlay': return 'Chat';
 			default: return '16:9';
 		}
 	}

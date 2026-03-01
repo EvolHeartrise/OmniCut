@@ -19,7 +19,7 @@
 	import { page } from '$app/state';
 	import CameraRegionOverlay from '$lib/components/CameraRegionOverlay.svelte';
 	import ReviewTranscriptPanel from '$lib/components/ReviewTranscriptPanel.svelte';
-	import ReviewChatPanel from '$lib/components/ReviewChatPanel.svelte';
+	import ClipChatPanel from '$lib/components/ClipChatPanel.svelte';
 
 	// --- URL-targeted clip (e.g. /review?clip=123) ---
 	let urlClipId = $derived(page.url.searchParams.get('clip'));
@@ -991,7 +991,7 @@
 				<ReviewTranscriptPanel {clip} {currentLocalTime} onseek={(t) => { if (videoEl) videoEl.currentTime = t; }} />
 			{/if}
 			{#if chatPanelOpen}
-				<ReviewChatPanel {clip} {currentLocalTime} onseek={(t) => { if (videoEl) videoEl.currentTime = t; }} />
+				<ClipChatPanel {clip} {currentLocalTime} onseek={(t) => { if (videoEl) videoEl.currentTime = t; }} />
 			{/if}
 		</div>
 	{/if}
