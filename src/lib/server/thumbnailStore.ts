@@ -18,25 +18,22 @@ function ensureThumbnailsDir(): void {
 }
 
 /**
- * Save a PNG thumbnail. One thumbnail per export/video — overwrites existing.
- * Provide exportId, videoId, or both.
+ * Save a PNG thumbnail. One thumbnail per video — overwrites existing.
  */
 export function saveThumbnailFromPng(
-	exportId: string,
+	videoId: string,
 	pngBuffer: Buffer,
 	metadata?: {
 		width?: number;
 		height?: number;
 		layers?: LayerConfig[];
-		videoId?: string;
+		exportId?: string;
 	}
 ): ThumbnailRecord {
 	ensureThumbnailsDir();
 
-	// Check for existing thumbnail (by video first, then export)
-	const existing = metadata?.videoId
-		? db.loadThumbnailByVideo(metadata.videoId) ?? db.loadThumbnailByExport(exportId)
-		: db.loadThumbnailByExport(exportId);
+	// Check for existing thumbnail by video
+	const existing = db.loadThumbnailByVideo(videoId);
 	if (existing) {
 		try {
 			if (fs.existsSync(existing.filePath)) fs.unlinkSync(existing.filePath);
@@ -50,8 +47,8 @@ export function saveThumbnailFromPng(
 	const now = Math.floor(Date.now() / 1000);
 	const record: ThumbnailRecord = {
 		id,
-		exportId,
-		videoId: metadata?.videoId,
+		videoId,
+		exportId: metadata?.exportId,
 		filePath,
 		width: metadata?.width ?? 1280,
 		height: metadata?.height ?? 720,

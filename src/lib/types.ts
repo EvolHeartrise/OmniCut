@@ -70,6 +70,8 @@ export interface EffectEntry {
 	subtitleMaxWidth?: number;
 	/** For subtitle type: text alignment (default 'center'). */
 	subtitleTextAlign?: 'left' | 'center' | 'right';
+	/** For subtitle type: font family (default 'Inter'). */
+	subtitleFontFamily?: string;
 	/** For image type: ID of the uploaded image (filename in data/overlays/). */
 	imageId?: string;
 	/** For image type: display scale multiplier (default 1). */
@@ -86,6 +88,13 @@ export interface EffectEntry {
 	animOut?: OverlayAnimation;
 	/** Animation duration in seconds (default 0.3). */
 	animDuration?: number;
+	/** Optional drop shadow for overlay effects (not applicable to 'zoom'). */
+	shadow?: {
+		color: string;      // CSS color, e.g. 'rgba(0,0,0,0.8)'
+		blur: number;       // blur radius in pixels
+		offsetX: number;    // horizontal offset in pixels
+		offsetY: number;    // vertical offset in pixels
+	};
 }
 
 export type OverlayAnimation =

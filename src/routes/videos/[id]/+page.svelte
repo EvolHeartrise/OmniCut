@@ -569,6 +569,12 @@
 		return parts.join('; ');
 	}
 
+	function overlayShadowStyle(entry: EffectEntry): string {
+		if (!entry.shadow) return '';
+		const { color, blur, offsetX, offsetY } = entry.shadow;
+		return `filter: drop-shadow(${offsetX}px ${offsetY}px ${blur}px ${color})`;
+	}
+
 	function removeEffectEntry(id: string) {
 		effectEntries = effectEntries.filter((e) => e.id !== id);
 		if (selectedEffectId === id) selectedEffectId = null;
@@ -1648,7 +1654,7 @@
 								<div
 									class="chat-panel-placeholder"
 									class:bubble-selected={selectedEffectId === entry.id}
-									style="left: {entry.x * 100}%; top: {entry.y * 100}%; width: {pw * videoScale * cs}px; height: {ph * videoScale * cs}px; {overlayAnimStyle(entry, compositionTime)}"
+									style="left: {entry.x * 100}%; top: {entry.y * 100}%; width: {pw * videoScale * cs}px; height: {ph * videoScale * cs}px; {overlayAnimStyle(entry, compositionTime)}; {overlayShadowStyle(entry)}"
 									onpointerdown={(e) => handleOverlayPointerDown(e, entry.id)}
 									onpointermove={handleOverlayPointerMove}
 									onpointerup={handleOverlayPointerUp}
@@ -1698,7 +1704,7 @@
 								<div
 									class="image-overlay"
 									class:bubble-selected={selectedEffectId === entry.id}
-									style="left: {entry.x * 100}%; top: {entry.y * 100}%; {overlayAnimStyle(entry, compositionTime)}"
+									style="left: {entry.x * 100}%; top: {entry.y * 100}%; {overlayAnimStyle(entry, compositionTime)}; {overlayShadowStyle(entry)}"
 									onpointerdown={(e) => handleOverlayPointerDown(e, entry.id)}
 									onpointermove={handleOverlayPointerMove}
 									onpointerup={handleOverlayPointerUp}
@@ -1718,7 +1724,7 @@
 								<div
 									class="subtitle-overlay"
 									class:bubble-selected={selectedEffectId === entry.id}
-									style="left: {entry.x * 100}%; top: {entry.y * 100}%; max-width: {(entry.subtitleMaxWidth ?? 900) * videoScale}px; font-size: {(entry.subtitleFontSize ?? 48) * videoScale}px; font-weight: {entry.subtitleFontWeight ?? 700}; color: {entry.subtitleFontColor ?? '#FFFFFF'}; -webkit-text-stroke: {(entry.subtitleOutlineWidth ?? 4) * videoScale}px {entry.subtitleOutlineColor ?? '#000000'}; paint-order: stroke fill; text-align: {entry.subtitleTextAlign ?? 'center'}; {overlayAnimStyle(entry, compositionTime, true)}"
+									style="left: {entry.x * 100}%; top: {entry.y * 100}%; max-width: {(entry.subtitleMaxWidth ?? 900) * videoScale}px; font-size: {(entry.subtitleFontSize ?? 48) * videoScale}px; font-weight: {entry.subtitleFontWeight ?? 700}; font-family: '{entry.subtitleFontFamily ?? 'Inter'}', sans-serif; color: {entry.subtitleFontColor ?? '#FFFFFF'}; -webkit-text-stroke: {(entry.subtitleOutlineWidth ?? 4) * videoScale}px {entry.subtitleOutlineColor ?? '#000000'}; paint-order: stroke fill; text-align: {entry.subtitleTextAlign ?? 'center'}; {overlayAnimStyle(entry, compositionTime, true)}; {overlayShadowStyle(entry)}"
 									onpointerdown={(e) => handleOverlayPointerDown(e, entry.id)}
 									onpointermove={handleOverlayPointerMove}
 									onpointerup={handleOverlayPointerUp}
@@ -1730,7 +1736,7 @@
 									<div
 										class="chat-bubble"
 										class:bubble-selected={selectedEffectId === entry.id}
-										style="left: {entry.x * 100}%; top: {entry.y * 100}%; {overlayAnimStyle(entry, compositionTime)}"
+										style="left: {entry.x * 100}%; top: {entry.y * 100}%; {overlayAnimStyle(entry, compositionTime)}; {overlayShadowStyle(entry)}"
 										onpointerdown={(e) => handleOverlayPointerDown(e, entry.id)}
 										onpointermove={handleOverlayPointerMove}
 										onpointerup={handleOverlayPointerUp}
@@ -2002,6 +2008,24 @@
 									></textarea>
 								</div>
 								<div class="prop-field">
+									<label class="prop-label">Font Family</label>
+									<select
+										class="prop-input"
+										value={selEffect.subtitleFontFamily ?? 'Inter'}
+										onchange={(e) => updateEffectEntry(selEffect.id, { subtitleFontFamily: (e.target as HTMLSelectElement).value })}
+									>
+										<option value="Inter">Inter</option>
+										<option value="Arial">Arial</option>
+										<option value="Impact">Impact</option>
+										<option value="Georgia">Georgia</option>
+										<option value="Times New Roman">Times New Roman</option>
+										<option value="Courier New">Courier New</option>
+										<option value="Verdana">Verdana</option>
+										<option value="Comic Sans MS">Comic Sans MS</option>
+										<option value="Trebuchet MS">Trebuchet MS</option>
+									</select>
+								</div>
+								<div class="prop-field">
 									<label class="prop-label">Font Size (px)</label>
 									<input
 										type="number"
@@ -2165,6 +2189,101 @@
 									onchange={(e) => updateEffectEntry(selEffect.id, { animDuration: +(e.target as HTMLInputElement).value })}
 								/>
 							</div>
+						</div>
+						{/if}
+
+						{#if !isZoom}
+						<div class="props-section">
+							<div class="prop-field" style="margin-top: 4px">
+								<label class="prop-label" style="font-weight:600;color:#94a3b8">Shadow</label>
+							</div>
+							<div class="prop-field">
+								<label class="prop-label">
+									<input
+										type="checkbox"
+										checked={!!selEffect.shadow}
+										onchange={() => {
+											if (selEffect.shadow) {
+												updateEffectEntry(selEffect.id, { shadow: undefined } as any);
+											} else {
+												updateEffectEntry(selEffect.id, { shadow: { color: 'rgba(0,0,0,0.8)', blur: 4, offsetX: 2, offsetY: 2 } });
+											}
+										}}
+									/>
+									Enable Shadow
+								</label>
+							</div>
+							{#if selEffect.shadow}
+								<div class="prop-field">
+									<label class="prop-label">Color</label>
+									<input
+										type="color"
+										class="prop-input"
+										value={(() => { const m = selEffect.shadow!.color.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/); if (m) { return '#' + [m[1],m[2],m[3]].map(v => (+v).toString(16).padStart(2,'0')).join(''); } return selEffect.shadow!.color; })()}
+										onchange={(e) => {
+											const hex = (e.target as HTMLInputElement).value;
+											const r = parseInt(hex.slice(1,3),16), g = parseInt(hex.slice(3,5),16), b = parseInt(hex.slice(5,7),16);
+											const m = selEffect.shadow!.color.match(/([\d.]+)\)$/);
+											const a = m ? m[1] : '0.8';
+											updateEffectEntry(selEffect.id, { shadow: { ...selEffect.shadow!, color: `rgba(${r},${g},${b},${a})` } });
+										}}
+									/>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Opacity</label>
+									<input
+										type="range"
+										class="prop-input"
+										min="0"
+										max="1"
+										step="0.05"
+										value={parseFloat(selEffect.shadow!.color.match(/([\d.]+)\)$/)?.[1] ?? '0.8')}
+										oninput={(e) => {
+											const opacity = +(e.target as HTMLInputElement).value;
+											const m = selEffect.shadow!.color.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+											const [r,g,b] = m ? [m[1],m[2],m[3]] : ['0','0','0'];
+											updateEffectEntry(selEffect.id, { shadow: { ...selEffect.shadow!, color: `rgba(${r},${g},${b},${opacity})` } });
+										}}
+									/>
+									<span style="font-size: 0.6rem; color: #94a3b8">{parseFloat(selEffect.shadow!.color.match(/([\d.]+)\)$/)?.[1] ?? '0.8').toFixed(2)}</span>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Blur</label>
+									<input
+										type="number"
+										class="prop-input"
+										min="0"
+										max="50"
+										step="1"
+										value={selEffect.shadow!.blur}
+										onchange={(e) => updateEffectEntry(selEffect.id, { shadow: { ...selEffect.shadow!, blur: +(e.target as HTMLInputElement).value } })}
+									/>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Offset X</label>
+									<input
+										type="number"
+										class="prop-input"
+										min="-50"
+										max="50"
+										step="1"
+										value={selEffect.shadow!.offsetX}
+										onchange={(e) => updateEffectEntry(selEffect.id, { shadow: { ...selEffect.shadow!, offsetX: +(e.target as HTMLInputElement).value } })}
+									/>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Offset Y</label>
+									<input
+										type="number"
+										class="prop-input"
+										min="-50"
+										max="50"
+										step="1"
+										value={selEffect.shadow!.offsetY}
+										onchange={(e) => updateEffectEntry(selEffect.id, { shadow: { ...selEffect.shadow!, offsetY: +(e.target as HTMLInputElement).value } })}
+									/>
+								</div>
+							{/if}
 						</div>
 						{/if}
 

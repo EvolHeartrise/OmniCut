@@ -280,6 +280,24 @@ export async function probeVideo(filePath: string): Promise<{ width: number; hei
 
 // --- Effect overlay helpers ---
 
+export interface ShadowConfig {
+	color: string;
+	blur: number;
+	offsetX: number;
+	offsetY: number;
+}
+
+function shadowPadding(shadow?: ShadowConfig): { top: number; right: number; bottom: number; left: number } {
+	if (!shadow) return { top: 0, right: 0, bottom: 0, left: 0 };
+	const b = shadow.blur;
+	return {
+		top:    Math.max(0, b - shadow.offsetY),
+		bottom: Math.max(0, b + shadow.offsetY),
+		left:   Math.max(0, b - shadow.offsetX),
+		right:  Math.max(0, b + shadow.offsetX),
+	};
+}
+
 export interface ResolvedEffect {
 	pngPath?: string;    // for chat-message (static PNG)
 	videoPath?: string;  // for twitch-chat (raw RGBA or encoded video)
@@ -373,11 +391,14 @@ export async function resolveOverlappingEffects(
 					panelHeight: effect.panelHeight,
 					chatOffset: effect.chatOffset,
 					fontWeight: effect.chatFontWeight,
-					chatScale: (effect.chatScale ?? 1) * chatScaleBoost
+					chatScale: (effect.chatScale ?? 1) * chatScaleBoost,
+					shadow: effect.shadow,
 				});
 
-				const x = Math.round(effect.x * videoWidth);
-				const y = Math.round(effect.y * videoHeight);
+				const sp = shadowPadding(effect.shadow);
+				const chatSc = (effect.chatScale ?? 1) * chatScaleBoost;
+				const x = Math.round(effect.x * videoWidth) - Math.round(sp.left * chatSc);
+				const y = Math.round(effect.y * videoHeight) - Math.round(sp.top * chatSc);
 				// Scale is baked into the render — no FFmpeg upscale needed
 				const rawVideo = result.raw ? { width: result.width, height: result.height, fps: result.fps } : undefined;
 				resolved = { videoPath: result.videoPath, x, y, localStart, localEnd, rawVideo,
@@ -386,7 +407,7 @@ export async function resolveOverlappingEffects(
 				console.warn(`[exporter] Failed to render twitch-chat effect ${ei}:`, err instanceof Error ? err.message : err);
 			}
 		} else if (effect.type === 'image') {
-			// image: load uploaded image, optionally scale, apply opacity
+			// image: load uploaded image, optionally scale, apply opacity, apply shadow
 			if (!effect.imageId) continue;
 
 			const imgDir = path.resolve(process.cwd(), 'data', 'overlays');
@@ -402,25 +423,38 @@ export async function resolveOverlappingEffects(
 			const opacity = effect.imageOpacity ?? 1;
 			const scaledW = Math.round(img.width * scale);
 			const scaledH = Math.round(img.height * scale);
+			const sp = shadowPadding(effect.shadow);
 
 			const pngPath = path.join(tempDir, `image_${clipIdx}_${ei}.png`);
 
-			if (scale !== 1 || opacity < 1 || !imgFilePath.toLowerCase().endsWith('.png')) {
-				// Re-render via canvas at scaled size with opacity
-				const canvas = createCanvas(scaledW, scaledH);
+			if (scale !== 1 || opacity < 1 || effect.shadow || !imgFilePath.toLowerCase().endsWith('.png')) {
+				// Re-render via canvas at scaled size with opacity and optional shadow
+				const canvasW = scaledW + sp.left + sp.right;
+				const canvasH = scaledH + sp.top + sp.bottom;
+				const canvas = createCanvas(canvasW, canvasH);
 				const ctx = canvas.getContext('2d');
+				if (effect.shadow) {
+					ctx.shadowColor = effect.shadow.color;
+					ctx.shadowBlur = effect.shadow.blur;
+					ctx.shadowOffsetX = effect.shadow.offsetX;
+					ctx.shadowOffsetY = effect.shadow.offsetY;
+				}
 				ctx.globalAlpha = opacity;
-				ctx.drawImage(img, 0, 0, scaledW, scaledH);
+				ctx.drawImage(img, sp.left, sp.top, scaledW, scaledH);
 				fs.writeFileSync(pngPath, canvas.toBuffer('image/png'));
+
+				const x = Math.round(effect.x * videoWidth) - sp.left;
+				const y = Math.round(effect.y * videoHeight) - sp.top;
+				resolved = { pngPath, x, y, localStart, localEnd,
+					overlayWidth: canvasW, overlayHeight: canvasH };
 			} else {
 				// Use directly
 				fs.copyFileSync(imgFilePath, pngPath);
+				const x = Math.round(effect.x * videoWidth);
+				const y = Math.round(effect.y * videoHeight);
+				resolved = { pngPath, x, y, localStart, localEnd,
+					overlayWidth: scaledW, overlayHeight: scaledH };
 			}
-
-			const x = Math.round(effect.x * videoWidth);
-			const y = Math.round(effect.y * videoHeight);
-			resolved = { pngPath, x, y, localStart, localEnd,
-				overlayWidth: scaledW, overlayHeight: scaledH };
 		} else if (effect.type === 'subtitle') {
 			// subtitle: render styled text as PNG
 			if (!effect.subtitleText) continue;
@@ -436,11 +470,16 @@ export async function resolveOverlappingEffects(
 				fontWeight: effect.subtitleFontWeight,
 				maxWidth: effect.subtitleMaxWidth,
 				textAlign: effect.subtitleTextAlign,
+				fontFamily: effect.subtitleFontFamily,
+				shadow: effect.shadow,
 			});
 
 			// Center horizontally at the specified x position
-			const x = Math.round(effect.x * videoWidth - result.width / 2);
-			const y = Math.round(effect.y * videoHeight);
+			// When shadow padding is present, compute content width for centering
+			const sp = shadowPadding(effect.shadow);
+			const contentW = result.width - sp.left - sp.right;
+			const x = Math.round(effect.x * videoWidth - contentW / 2) - sp.left;
+			const y = Math.round(effect.y * videoHeight) - sp.top;
 			resolved = { pngPath, x, y, localStart, localEnd,
 				overlayWidth: result.width, overlayHeight: result.height };
 		} else {
@@ -450,12 +489,14 @@ export async function resolveOverlappingEffects(
 			const pngPath = path.join(tempDir, `effect_${clipIdx}_${ei}.png`);
 			const result = await renderEffectOverlay({
 				twitchId: effect.twitchId,
-				outputPath: pngPath
+				outputPath: pngPath,
+				shadow: effect.shadow,
 			});
 			if (!result) continue;
 
-			const x = Math.round(effect.x * videoWidth);
-			const y = Math.round(effect.y * videoHeight);
+			const sp = shadowPadding(effect.shadow);
+			const x = Math.round(effect.x * videoWidth) - sp.left;
+			const y = Math.round(effect.y * videoHeight) - sp.top;
 			resolved = { pngPath, x, y, localStart, localEnd,
 				overlayWidth: result.width, overlayHeight: result.height };
 		}

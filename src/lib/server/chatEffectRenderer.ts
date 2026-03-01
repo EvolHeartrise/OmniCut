@@ -17,6 +17,7 @@ import {
 	CHAT_BADGE_SIZE, CHAT_EMOTE_HEIGHT, CHAT_PAD_X, CHAT_PAD_Y,
 	type PreparedMessage
 } from './chatRenderer.js';
+import type { ShadowConfig } from './exporter.js';
 
 const MAX_VISIBLE = 200;
 const FPS = 30;
@@ -165,6 +166,7 @@ export async function renderChatEffectVideo(opts: {
 	chatOffset?: number;  // shift chat timeline in seconds (default 0)
 	fontWeight?: number;  // CSS font-weight for chat text (default 400)
 	chatScale?: number;   // render at scaled resolution for crisp output (default 1)
+	shadow?: ShadowConfig;
 }): Promise<{ videoPath: string; width: number; height: number; raw: true; fps: number }> {
 	const {
 		streamId, channel,
@@ -174,7 +176,8 @@ export async function renderChatEffectVideo(opts: {
 		panelHeight = 1080,
 		chatOffset = 0,
 		fontWeight,
-		chatScale = 1
+		chatScale = 1,
+		shadow,
 	} = opts;
 
 	const dur = localEnd - localStart;
@@ -240,16 +243,27 @@ export async function renderChatEffectVideo(opts: {
 	// Render at scaled resolution so text/emotes are crisp (no blurry FFmpeg upscale).
 	const pixelW = Math.round(panelWidth * chatScale) & ~1;   // even width
 	const pixelH = Math.round(panelHeight * chatScale) & ~1;  // even height
+
+	// Shadow padding (scaled to match render resolution)
+	const sp = shadow ? shadowPad(shadow, chatScale) : { top: 0, right: 0, bottom: 0, left: 0 };
+	const outW = (pixelW + sp.left + sp.right) & ~1;  // keep even
+	const outH = (pixelH + sp.top + sp.bottom) & ~1;
+
 	const rawPath = outputPath.replace(/\.\w+$/, '.rgba');
 	const totalFrames = Math.ceil(dur * FPS);
 
-	console.log(`[chat-fx] Rendering ${totalFrames} frames (${dur.toFixed(2)}s) ${pixelW}x${pixelH} → ${rawPath}`);
+	console.log(`[chat-fx] Rendering ${totalFrames} frames (${dur.toFixed(2)}s) ${outW}x${outH} → ${rawPath}`);
 	console.log(`[chat-fx]   stream time ${localStart.toFixed(2)}→${localEnd.toFixed(2)}, ${prepared.length} messages loaded (chatOffset=${chatOffset})`);
 
 	const fd = fs.openSync(rawPath, 'w');
 
 	const canvas = createCanvas(pixelW, pixelH);
 	const ctx = canvas.getContext('2d');
+
+	// Shadow canvas (only created if shadow is present)
+	const shadowCanvas = shadow ? createCanvas(outW, outH) : null;
+	const shadowCtx = shadowCanvas?.getContext('2d') ?? null;
+
 	let lastMsgIds: string | null = null;
 	let lastFrameBuf: Buffer | null = null;
 	let uniqueFrames = 0;
@@ -275,8 +289,21 @@ export async function renderChatEffectVideo(opts: {
 			ctx.scale(chatScale, chatScale);
 			renderFrame(ctx, prepared, currentTime, elapsedMs, panelWidth, panelHeight, chatFont, chatBoldFont);
 			ctx.restore();
-			const imageData = ctx.getImageData(0, 0, pixelW, pixelH);
-			lastFrameBuf = Buffer.from(imageData.data);  // copy the RGBA data
+
+			if (shadowCtx && shadow) {
+				// Two-pass: draw content canvas onto shadow canvas with shadow applied
+				shadowCtx.clearRect(0, 0, outW, outH);
+				shadowCtx.shadowColor = shadow.color;
+				shadowCtx.shadowBlur = shadow.blur * chatScale;
+				shadowCtx.shadowOffsetX = shadow.offsetX * chatScale;
+				shadowCtx.shadowOffsetY = shadow.offsetY * chatScale;
+				shadowCtx.drawImage(canvas, sp.left, sp.top);
+				const imageData = shadowCtx.getImageData(0, 0, outW, outH);
+				lastFrameBuf = Buffer.from(imageData.data);
+			} else {
+				const imageData = ctx.getImageData(0, 0, pixelW, pixelH);
+				lastFrameBuf = Buffer.from(imageData.data);
+			}
 			lastMsgIds = msgIds;
 			uniqueFrames++;
 		}
@@ -286,9 +313,21 @@ export async function renderChatEffectVideo(opts: {
 
 	fs.closeSync(fd);
 
-	const expectedSize = totalFrames * pixelW * pixelH * 4;
+	const expectedSize = totalFrames * outW * outH * 4;
 	const actualSize = fs.statSync(rawPath).size;
 	console.log(`[chat-fx]   ${uniqueFrames} unique frames, raw file ${actualSize} bytes (expected ${expectedSize}, ${actualSize === expectedSize ? 'OK' : 'MISMATCH!'})`);
 
-	return { videoPath: rawPath, width: pixelW, height: pixelH, raw: true as const, fps: FPS };
+	return { videoPath: rawPath, width: outW, height: outH, raw: true as const, fps: FPS };
+}
+
+function shadowPad(shadow: ShadowConfig, scale: number): { top: number; right: number; bottom: number; left: number } {
+	const b = Math.round(shadow.blur * scale);
+	const ox = Math.round(shadow.offsetX * scale);
+	const oy = Math.round(shadow.offsetY * scale);
+	return {
+		top:    Math.max(0, b - oy),
+		bottom: Math.max(0, b + oy),
+		left:   Math.max(0, b - ox),
+		right:  Math.max(0, b + ox),
+	};
 }

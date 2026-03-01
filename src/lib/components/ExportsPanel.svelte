@@ -379,7 +379,6 @@
 										{isPreviewing ? '\u2715' : '\u25B6'}
 									</button>
 								{/if}
-								<a class="btn-thumbnail" href="/thumbnail?export={exp.id}">Thumbnail</a>
 								{#if exp.status === 'ready'}
 									<a class="btn-upload" href="/upload?export={exp.id}">Upload</a>
 								{/if}
@@ -537,22 +536,6 @@
 	.btn-preview:hover {
 		background: #3a3a5a;
 		color: #fff;
-	}
-
-	.btn-thumbnail {
-		background: rgba(59, 130, 246, 0.15);
-		border: 1px solid rgba(59, 130, 246, 0.3);
-		color: #93c5fd;
-		font-size: 0.65rem;
-		padding: 2px 8px;
-		border-radius: 3px;
-		cursor: pointer;
-		text-decoration: none;
-	}
-
-	.btn-thumbnail:hover {
-		background: rgba(59, 130, 246, 0.25);
-		color: #bfdbfe;
 	}
 
 	.btn-upload {

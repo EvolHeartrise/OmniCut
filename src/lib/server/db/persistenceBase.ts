@@ -211,7 +211,8 @@ export async function initDatabase(): Promise<void> {
 
 		CREATE TABLE IF NOT EXISTS thumbnails (
 			id TEXT PRIMARY KEY,
-			export_id TEXT NOT NULL,
+			export_id TEXT,
+			video_id TEXT,
 			file_path TEXT NOT NULL,
 			width INTEGER NOT NULL DEFAULT 1280,
 			height INTEGER NOT NULL DEFAULT 720,
@@ -221,7 +222,8 @@ export async function initDatabase(): Promise<void> {
 			ai_enhanced INTEGER NOT NULL DEFAULT 0,
 			created_at INTEGER NOT NULL DEFAULT (unixepoch()),
 			updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
-			FOREIGN KEY (export_id) REFERENCES exports(id) ON DELETE CASCADE
+			FOREIGN KEY (export_id) REFERENCES exports(id) ON DELETE SET NULL,
+			FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE
 		);
 
 		CREATE TABLE IF NOT EXISTS channel_camera_bounds (

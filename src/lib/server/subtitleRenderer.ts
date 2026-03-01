@@ -5,6 +5,7 @@
 
 import * as fs from 'node:fs';
 import { createCanvas, type SKRSContext2D } from '@napi-rs/canvas';
+import type { ShadowConfig } from './exporter.js';
 
 const DEFAULT_FONT_SIZE = 48;
 const DEFAULT_FONT_COLOR = '#FFFFFF';
@@ -27,6 +28,8 @@ export async function renderSubtitleOverlay(opts: {
 	fontWeight?: number;
 	maxWidth?: number;
 	textAlign?: 'left' | 'center' | 'right';
+	fontFamily?: string;
+	shadow?: ShadowConfig;
 }): Promise<{ pngPath: string; width: number; height: number }> {
 	const {
 		text,
@@ -38,10 +41,12 @@ export async function renderSubtitleOverlay(opts: {
 		fontWeight = DEFAULT_FONT_WEIGHT,
 		maxWidth = DEFAULT_MAX_WIDTH,
 		textAlign = DEFAULT_TEXT_ALIGN,
+		fontFamily = 'Inter',
+		shadow,
 	} = opts;
 
-	const fontFamily = 'Inter, Arial, sans-serif';
-	const font = `${fontWeight} ${fontSize}px ${fontFamily}`;
+	const fontFamilyFull = `${fontFamily}, sans-serif`;
+	const font = `${fontWeight} ${fontSize}px ${fontFamilyFull}`;
 	const lineHeight = Math.ceil(fontSize * LINE_HEIGHT_FACTOR);
 	// Account for outline bleed in content width
 	const contentWidth = maxWidth - (PADDING_X + outlineWidth) * 2;
@@ -63,7 +68,7 @@ export async function renderSubtitleOverlay(opts: {
 	const canvasWidth = Math.ceil(actualMaxLineWidth + pad * 2);
 	const canvasHeight = Math.ceil(lines.length * lineHeight + (PADDING_Y + outlineWidth) * 2);
 
-	// Render
+	// Render text onto content canvas
 	const canvas = createCanvas(canvasWidth, canvasHeight);
 	const ctx = canvas.getContext('2d');
 
@@ -97,11 +102,37 @@ export async function renderSubtitleOverlay(opts: {
 		ctx.fillText(lines[i], x, y);
 	}
 
+	// If shadow, use two-pass: draw content canvas onto padded canvas with shadow
+	if (shadow) {
+		const sp = shadowPad(shadow);
+		const finalW = canvasWidth + sp.left + sp.right;
+		const finalH = canvasHeight + sp.top + sp.bottom;
+		const finalCanvas = createCanvas(finalW, finalH);
+		const finalCtx = finalCanvas.getContext('2d');
+		finalCtx.shadowColor = shadow.color;
+		finalCtx.shadowBlur = shadow.blur;
+		finalCtx.shadowOffsetX = shadow.offsetX;
+		finalCtx.shadowOffsetY = shadow.offsetY;
+		finalCtx.drawImage(canvas, sp.left, sp.top);
+		fs.writeFileSync(outputPath, finalCanvas.toBuffer('image/png'));
+		return { pngPath: outputPath, width: finalW, height: finalH };
+	}
+
 	// Write PNG
 	const pngBuffer = canvas.toBuffer('image/png');
 	fs.writeFileSync(outputPath, pngBuffer);
 
 	return { pngPath: outputPath, width: canvasWidth, height: canvasHeight };
+}
+
+function shadowPad(shadow: ShadowConfig): { top: number; right: number; bottom: number; left: number } {
+	const b = shadow.blur;
+	return {
+		top:    Math.max(0, b - shadow.offsetY),
+		bottom: Math.max(0, b + shadow.offsetY),
+		left:   Math.max(0, b - shadow.offsetX),
+		right:  Math.max(0, b + shadow.offsetX),
+	};
 }
 
 /** Word-wrap text to fit within maxWidth pixels. */

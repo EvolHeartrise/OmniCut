@@ -24,6 +24,7 @@ import {
 	CHAT_PAD_X,
 	CHAT_PAD_Y,
 } from './chatRenderer.js';
+import type { ShadowConfig } from './exporter.js';
 
 // Default max width for effect overlays (pixels at 1920-wide resolution)
 const DEFAULT_MAX_WIDTH = 400;
@@ -41,8 +42,9 @@ export async function renderEffectOverlay(opts: {
 	twitchId: string;
 	outputPath: string;
 	maxWidth?: number;
+	shadow?: ShadowConfig;
 }): Promise<{ pngPath: string; width: number; height: number } | null> {
-	const { twitchId, outputPath, maxWidth = DEFAULT_MAX_WIDTH } = opts;
+	const { twitchId, outputPath, maxWidth = DEFAULT_MAX_WIDTH, shadow } = opts;
 
 	// Load the chat message from DB
 	const msg = loadChatMessageByTwitchId(twitchId);
@@ -156,6 +158,22 @@ export async function renderEffectOverlay(opts: {
 		lineY += line.height;
 	}
 
+	// If shadow, two-pass: draw content canvas onto padded canvas with shadow
+	if (shadow) {
+		const sp = shadowPad(shadow);
+		const finalW = canvasWidth + sp.left + sp.right;
+		const finalH = canvasHeight + sp.top + sp.bottom;
+		const finalCanvas = createCanvas(finalW, finalH);
+		const finalCtx = finalCanvas.getContext('2d');
+		finalCtx.shadowColor = shadow.color;
+		finalCtx.shadowBlur = shadow.blur;
+		finalCtx.shadowOffsetX = shadow.offsetX;
+		finalCtx.shadowOffsetY = shadow.offsetY;
+		finalCtx.drawImage(canvas, sp.left, sp.top);
+		fs.writeFileSync(outputPath, finalCanvas.toBuffer('image/png'));
+		return { pngPath: outputPath, width: finalW, height: finalH };
+	}
+
 	// Write PNG
 	const pngBuffer = canvas.toBuffer('image/png');
 	fs.writeFileSync(outputPath, pngBuffer);
@@ -166,6 +184,16 @@ export async function renderEffectOverlay(opts: {
 /** Clear the channel data cache (call between exports if needed). */
 export function clearEffectRendererCache(): void {
 	channelCache.clear();
+}
+
+function shadowPad(shadow: ShadowConfig): { top: number; right: number; bottom: number; left: number } {
+	const b = shadow.blur;
+	return {
+		top:    Math.max(0, b - shadow.offsetY),
+		bottom: Math.max(0, b + shadow.offsetY),
+		left:   Math.max(0, b - shadow.offsetX),
+		right:  Math.max(0, b + shadow.offsetX),
+	};
 }
 
 function drawRoundedRect(

@@ -152,10 +152,9 @@ async function runUpload(uploadId: string): Promise<void> {
 			}
 		}
 
-		// Auto-set thumbnail if one exists (check video first, then export)
+		// Auto-set thumbnail if one exists for the video
 		try {
-			const thumbnail = (exportRecord?.videoId ? db.loadThumbnailByVideo(exportRecord.videoId) : null)
-				?? db.loadThumbnailByExport(record.exportId);
+			const thumbnail = exportRecord?.videoId ? db.loadThumbnailByVideo(exportRecord.videoId) : null;
 			if (thumbnail) {
 				const fs = await import('node:fs');
 				if (fs.existsSync(thumbnail.filePath)) {

@@ -637,12 +637,6 @@ export const youtubeDeleteUploadCmd = command('unchecked', async (args: { id: st
 // Queries — Thumbnails
 // ---------------------------------------------------------------------------
 
-/** Get thumbnail for an export. */
-export const getThumbnailByExport = query('unchecked', async (args: { exportId: string }) => {
-	const { loadThumbnailByExport } = await import('$lib/server/db/index.js');
-	return { thumbnail: loadThumbnailByExport(args.exportId) };
-});
-
 /** Check if AI (Gemini) is configured. */
 export const isAIConfigured = query(async () => {
 	const { isAIConfigured } = await import('$lib/server/thumbnailStore.js');
@@ -653,10 +647,10 @@ export const isAIConfigured = query(async () => {
 // Commands — Thumbnails
 // ---------------------------------------------------------------------------
 
-/** Save a thumbnail PNG for an export or video. */
+/** Save a thumbnail PNG for a video. */
 export const saveThumbnailCmd = command('unchecked', async (args: {
-	exportId: string;
-	videoId?: string;
+	videoId: string;
+	exportId?: string;
 	pngBase64: string;
 	width?: number;
 	height?: number;
@@ -689,11 +683,11 @@ export const saveThumbnailCmd = command('unchecked', async (args: {
 }) => {
 	const { saveThumbnailFromPng } = await import('$lib/server/thumbnailStore.js');
 	const pngBuffer = Buffer.from(args.pngBase64, 'base64');
-	const record = saveThumbnailFromPng(args.exportId, pngBuffer, {
+	const record = saveThumbnailFromPng(args.videoId, pngBuffer, {
 		width: args.width,
 		height: args.height,
 		layers: args.layers,
-		videoId: args.videoId
+		exportId: args.exportId
 	});
 	return record;
 });

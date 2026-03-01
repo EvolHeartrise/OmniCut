@@ -12,7 +12,6 @@
 		youtubeUploadCmd,
 		youtubeDeleteUploadCmd,
 		listExports,
-		getThumbnailByExport,
 		getThumbnailByVideo
 	} from '$lib/streams.remote';
 
@@ -183,25 +182,17 @@
 			title = exp.title;
 			description = exp.description ?? '';
 		}
-		// Fetch thumbnail — try video first (if export has videoId), then fall back to export
+		// Fetch thumbnail for the video
 		thumbnailId = null;
 		thumbnailUrl = null;
-		const tryVideoThumbnail = exp?.videoId
-			? getThumbnailByVideo({ videoId: exp.videoId }).then((data) => data.thumbnail).catch(() => null)
-			: Promise.resolve(null);
-		tryVideoThumbnail.then((videoThumb) => {
-			if (videoThumb) {
-				thumbnailId = videoThumb.id;
-				thumbnailUrl = `/api/thumbnail/${videoThumb.id}`;
-			} else {
-				getThumbnailByExport({ exportId }).then((data) => {
-					if (data.thumbnail) {
-						thumbnailId = data.thumbnail.id;
-						thumbnailUrl = `/api/thumbnail/${data.thumbnail.id}`;
-					}
-				}).catch(() => {});
-			}
-		});
+		if (exp?.videoId) {
+			getThumbnailByVideo({ videoId: exp.videoId }).then((data) => {
+				if (data.thumbnail) {
+					thumbnailId = data.thumbnail.id;
+					thumbnailUrl = `/api/thumbnail/${data.thumbnail.id}`;
+				}
+			}).catch(() => {});
+		}
 	}
 
 	// Fetch categories on mount (once)
@@ -446,10 +437,10 @@ YOUTUBE_REDIRECT_URI=http://localhost:5173/api/youtube/callback</pre>
 							<img class="thumbnail-img" src={thumbnailUrl} alt="Thumbnail" />
 							<span class="thumbnail-hint">Will be auto-set after upload</span>
 						</div>
-					{:else if selectedExportId}
+					{:else if selectedExport?.videoId}
 						<div class="thumbnail-preview">
 							<span class="thumbnail-label">Thumbnail</span>
-							<a class="thumbnail-link" href="/thumbnail?export={selectedExportId}">Create a thumbnail</a>
+							<a class="thumbnail-link" href="/thumbnail?video={selectedExport.videoId}">Create a thumbnail</a>
 						</div>
 					{/if}
 

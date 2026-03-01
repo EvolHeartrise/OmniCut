@@ -1,27 +1,15 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { streams, clipRegions, syncOffsets, videos } from '$lib/stores/streams.js';
-	import { listExports } from '$lib/streams.remote';
-
-	interface ExportRecord {
-		id: string;
-		title: string;
-		clipIds: string[];
-		status: string;
-	}
 
 	interface Props {
-		preselectedExportId?: string | null;
 		preselectedVideoId?: string | null;
 		onFrameSelected: (blobUrl: string, streamId: string, timestamp: number) => void;
-		onExportSelected?: (exportId: string) => void;
 		onVideoSelected?: (videoId: string) => void;
 	}
 
-	let { preselectedExportId = null, preselectedVideoId = null, onFrameSelected, onExportSelected, onVideoSelected }: Props = $props();
+	let { preselectedVideoId = null, onFrameSelected, onVideoSelected }: Props = $props();
 
-	let exports = $state<ExportRecord[]>([]);
-	let selectedExportId = $state<string | null>(null);
 	let selectedVideoId = $state<string | null>(null);
 	let selectedClipId = $state<string | null>(null);
 	let scrubValue = $state(0);
@@ -33,26 +21,16 @@
 	let previewStreamId = $state<string | null>(null);
 	let previewTimestamp = $state<number>(0);
 
-	let readyExports = $derived(exports.filter((e) => e.status === 'ready'));
-
-	let selectedExportClips = $derived.by(() => {
-		// Prefer video clips if selected
-		if (selectedVideoId) {
-			const video = $videos.find((v) => v.id === selectedVideoId);
-			if (!video) return [];
-			return video.clipEntries
-				.map((e) => $clipRegions.find((c) => c.id === e.clipId))
-				.filter((c): c is NonNullable<typeof c> => !!c);
-		}
-		if (!selectedExportId) return [];
-		const exp = readyExports.find((e) => e.id === selectedExportId);
-		if (!exp) return [];
-		return exp.clipIds
-			.map((id) => $clipRegions.find((c) => c.id === id))
+	let selectedVideoClips = $derived.by(() => {
+		if (!selectedVideoId) return [];
+		const video = $videos.find((v) => v.id === selectedVideoId);
+		if (!video) return [];
+		return video.clipEntries
+			.map((e) => $clipRegions.find((c) => c.id === e.clipId))
 			.filter((c): c is NonNullable<typeof c> => !!c);
 	});
 
-	let selectedClip = $derived(selectedExportClips.find((c) => c.id === selectedClipId) ?? null);
+	let selectedClip = $derived(selectedVideoClips.find((c) => c.id === selectedClipId) ?? null);
 
 	let clipLocalBounds = $derived.by(() => {
 		if (!selectedClip) return null;
@@ -72,49 +50,22 @@
 		return localStart + scrubValue * (localEnd - localStart);
 	});
 
-	onMount(async () => {
-		try {
-			const data = await listExports();
-			exports = data.exports;
-			if (preselectedVideoId) {
-				// Video mode: use clips from the video instead of an export
-				const video = $videos.find((v) => v.id === preselectedVideoId);
-				if (video) {
-					selectVideo(preselectedVideoId!);
-				}
-			} else if (preselectedExportId && readyExports.some((e) => e.id === preselectedExportId)) {
-				selectExport(preselectedExportId!);
+	onMount(() => {
+		if (preselectedVideoId) {
+			const video = $videos.find((v) => v.id === preselectedVideoId);
+			if (video) {
+				selectVideo(preselectedVideoId!);
 			}
-		} catch { /* ignore */ }
+		}
 	});
 
 	function selectVideo(videoId: string) {
 		selectedVideoId = videoId;
-		selectedExportId = null;
 		selectedClipId = null;
 		scrubValue = 0;
 		previewUrl = null;
 		previewStreamId = null;
 		onVideoSelected?.(videoId);
-	}
-
-	function selectExport(exportId: string) {
-		selectedExportId = exportId;
-		selectedVideoId = null;
-		selectedClipId = null;
-		scrubValue = 0;
-		previewUrl = null;
-		previewStreamId = null;
-		onExportSelected?.(exportId);
-		// Auto-select first clip
-		const exp = readyExports.find((e) => e.id === exportId);
-		if (exp && exp.clipIds.length > 0) {
-			const firstClip = $clipRegions.find((c) => c.id === exp.clipIds[0]);
-			if (firstClip) {
-				selectedClipId = firstClip.id;
-				fetchFrame();
-			}
-		}
 	}
 
 	function selectClip(clipId: string) {
@@ -130,7 +81,7 @@
 	}
 
 	async function fetchFrame() {
-		if (!selectedClip || !clipLocalBounds || !selectedExportId) return;
+		if (!selectedClip || !clipLocalBounds || !selectedVideoId) return;
 		loading = true;
 		const streamId = selectedClip.streamId;
 		const t = currentLocalTimestamp;
@@ -168,19 +119,19 @@
 
 <div class="frame-picker">
 	<label class="picker-label">
-		Export
-		<select class="picker-select" value={selectedExportId ?? ''} onchange={(e) => selectExport((e.target as HTMLSelectElement).value)}>
-			<option value="" disabled>Select export...</option>
-			{#each readyExports as exp (exp.id)}
-				<option value={exp.id}>{exp.title}</option>
+		Video
+		<select class="picker-select" value={selectedVideoId ?? ''} onchange={(e) => selectVideo((e.target as HTMLSelectElement).value)}>
+			<option value="" disabled>Select video...</option>
+			{#each $videos as vid (vid.id)}
+				<option value={vid.id}>{vid.title}</option>
 			{/each}
 		</select>
 	</label>
 
-	{#if selectedExportId && selectedExportClips.length > 0}
+	{#if selectedVideoId && selectedVideoClips.length > 0}
 		<div class="clip-list">
 			<span class="picker-sublabel">Clips</span>
-			{#each selectedExportClips as clip (clip.id)}
+			{#each selectedVideoClips as clip (clip.id)}
 				<button
 					class="clip-btn"
 					class:active={selectedClipId === clip.id}

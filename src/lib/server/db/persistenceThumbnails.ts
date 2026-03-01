@@ -55,8 +55,8 @@ export type LayerConfig = TextLayerConfig | ImageLayerConfig | EffectLayerConfig
 
 export interface ThumbnailRecord {
 	id: string;
-	exportId: string;
-	videoId?: string;
+	videoId: string;
+	exportId?: string;
 	filePath: string;
 	width: number;
 	height: number;
@@ -92,8 +92,8 @@ export function mapThumbnailRow(r: ThumbnailRow): ThumbnailRecord {
 	}
 	return {
 		id: r.id,
-		exportId: r.export_id,
-		...(r.video_id && { videoId: r.video_id }),
+		videoId: r.video_id ?? '',
+		...(r.export_id && { exportId: r.export_id }),
 		filePath: r.file_path,
 		width: r.width,
 		height: r.height,
@@ -107,11 +107,11 @@ export function mapThumbnailRow(r: ThumbnailRow): ThumbnailRecord {
 export function saveThumbnail(record: ThumbnailRecord): void {
 	const d = getDb();
 	d.run(
-		`INSERT INTO thumbnails (id, export_id, video_id, file_path, width, height, source_stream_id, source_timestamp, text_layers, ai_enhanced, created_at, updated_at)
+		`INSERT INTO thumbnails (id, video_id, export_id, file_path, width, height, source_stream_id, source_timestamp, text_layers, ai_enhanced, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			file_path = excluded.file_path,
-			video_id = excluded.video_id,
+			export_id = excluded.export_id,
 			width = excluded.width,
 			height = excluded.height,
 			source_stream_id = excluded.source_stream_id,
@@ -121,8 +121,8 @@ export function saveThumbnail(record: ThumbnailRecord): void {
 			updated_at = excluded.updated_at`,
 		[
 			record.id,
-			record.exportId,
-			record.videoId ?? null,
+			record.videoId,
+			record.exportId ?? null,
 			record.filePath,
 			record.width,
 			record.height,
@@ -139,13 +139,6 @@ export function saveThumbnail(record: ThumbnailRecord): void {
 export function loadThumbnail(id: string): ThumbnailRecord | null {
 	const d = getDb();
 	const row = d.query('SELECT * FROM thumbnails WHERE id = ?').get(id) as ThumbnailRow | null;
-	if (!row) return null;
-	return mapThumbnailRow(row);
-}
-
-export function loadThumbnailByExport(exportId: string): ThumbnailRecord | null {
-	const d = getDb();
-	const row = d.query('SELECT * FROM thumbnails WHERE export_id = ? ORDER BY updated_at DESC LIMIT 1').get(exportId) as ThumbnailRow | null;
 	if (!row) return null;
 	return mapThumbnailRow(row);
 }
