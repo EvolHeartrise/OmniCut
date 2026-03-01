@@ -1,4 +1,4 @@
-import type { ClipEntry, EffectEntry } from '../../types.js';
+import type { ClipEntry, EffectEntry, VerticalLayout } from '../../types.js';
 import { getDb } from './persistenceBase.js';
 
 interface ExportRow {
@@ -8,6 +8,7 @@ interface ExportRow {
 	clip_ids: string;
 	clip_entries: string | null;
 	effect_entries: string | null;
+	vertical_layout: string | null;
 	status: string;
 	output_path: string | null;
 	error: string | null;
@@ -24,6 +25,7 @@ export interface ExportRecord {
 	clipIds: string[];
 	clipEntries?: ClipEntry[];
 	effectEntries?: EffectEntry[];
+	verticalLayout?: VerticalLayout;
 	status: 'pending' | 'exporting' | 'ready' | 'error';
 	outputPath?: string;
 	error?: string;
@@ -49,6 +51,10 @@ function mapExportRow(r: ExportRow): ExportRecord {
 	if (r.effect_entries) {
 		try { effectEntries = JSON.parse(r.effect_entries) as EffectEntry[]; } catch { /* ignore */ }
 	}
+	let verticalLayout: VerticalLayout | undefined;
+	if (r.vertical_layout) {
+		try { verticalLayout = JSON.parse(r.vertical_layout) as VerticalLayout; } catch { /* ignore */ }
+	}
 	return {
 		id: r.id,
 		title: r.title,
@@ -56,6 +62,7 @@ function mapExportRow(r: ExportRow): ExportRecord {
 		clipIds,
 		...(clipEntries && { clipEntries }),
 		...(effectEntries && { effectEntries }),
+		...(verticalLayout && { verticalLayout }),
 		status: r.status as ExportRecord['status'],
 		...(r.output_path && { outputPath: r.output_path }),
 		...(r.error && { error: r.error }),
@@ -69,8 +76,8 @@ function mapExportRow(r: ExportRow): ExportRecord {
 export function saveExport(record: ExportRecord): void {
 	const d = getDb();
 	d.run(
-		`INSERT INTO exports (id, title, description, clip_ids, clip_entries, effect_entries, status, output_path, error, created_at, completed_at, format, video_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO exports (id, title, description, clip_ids, clip_entries, effect_entries, vertical_layout, status, output_path, error, created_at, completed_at, format, video_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		[
 			record.id,
 			record.title,
@@ -78,6 +85,7 @@ export function saveExport(record: ExportRecord): void {
 			JSON.stringify(record.clipIds),
 			record.clipEntries ? JSON.stringify(record.clipEntries) : null,
 			record.effectEntries ? JSON.stringify(record.effectEntries) : null,
+			record.verticalLayout ? JSON.stringify(record.verticalLayout) : null,
 			record.status,
 			record.outputPath ?? null,
 			record.error ?? null,

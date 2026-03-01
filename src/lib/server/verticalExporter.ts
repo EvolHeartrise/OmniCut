@@ -5,9 +5,9 @@
  */
 
 import * as path from 'node:path';
-import type { ClipRegion, CameraBoundsEntry, ClipEntry, EffectEntry } from '../types.js';
+import type { ClipRegion, CameraBoundsEntry, ClipEntry, EffectEntry, VerticalSlot, VerticalLayout } from '../types.js';
 import { runFfmpeg } from './ffmpeg.js';
-import { detectNvenc, probeVideo, resolveOverlappingEffects, resolveZoomEffects, buildZoomFilter, ZOOM_SUPERSAMPLE, type StreamLookup, type ClipContext } from './exporter.js';
+import { detectNvenc, probeVideo, resolveOverlappingEffects, resolveZoomEffects, buildZoomFilter, buildAnimatedOverlay, ZOOM_SUPERSAMPLE, type StreamLookup, type ClipContext } from './exporter.js';
 import { clearEffectRendererCache } from './effectRenderer.js';
 import { clearChatEffectCache } from './chatEffectRenderer.js';
 import {
@@ -23,8 +23,62 @@ const MAX_CAM_H = 700;
 /** A clip with its resolved camera bounds for vertical export. */
 export interface VerticalClip {
 	clip: ClipRegion;
-	cam: CameraBoundsEntry;
+	cam: CameraBoundsEntry | null;
 	entry?: ClipEntry;
+}
+
+/** Build an ffmpeg filter chain for a single vertical slot. */
+function buildSlotFilter(
+	slot: VerticalSlot,
+	inputLabel: string,
+	outputLabel: string,
+	slotH: number,
+	cam: CameraBoundsEntry | null,
+	probeW: number,
+	probeH: number
+): string {
+	switch (slot.type) {
+		case 'full':
+			return `[${inputLabel}]scale=${OUT_W}:${slotH}:force_original_aspect_ratio=increase,crop=${OUT_W}:${slotH}[${outputLabel}]`;
+		case 'camera': {
+			const cx = Math.round(cam!.camX * probeW);
+			const cy = Math.round(cam!.camY * probeH);
+			const cw = Math.round(cam!.camW * probeW);
+			const ch = Math.round(cam!.camH * probeH);
+			return `[${inputLabel}]crop=${cw}:${ch}:${cx}:${cy},scale=${OUT_W}:-2,crop=${OUT_W}:${slotH}[${outputLabel}]`;
+		}
+		case 'custom': {
+			const cx = Math.round((slot.cropX ?? 0) * probeW);
+			const cy = Math.round((slot.cropY ?? 0) * probeH);
+			const cw = Math.round((slot.cropW ?? 1) * probeW);
+			const ch = Math.round((slot.cropH ?? 1) * probeH);
+			return `[${inputLabel}]crop=${cw}:${ch}:${cx}:${cy},scale=${OUT_W}:-2,crop=${OUT_W}:${slotH}[${outputLabel}]`;
+		}
+	}
+}
+
+/** Compute the aspect ratio for a slot, used to determine its rendered height. */
+function slotAspectRatio(
+	slot: VerticalSlot,
+	cam: CameraBoundsEntry | null,
+	probeW: number,
+	probeH: number
+): number {
+	switch (slot.type) {
+		case 'camera': {
+			const cw = Math.round(cam!.camW * probeW);
+			const ch = Math.round(cam!.camH * probeH);
+			return cw / Math.max(1, ch);
+		}
+		case 'custom': {
+			const cw = Math.round((slot.cropW ?? 1) * probeW);
+			const ch = Math.round((slot.cropH ?? 1) * probeH);
+			return cw / Math.max(1, ch);
+		}
+		case 'full':
+		default:
+			return probeW / Math.max(1, probeH);
+	}
 }
 
 /**
@@ -38,7 +92,8 @@ export async function exportVerticalVideo(
 	onProgress: (message: string, step: number, totalSteps: number) => void,
 	effectEntries?: EffectEntry[],
 	compOffsets?: number[],
-	channelMap?: Map<string, string>
+	channelMap?: Map<string, string>,
+	layout?: VerticalLayout
 ): Promise<{ outputPath: string }> {
 	if (verticalClips.length === 0) {
 		throw new Error('No clips with camera bounds to export');
@@ -71,17 +126,16 @@ export async function exportVerticalVideo(
 				continue;
 			}
 
-			// Compute crop/scale dimensions from normalized cam coords
-			const cx = Math.round(cam.camX * probe.width);
-			const cy = Math.round(cam.camY * probe.height);
-			const cw = Math.round(cam.camW * probe.width);
-			const ch = Math.round(cam.camH * probe.height);
+			// Resolve layout slots
+			const resolvedLayout = layout ?? { top: { type: 'full' as const }, bottom: { type: 'camera' as const } };
+			const topSlot = resolvedLayout.top;
+			const botSlot = resolvedLayout.bottom;
 
-			// Compute cam panel height: scale cam to fill OUT_W, preserving aspect ratio, capped at MAX_CAM_H
-			const camAR = cw / Math.max(1, ch);
-			let camH = Math.round(OUT_W / camAR);
-			camH = Math.min(camH, MAX_CAM_H) & ~1;
-			const gameH = (OUT_H - camH) & ~1;
+			// Compute bottom slot height from its aspect ratio, capped at MAX_CAM_H
+			const botAR = slotAspectRatio(botSlot, cam, probe.width, probe.height);
+			let bottomH = Math.round(OUT_W / botAR);
+			bottomH = Math.min(bottomH, MAX_CAM_H) & ~1;
+			const topH = (OUT_H - bottomH) & ~1;
 
 			// Find overlapping effects for this clip
 			const clipCompStart = compOffsets?.[i] ?? 0;
@@ -114,6 +168,13 @@ export async function exportVerticalVideo(
 						'-r', `${eff.rawVideo.fps}`,
 						'-i', eff.videoPath!
 					);
+				} else if (eff.animation) {
+					// Animated subtitle: loop the PNG as a 30fps video so fade filters work
+					extraInputs.push(
+						...itsoffset,
+						'-loop', '1', '-framerate', '30',
+						'-i', eff.pngPath!
+					);
 				} else {
 					extraInputs.push(...itsoffset, '-i', eff.videoPath ?? eff.pngPath!);
 				}
@@ -130,10 +191,10 @@ export async function exportVerticalVideo(
 			const scaleUp = hasZoom ? `,scale=${compW}:${compH}` : '';
 
 			let filterGraph = [
-				`[0:v]split=2[gameplay][camsrc]`,
-				`[camsrc]crop=${cw}:${ch}:${cx}:${cy},scale=${OUT_W}:-2,crop=${OUT_W}:${camH}[cam]`,
-				`[gameplay]scale=${OUT_W}:${gameH}:force_original_aspect_ratio=increase,crop=${OUT_W}:${gameH}[game]`,
-				`[game][cam]vstack=inputs=2${speedFilter},format=yuv420p${scaleUp}[vbase]`
+				`[0:v]split=2[slot_top_src][slot_bot_src]`,
+				buildSlotFilter(topSlot, 'slot_top_src', 'slot_top', topH, cam, probe.width, probe.height),
+				buildSlotFilter(botSlot, 'slot_bot_src', 'slot_bot', bottomH, cam, probe.width, probe.height),
+				`[slot_top][slot_bot]vstack=inputs=2${speedFilter},format=yuv420p${scaleUp}[vbase]`
 			].join(';');
 
 			let finalLabel = 'vbase';
@@ -163,7 +224,17 @@ export async function exportVerticalVideo(
 					filterGraph += `;[${inputIdx}:v]${alphaFmt}[${prepLabel}]`;
 					overlayInput = prepLabel;
 				}
-				filterGraph += `;[${finalLabel}][${overlayInput}]overlay=${ox}:${oy}:enable='between(t,${enableStart},${enableEnd})'[${nextLabel}]`;
+				// Build overlay filter — use animated expressions for subtitle effects
+				if (eff.animation) {
+					const overlayExpr = buildAnimatedOverlay(
+						overlayInput, finalLabel, nextLabel,
+						ox, oy, parseFloat(enableStart), parseFloat(enableEnd),
+						eff.animation, ss
+					);
+					filterGraph += overlayExpr;
+				} else {
+					filterGraph += `;[${finalLabel}][${overlayInput}]overlay=${ox}:${oy}:enable='between(t,${enableStart},${enableEnd})'[${nextLabel}]`;
+				}
 				finalLabel = nextLabel;
 			}
 
@@ -185,7 +256,15 @@ export async function exportVerticalVideo(
 
 			const videoArgs = buildVideoEncoderArgs(useNvenc, gop);
 
-			await runFfmpeg([
+			if (overlappingEffects.length > 0) {
+				console.log(`[vertical-export] Clip ${i}: ${overlappingEffects.length} overlay(s), ss=${trimStart.toFixed(3)} t=${dur.toFixed(3)} speed=${speed}`);
+				for (const eff of overlappingEffects) {
+					console.log(`[vertical-export]   overlay: pos=(${eff.x},${eff.y}) local=[${eff.localStart.toFixed(3)},${eff.localEnd.toFixed(3)}] raw=${!!eff.rawVideo} video=${eff.videoPath}`);
+				}
+				console.log(`[vertical-export]   filter_complex: ${filterGraph}`);
+			}
+
+			const ffmpegArgs = [
 				'-fflags', '+genpts',
 				'-f', 'concat', '-safe', '0', '-i', concatPath,
 				...extraInputs,
@@ -199,7 +278,8 @@ export async function exportVerticalVideo(
 				...audioArgs,
 				'-movflags', '+faststart',
 				'-y', outFile
-			], 2000);
+			];
+			await runFfmpeg(ffmpegArgs, 2000);
 
 			verticalFiles.push(outFile);
 		}

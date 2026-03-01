@@ -17,9 +17,10 @@
 		getMultiStreamTranscriptions,
 		getChatMessageByTwitchId
 	} from '$lib/streams.remote';
+	import { getCameraBounds } from '$lib/stores/streams.js';
 	import { untrack } from 'svelte';
 	import { formatDuration, getClipLocalBounds, setupHls, usernameColor } from '$lib/utils.js';
-	import type { ClipEntry, EffectEntry } from '$lib/types.js';
+	import type { ClipEntry, EffectEntry, VerticalLayout, CameraBoundsEntry } from '$lib/types.js';
 	import type { ClipRegion } from '$lib/stores/streams.js';
 	import { computeTickInterval, handleTimelineWheel, zoomIn as tzZoomIn, zoomOut as tzZoomOut } from '$lib/timeline.js';
 	import { TRACK_COLORS } from '$lib/constants.js';
@@ -43,6 +44,7 @@
 
 	// --- Effect entries state ---
 	let effectEntries = $state<EffectEntry[]>([]);
+	let verticalLayout = $state<VerticalLayout | undefined>(undefined);
 	let selectedEffectId = $state<string | null>(null);
 	let addingEffect = $state(false);
 	let addEffectTwitchId = $state('');
@@ -62,6 +64,16 @@
 	// Chat panel state
 	let chatPanelOpen = $state(false);
 
+	// --- Vertical (9:16) canvas preview ---
+	const VERT_OUT_W = 1080;
+	const VERT_OUT_H = 1920;
+	const VERT_MAX_CAM_H = 700;
+	const VERT_CANVAS_W = 540; // half-res for perf, CSS-scaled
+	const VERT_CANVAS_H = 960;
+	let verticalCanvasEl = $state<HTMLCanvasElement | null>(null);
+	let verticalRafId: number | null = null;
+	let currentCamBounds = $state<CameraBoundsEntry | null>(null);
+
 	// Track whether we've initialized local state from the video
 	let initialized = $state(false);
 
@@ -73,6 +85,7 @@
 			format = video.format;
 			entries = structuredClone(video.clipEntries);
 			effectEntries = structuredClone(video.effectEntries ?? []);
+			verticalLayout = video.verticalLayout ? structuredClone(video.verticalLayout) : undefined;
 			initialized = true;
 			loaded = true;
 			// Fetch chat message data for all effect entries
@@ -118,6 +131,7 @@
 				description: description.trim() || undefined,
 				clipEntries: entries,
 				effectEntries,
+				verticalLayout,
 				format
 			});
 			lastSavedAt = Date.now();
@@ -135,6 +149,7 @@
 		void format;
 		void JSON.stringify(entries);
 		void JSON.stringify(effectEntries);
+		void JSON.stringify(verticalLayout);
 		if (initialized) scheduleSave();
 	});
 
@@ -372,6 +387,99 @@
 		selectedEffectId = id;
 	}
 
+	function addSubtitleEffect() {
+		const id = nanoid(12);
+		const entry: EffectEntry = {
+			id,
+			type: 'subtitle',
+			startTime: compositionTime,
+			duration: 5,
+			x: 0.5,
+			y: 0.85,
+			subtitleText: 'Subtitle text',
+			subtitleFontSize: 48,
+			subtitleFontColor: '#FFFFFF',
+			subtitleOutlineColor: '#000000',
+			subtitleOutlineWidth: 4,
+			subtitleFontWeight: 700,
+			subtitleMaxWidth: 900,
+			subtitleTextAlign: 'center',
+			subtitleAnimIn: 'pop',
+			subtitleAnimOut: 'pop',
+			subtitleAnimDuration: 0.3,
+		};
+		effectEntries = [...effectEntries, entry];
+		selectedEffectId = id;
+	}
+
+	/** Compute inline CSS for subtitle in/out animation based on current composition time. */
+	function subtitleAnimStyle(entry: EffectEntry, t: number): string {
+		const animIn = entry.subtitleAnimIn ?? 'none';
+		const animOut = entry.subtitleAnimOut ?? 'none';
+		const dur = entry.subtitleAnimDuration ?? 0.3;
+		const effectEnd = entry.startTime + entry.duration;
+
+		let opacity = 1;
+		let translateX = '-50%'; // base centering
+		let translateY = '0';
+		let scale = 1;
+
+		// In-animation phase
+		const inElapsed = t - entry.startTime;
+		if (inElapsed < dur && animIn !== 'none') {
+			const p = Math.max(0, Math.min(1, inElapsed / dur));
+			const eased = 1 - (1 - p) * (1 - p); // ease-out quadratic
+
+			// All in-animations get a subtle fade
+			opacity = eased;
+
+			if (animIn === 'pop') {
+				scale = 0.3 + 0.7 * eased;
+			} else if (animIn === 'slide-up') {
+				translateY = `${(1 - eased) * 80}px`;
+			} else if (animIn === 'slide-down') {
+				translateY = `${-(1 - eased) * 80}px`;
+			} else if (animIn === 'slide-left') {
+				translateX = `calc(-50% + ${(1 - eased) * 200}px)`;
+			} else if (animIn === 'slide-right') {
+				translateX = `calc(-50% - ${(1 - eased) * 200}px)`;
+			} else if (animIn === 'bounce') {
+				const bounce = 1 - (1 - p) * (1 - p) * Math.cos(p * Math.PI * 2);
+				const clamped = Math.min(bounce, 1.15);
+				translateY = `${(1 - clamped) * 80}px`;
+			}
+		}
+
+		// Out-animation phase
+		const outElapsed = t - (effectEnd - dur);
+		if (outElapsed > 0 && animOut !== 'none') {
+			const p = Math.max(0, Math.min(1, outElapsed / dur));
+			const eased = p * p; // ease-in quadratic
+
+			// All out-animations get a subtle fade
+			opacity *= (1 - eased);
+
+			if (animOut === 'pop') {
+				scale *= (1 - eased * 0.7);
+			} else if (animOut === 'slide-up') {
+				translateY = `${-eased * 80}px`;
+			} else if (animOut === 'slide-down') {
+				translateY = `${eased * 80}px`;
+			} else if (animOut === 'slide-left') {
+				translateX = `calc(-50% - ${eased * 200}px)`;
+			} else if (animOut === 'slide-right') {
+				translateX = `calc(-50% + ${eased * 200}px)`;
+			} else if (animOut === 'bounce') {
+				translateY = `${-eased * eased * 80}px`;
+			}
+		}
+
+		const parts: string[] = [];
+		parts.push(`transform: translateX(${translateX}) translateY(${translateY}) scale(${scale.toFixed(3)})`);
+		if (opacity < 1) parts.push(`opacity: ${opacity.toFixed(3)}`);
+		return parts.join('; ');
+	}
+
 	function removeEffectEntry(id: string) {
 		effectEntries = effectEntries.filter((e) => e.id !== id);
 		if (selectedEffectId === id) selectedEffectId = null;
@@ -522,24 +630,47 @@
 	let videoScale = $derived(videoBounds.width > 0 ? videoBounds.width / sourceVideoSize.w : 1);
 
 	function updateVideoBounds() {
-		const video = previewVideoEl;
 		const container = previewPlayerAreaEl;
-		if (!video || !container) return;
+		if (!container) return;
+		const rect = container.getBoundingClientRect();
+
+		if (format === 'mobile_short') {
+			// Virtual 9:16 AR for vertical preview
+			const vw = 1080;
+			const vh = 1920;
+			const containerAR = rect.width / rect.height;
+			const videoAR = vw / vh;
+			let renderW: number, renderH: number, renderX: number, renderY: number;
+			if (videoAR > containerAR) {
+				renderW = rect.width;
+				renderH = rect.width / videoAR;
+				renderX = 0;
+				renderY = (rect.height - renderH) / 2;
+			} else {
+				renderH = rect.height;
+				renderW = rect.height * videoAR;
+				renderX = (rect.width - renderW) / 2;
+				renderY = 0;
+			}
+			videoBounds = { left: renderX, top: renderY, width: renderW, height: renderH };
+			sourceVideoSize = { w: vw, h: vh };
+			return;
+		}
+
+		const video = previewVideoEl;
+		if (!video) return;
 		const vw = video.videoWidth;
 		const vh = video.videoHeight;
 		if (!vw || !vh) return;
-		const rect = container.getBoundingClientRect();
 		const containerAR = rect.width / rect.height;
 		const videoAR = vw / vh;
 		let renderW: number, renderH: number, renderX: number, renderY: number;
 		if (videoAR > containerAR) {
-			// Video is wider — pillarboxed top/bottom (actually letterboxed means bars on sides, but here video fills width)
 			renderW = rect.width;
 			renderH = rect.width / videoAR;
 			renderX = 0;
 			renderY = (rect.height - renderH) / 2;
 		} else {
-			// Video is taller — pillarboxed left/right
 			renderH = rect.height;
 			renderW = rect.height * videoAR;
 			renderX = (rect.width - renderW) / 2;
@@ -549,8 +680,10 @@
 		sourceVideoSize = { w: vw, h: vh };
 	}
 
-	// Keep video bounds updated on resize
+	// Keep video bounds updated on resize and format change
 	$effect(() => {
+		// Re-run when format changes
+		void format;
 		const container = previewPlayerAreaEl;
 		const video = previewVideoEl;
 		if (!container || !video) return;
@@ -559,6 +692,8 @@
 		const onMeta = () => updateVideoBounds();
 		video.addEventListener('loadedmetadata', onMeta);
 		video.addEventListener('resize', onMeta);
+		// Also update immediately for format switch
+		updateVideoBounds();
 		return () => {
 			ro.disconnect();
 			video.removeEventListener('loadedmetadata', onMeta);
@@ -994,7 +1129,149 @@
 				cancelAnimationFrame(rafId);
 				rafId = null;
 			}
+			if (verticalRafId != null) {
+				cancelAnimationFrame(verticalRafId);
+				verticalRafId = null;
+			}
 			stopWaveformScan();
+		};
+	});
+
+	// --- Vertical preview: resolve camera bounds for current clip ---
+	$effect(() => {
+		if (format !== 'mobile_short') { currentCamBounds = null; return; }
+		const clip = currentClipRegion;
+		if (!clip) return;
+		const stream = streamMap.get(clip.streamId);
+		if (!stream) return;
+		getCameraBounds(stream.channel, clip.startTime).then(b => { currentCamBounds = b; });
+	});
+
+	// --- Vertical preview: canvas render loop ---
+	function verticalCoverDraw(
+		ctx: CanvasRenderingContext2D,
+		video: HTMLVideoElement,
+		srcX: number, srcY: number, srcW: number, srcH: number,
+		dstX: number, dstY: number, dstW: number, dstH: number
+	) {
+		// Cover-fit: scale source to fill destination, center-crop
+		const scale = Math.max(dstW / srcW, dstH / srcH);
+		const cropW = dstW / scale;
+		const cropH = dstH / scale;
+		const cropX = srcX + (srcW - cropW) / 2;
+		const cropY = srcY + (srcH - cropH) / 2;
+		ctx.drawImage(video, cropX, cropY, cropW, cropH, dstX, dstY, dstW, dstH);
+	}
+
+	function drawVerticalFrame() {
+		const canvas = verticalCanvasEl;
+		const video = previewVideoEl;
+		if (!canvas || !video || !video.videoWidth || !video.videoHeight) return;
+		const ctx = canvas.getContext('2d');
+		if (!ctx) return;
+
+		const vw = video.videoWidth;
+		const vh = video.videoHeight;
+		const cw = VERT_CANVAS_W;
+		const ch = VERT_CANVAS_H;
+		const scaleX = cw / VERT_OUT_W;
+		const scaleY = ch / VERT_OUT_H;
+
+		ctx.clearRect(0, 0, cw, ch);
+
+		const layout = verticalLayout ?? { top: { type: 'full' as const }, bottom: { type: 'camera' as const } };
+		const bottomSlot = layout.bottom;
+		const topSlot = layout.top;
+
+		// Compute bottom slot height (mirroring verticalExporter logic)
+		let bottomH: number;
+		if (bottomSlot.type === 'camera' && currentCamBounds) {
+			const camPxW = currentCamBounds.camW * vw;
+			const camPxH = currentCamBounds.camH * vh;
+			const botAR = camPxW / Math.max(1, camPxH);
+			bottomH = Math.round(VERT_OUT_W / botAR);
+			bottomH = Math.min(bottomH, VERT_MAX_CAM_H) & ~1;
+		} else if (bottomSlot.type === 'custom' && bottomSlot.cropW && bottomSlot.cropH) {
+			const cropPxW = bottomSlot.cropW * vw;
+			const cropPxH = bottomSlot.cropH * vh;
+			const botAR = cropPxW / Math.max(1, cropPxH);
+			bottomH = Math.round(VERT_OUT_W / botAR);
+			bottomH = Math.min(bottomH, VERT_MAX_CAM_H) & ~1;
+		} else {
+			// full frame or missing camera
+			const botAR = vw / Math.max(1, vh);
+			bottomH = Math.round(VERT_OUT_W / botAR);
+			bottomH = Math.min(bottomH, VERT_MAX_CAM_H) & ~1;
+		}
+		const topH = (VERT_OUT_H - bottomH) & ~1;
+
+		// Draw top slot
+		const topDstH = Math.round(topH * scaleY);
+		const topDstW = cw;
+		if (topSlot.type === 'camera' && currentCamBounds) {
+			verticalCoverDraw(ctx, video,
+				currentCamBounds.camX * vw, currentCamBounds.camY * vh,
+				currentCamBounds.camW * vw, currentCamBounds.camH * vh,
+				0, 0, topDstW, topDstH
+			);
+		} else if (topSlot.type === 'custom') {
+			verticalCoverDraw(ctx, video,
+				(topSlot.cropX ?? 0) * vw, (topSlot.cropY ?? 0) * vh,
+				(topSlot.cropW ?? 1) * vw, (topSlot.cropH ?? 1) * vh,
+				0, 0, topDstW, topDstH
+			);
+		} else {
+			// full frame
+			verticalCoverDraw(ctx, video, 0, 0, vw, vh, 0, 0, topDstW, topDstH);
+		}
+
+		// Draw bottom slot
+		const bottomDstH = Math.round(bottomH * scaleY);
+		const bottomDstY = topDstH;
+		if (bottomSlot.type === 'camera' && currentCamBounds) {
+			verticalCoverDraw(ctx, video,
+				currentCamBounds.camX * vw, currentCamBounds.camY * vh,
+				currentCamBounds.camW * vw, currentCamBounds.camH * vh,
+				0, bottomDstY, cw, bottomDstH
+			);
+		} else if (bottomSlot.type === 'custom') {
+			verticalCoverDraw(ctx, video,
+				(bottomSlot.cropX ?? 0) * vw, (bottomSlot.cropY ?? 0) * vh,
+				(bottomSlot.cropW ?? 1) * vw, (bottomSlot.cropH ?? 1) * vh,
+				0, bottomDstY, cw, bottomDstH
+			);
+		} else {
+			verticalCoverDraw(ctx, video, 0, 0, vw, vh, 0, bottomDstY, cw, bottomDstH);
+		}
+
+		// Separator line
+		ctx.fillStyle = '#111';
+		ctx.fillRect(0, topDstH - 1, cw, 2);
+	}
+
+	function verticalRenderLoop() {
+		drawVerticalFrame();
+		verticalRafId = requestAnimationFrame(verticalRenderLoop);
+	}
+
+	// Start/stop vertical canvas loop based on format
+	$effect(() => {
+		if (format !== 'mobile_short' || !verticalCanvasEl || !previewVideoEl) {
+			if (verticalRafId != null) { cancelAnimationFrame(verticalRafId); verticalRafId = null; }
+			return;
+		}
+		// Wait for video data
+		const startLoop = () => {
+			if (verticalRafId != null) return;
+			verticalRafId = requestAnimationFrame(verticalRenderLoop);
+		};
+		if (previewVideoEl.videoWidth) {
+			startLoop();
+		}
+		previewVideoEl.addEventListener('loadeddata', startLoop);
+		return () => {
+			previewVideoEl!.removeEventListener('loadeddata', startLoop);
+			if (verticalRafId != null) { cancelAnimationFrame(verticalRafId); verticalRafId = null; }
 		};
 	});
 
@@ -1256,7 +1533,16 @@
 						ontimeupdate={handlePreviewTimeUpdate}
 						playsinline
 						class="preview-video"
+						class:preview-video-hidden={format === 'mobile_short'}
 					></video>
+					{#if format === 'mobile_short'}
+						<canvas
+							bind:this={verticalCanvasEl}
+							width={VERT_CANVAS_W}
+							height={VERT_CANVAS_H}
+							class="vertical-preview-canvas"
+						></canvas>
+					{/if}
 					<!-- Effect overlays on video — positioned to match the video's actual rendered area -->
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<div
@@ -1317,6 +1603,16 @@
 									<div class="zoom-dim zoom-dim-right" style="top: {cy * 100}%; height: {ch * 100}%; width: {Math.max(0, (1 - cx - cw)) * 100}%"></div>
 									<div class="zoom-region" style="left: {cx * 100}%; top: {cy * 100}%; width: {cw * 100}%; height: {ch * 100}%"></div>
 								</div>
+							{:else if entry.type === 'subtitle'}
+								<!-- svelte-ignore a11y_no_static_element_interactions -->
+								<div
+									class="subtitle-overlay"
+									class:bubble-selected={selectedEffectId === entry.id}
+									style="left: {entry.x * 100}%; top: {entry.y * 100}%; max-width: {(entry.subtitleMaxWidth ?? 900) * videoScale}px; font-size: {(entry.subtitleFontSize ?? 48) * videoScale}px; font-weight: {entry.subtitleFontWeight ?? 700}; color: {entry.subtitleFontColor ?? '#FFFFFF'}; -webkit-text-stroke: {(entry.subtitleOutlineWidth ?? 4) * videoScale}px {entry.subtitleOutlineColor ?? '#000000'}; paint-order: stroke fill; text-align: {entry.subtitleTextAlign ?? 'center'}; {subtitleAnimStyle(entry, compositionTime)}"
+									onpointerdown={(e) => handleOverlayPointerDown(e, entry.id)}
+									onpointermove={handleOverlayPointerMove}
+									onpointerup={handleOverlayPointerUp}
+								>{entry.subtitleText ?? 'Subtitle'}</div>
 							{:else}
 								{@const msg = entry.twitchId ? chatMessageCache.get(entry.twitchId) : undefined}
 								{#if msg}
@@ -1397,6 +1693,7 @@
 						{@const msg = selEffect.twitchId ? chatMessageCache.get(selEffect.twitchId) : undefined}
 						{@const isChatPanel = selEffect.type === 'twitch-chat'}
 						{@const isZoom = selEffect.type === 'zoom'}
+						{@const isSubtitle = selEffect.type === 'subtitle'}
 						<div class="props-header">
 							<h3 class="props-title">Effect Properties</h3>
 							<button class="btn-deselect" onclick={() => selectedEffectId = null} title="Deselect">&times;</button>
@@ -1405,7 +1702,7 @@
 						<div class="props-info">
 							<div class="props-row">
 								<span class="props-label">Type</span>
-								<span class="props-value">{isZoom ? 'Zoom & Pan' : isChatPanel ? 'Chat Panel' : 'Chat Message'}</span>
+								<span class="props-value">{isZoom ? 'Zoom & Pan' : isChatPanel ? 'Chat Panel' : isSubtitle ? 'Subtitle' : 'Chat Message'}</span>
 							</div>
 							{#if selEffect.type === 'chat-message'}
 								<div class="props-row">
@@ -1583,10 +1880,147 @@
 										onchange={(e) => updateEffectEntry(selEffect.id, { chatFontWeight: +(e.target as HTMLInputElement).value })}
 									/>
 								</div>
+							{:else if isSubtitle}
+								<div class="prop-field">
+									<label class="prop-label">Text</label>
+									<textarea
+										class="prop-input prop-textarea"
+										rows="3"
+										value={selEffect.subtitleText ?? ''}
+										onchange={(e) => updateEffectEntry(selEffect.id, { subtitleText: (e.target as HTMLTextAreaElement).value })}
+									></textarea>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Font Size (px)</label>
+									<input
+										type="number"
+										class="prop-input"
+										min="12"
+										max="200"
+										step="2"
+										value={selEffect.subtitleFontSize ?? 48}
+										onchange={(e) => updateEffectEntry(selEffect.id, { subtitleFontSize: +(e.target as HTMLInputElement).value })}
+									/>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Font Color</label>
+									<input
+										type="color"
+										class="prop-input"
+										value={selEffect.subtitleFontColor ?? '#FFFFFF'}
+										onchange={(e) => updateEffectEntry(selEffect.id, { subtitleFontColor: (e.target as HTMLInputElement).value })}
+									/>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Outline Color</label>
+									<input
+										type="color"
+										class="prop-input"
+										value={selEffect.subtitleOutlineColor ?? '#000000'}
+										onchange={(e) => updateEffectEntry(selEffect.id, { subtitleOutlineColor: (e.target as HTMLInputElement).value })}
+									/>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Outline Width (px)</label>
+									<input
+										type="number"
+										class="prop-input"
+										min="0"
+										max="20"
+										step="1"
+										value={selEffect.subtitleOutlineWidth ?? 4}
+										onchange={(e) => updateEffectEntry(selEffect.id, { subtitleOutlineWidth: +(e.target as HTMLInputElement).value })}
+									/>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Font Weight</label>
+									<input
+										type="number"
+										class="prop-input"
+										min="100"
+										max="900"
+										step="100"
+										value={selEffect.subtitleFontWeight ?? 700}
+										onchange={(e) => updateEffectEntry(selEffect.id, { subtitleFontWeight: +(e.target as HTMLInputElement).value })}
+									/>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Max Width (px)</label>
+									<input
+										type="number"
+										class="prop-input"
+										min="100"
+										max="1920"
+										step="10"
+										value={selEffect.subtitleMaxWidth ?? 900}
+										onchange={(e) => updateEffectEntry(selEffect.id, { subtitleMaxWidth: +(e.target as HTMLInputElement).value })}
+									/>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Text Align</label>
+									<select
+										class="prop-input"
+										value={selEffect.subtitleTextAlign ?? 'center'}
+										onchange={(e) => updateEffectEntry(selEffect.id, { subtitleTextAlign: (e.target as HTMLSelectElement).value as 'left' | 'center' | 'right' })}
+									>
+										<option value="left">Left</option>
+										<option value="center">Center</option>
+										<option value="right">Right</option>
+									</select>
+								</div>
+								<div class="prop-field" style="margin-top: 8px">
+									<label class="prop-label" style="font-weight:600;color:#34d399">Animation</label>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">In Effect</label>
+									<select
+										class="prop-input"
+										value={selEffect.subtitleAnimIn ?? 'none'}
+										onchange={(e) => updateEffectEntry(selEffect.id, { subtitleAnimIn: (e.target as HTMLSelectElement).value as any })}
+									>
+										<option value="none">None</option>
+										<option value="fade">Fade In</option>
+										<option value="pop">Pop</option>
+										<option value="slide-up">Slide Up</option>
+										<option value="slide-down">Slide Down</option>
+										<option value="slide-left">Slide Left</option>
+										<option value="slide-right">Slide Right</option>
+										<option value="bounce">Bounce</option>
+									</select>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Out Effect</label>
+									<select
+										class="prop-input"
+										value={selEffect.subtitleAnimOut ?? 'none'}
+										onchange={(e) => updateEffectEntry(selEffect.id, { subtitleAnimOut: (e.target as HTMLSelectElement).value as any })}
+									>
+										<option value="none">None</option>
+										<option value="fade">Fade Out</option>
+										<option value="pop">Pop</option>
+										<option value="slide-up">Slide Up</option>
+										<option value="slide-down">Slide Down</option>
+										<option value="slide-left">Slide Left</option>
+										<option value="slide-right">Slide Right</option>
+										<option value="bounce">Bounce</option>
+									</select>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Anim Duration (s)</label>
+									<input
+										type="number"
+										class="prop-input"
+										min="0.1"
+										max="2"
+										step="0.05"
+										value={selEffect.subtitleAnimDuration ?? 0.3}
+										onchange={(e) => updateEffectEntry(selEffect.id, { subtitleAnimDuration: +(e.target as HTMLInputElement).value })}
+									/>
+								</div>
 							{/if}
 						</div>
 
-						{#if !isChatPanel && !isZoom && msg}
+						{#if !isChatPanel && !isZoom && !isSubtitle && msg}
 							<div class="props-section">
 								<label class="prop-label">Message Preview</label>
 								<div class="effect-msg-preview">
@@ -1681,6 +2115,32 @@
 								<option value="mobile_short">Mobile Short (9:16)</option>
 							</select>
 						</div>
+						{#if format === 'mobile_short'}
+							<div class="prop-field">
+								<label class="prop-label" for="v-slot-top">Top Slot</label>
+								<select id="v-slot-top" class="prop-select" value={verticalLayout?.top.type ?? 'full'}
+									onchange={(e) => {
+										const val = (e.target as HTMLSelectElement).value as 'full' | 'camera' | 'custom';
+										verticalLayout = { top: { type: val }, bottom: verticalLayout?.bottom ?? { type: 'camera' } };
+									}}>
+									<option value="full">Full Frame</option>
+									<option value="camera">Camera</option>
+									<option value="custom">Custom Region</option>
+								</select>
+							</div>
+							<div class="prop-field">
+								<label class="prop-label" for="v-slot-bot">Bottom Slot</label>
+								<select id="v-slot-bot" class="prop-select" value={verticalLayout?.bottom.type ?? 'camera'}
+									onchange={(e) => {
+										const val = (e.target as HTMLSelectElement).value as 'full' | 'camera' | 'custom';
+										verticalLayout = { top: verticalLayout?.top ?? { type: 'full' }, bottom: { type: val } };
+									}}>
+									<option value="full">Full Frame</option>
+									<option value="camera">Camera</option>
+									<option value="custom">Custom Region</option>
+								</select>
+							</div>
+						{/if}
 					</div>
 
 					<div class="props-summary">
@@ -1735,6 +2195,9 @@
 					</button>
 					<button class="btn-tl btn-tl-sm btn-fx-zoom" onclick={addZoomEffect} title="Add zoom & pan effect">
 						+ Zoom & Pan
+					</button>
+					<button class="btn-tl btn-tl-sm btn-fx-subtitle" onclick={addSubtitleEffect} title="Add subtitle text overlay">
+						+ Subtitle
 					</button>
 					<button class="btn-tl btn-tl-sm" class:btn-chat-active={chatPanelOpen} onclick={() => { chatPanelOpen = !chatPanelOpen; }} title="Toggle chat panel">
 						{chatPanelOpen ? 'Hide Chat' : 'Chat'}
@@ -1841,6 +2304,7 @@
 												class:selected={isSelected}
 												class:effect-chat-panel={isChatPanel}
 												class:effect-zoom={entry.type === 'zoom'}
+												class:effect-subtitle={entry.type === 'subtitle'}
 												style="left: {leftPx}px; width: {widthPx}px"
 												onclick={(e) => handleEffectClick(e, entry.id)}
 												onmousedown={(e) => handleEffectMoveStart(e, entry.id)}
@@ -1852,6 +2316,8 @@
 														Zoom & Pan
 													{:else if isChatPanel}
 														Chat Panel
+													{:else if entry.type === 'subtitle'}
+														{entry.subtitleText?.slice(0, 20) ?? 'Subtitle'}{(entry.subtitleText?.length ?? 0) > 20 ? '...' : ''}
 													{:else}
 														{emsg?.username ?? entry.twitchId?.slice(0, 8) ?? '?'}
 													{/if}
@@ -1997,6 +2463,20 @@
 		height: 100%;
 		object-fit: contain;
 		display: block;
+	}
+
+	.preview-video-hidden {
+		position: absolute;
+		opacity: 0;
+		pointer-events: none;
+	}
+
+	.vertical-preview-canvas {
+		max-width: 100%;
+		max-height: 100%;
+		aspect-ratio: 9 / 16;
+		display: block;
+		background: #000;
 	}
 
 	.video-controls {
@@ -2827,9 +3307,25 @@
 		color: #fde68a;
 	}
 
+	.btn-fx-subtitle {
+		color: #34d399;
+		border: 1px solid rgba(52, 211, 153, 0.3);
+		background: rgba(52, 211, 153, 0.1);
+	}
+
+	.btn-fx-subtitle:hover {
+		background: rgba(52, 211, 153, 0.2);
+		color: #6ee7b7;
+	}
+
 	.effect-zoom {
 		background: rgba(251, 191, 36, 0.3);
 		border-color: rgba(251, 191, 36, 0.4);
+	}
+
+	.effect-subtitle {
+		background: rgba(52, 211, 153, 0.3);
+		border-color: rgba(52, 211, 153, 0.4);
 	}
 
 	/* Zoom preview overlay */
@@ -2945,6 +3441,24 @@
 	.chat-bubble.bubble-selected {
 		outline: 2px solid #38bdf8;
 		outline-offset: 1px;
+	}
+
+	.subtitle-overlay {
+		position: absolute;
+		pointer-events: auto;
+		padding: 4px 8px;
+		white-space: pre-wrap;
+		word-wrap: break-word;
+		cursor: grab;
+		line-height: 1.3;
+		user-select: none;
+		touch-action: none;
+		font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+	}
+
+	.subtitle-overlay.bubble-selected {
+		outline: 2px solid #34d399;
+		outline-offset: 2px;
 	}
 
 	.bubble-badge {

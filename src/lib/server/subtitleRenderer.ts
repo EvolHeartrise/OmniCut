@@ -1,0 +1,134 @@
+/**
+ * Subtitle effect renderer — renders styled text with outline as a PNG image
+ * for compositing onto exported video via FFmpeg overlay filter.
+ */
+
+import * as fs from 'node:fs';
+import { createCanvas, type SKRSContext2D } from '@napi-rs/canvas';
+
+const DEFAULT_FONT_SIZE = 48;
+const DEFAULT_FONT_COLOR = '#FFFFFF';
+const DEFAULT_OUTLINE_COLOR = '#000000';
+const DEFAULT_OUTLINE_WIDTH = 4;
+const DEFAULT_FONT_WEIGHT = 700;
+const DEFAULT_MAX_WIDTH = 900;
+const DEFAULT_TEXT_ALIGN = 'center';
+const PADDING_X = 16;
+const PADDING_Y = 12;
+const LINE_HEIGHT_FACTOR = 1.3;
+
+export async function renderSubtitleOverlay(opts: {
+	text: string;
+	outputPath: string;
+	fontSize?: number;
+	fontColor?: string;
+	outlineColor?: string;
+	outlineWidth?: number;
+	fontWeight?: number;
+	maxWidth?: number;
+	textAlign?: 'left' | 'center' | 'right';
+}): Promise<{ pngPath: string; width: number; height: number }> {
+	const {
+		text,
+		outputPath,
+		fontSize = DEFAULT_FONT_SIZE,
+		fontColor = DEFAULT_FONT_COLOR,
+		outlineColor = DEFAULT_OUTLINE_COLOR,
+		outlineWidth = DEFAULT_OUTLINE_WIDTH,
+		fontWeight = DEFAULT_FONT_WEIGHT,
+		maxWidth = DEFAULT_MAX_WIDTH,
+		textAlign = DEFAULT_TEXT_ALIGN,
+	} = opts;
+
+	const fontFamily = 'Inter, Arial, sans-serif';
+	const font = `${fontWeight} ${fontSize}px ${fontFamily}`;
+	const lineHeight = Math.ceil(fontSize * LINE_HEIGHT_FACTOR);
+	// Account for outline bleed in content width
+	const contentWidth = maxWidth - (PADDING_X + outlineWidth) * 2;
+
+	// Measure and word-wrap text
+	const measureCanvas = createCanvas(1, 1);
+	const measureCtx = measureCanvas.getContext('2d');
+	measureCtx.font = font;
+	const lines = wrapText(measureCtx, text, contentWidth);
+
+	// Compute actual max line width for tight sizing
+	let actualMaxLineWidth = 0;
+	for (const line of lines) {
+		const w = measureCtx.measureText(line).width;
+		if (w > actualMaxLineWidth) actualMaxLineWidth = w;
+	}
+
+	const pad = PADDING_X + outlineWidth;
+	const canvasWidth = Math.ceil(actualMaxLineWidth + pad * 2);
+	const canvasHeight = Math.ceil(lines.length * lineHeight + (PADDING_Y + outlineWidth) * 2);
+
+	// Render
+	const canvas = createCanvas(canvasWidth, canvasHeight);
+	const ctx = canvas.getContext('2d');
+
+	ctx.font = font;
+	ctx.textBaseline = 'top';
+
+	const topPad = PADDING_Y + outlineWidth;
+
+	for (let i = 0; i < lines.length; i++) {
+		const lineWidth = ctx.measureText(lines[i]).width;
+		let x: number;
+		if (textAlign === 'center') {
+			x = (canvasWidth - lineWidth) / 2;
+		} else if (textAlign === 'right') {
+			x = canvasWidth - pad - lineWidth;
+		} else {
+			x = pad;
+		}
+		const y = topPad + i * lineHeight;
+
+		// Draw outline (stroke) first, then fill on top
+		if (outlineWidth > 0) {
+			ctx.strokeStyle = outlineColor;
+			ctx.lineWidth = outlineWidth * 2; // doubled because strokeText straddles the path
+			ctx.lineJoin = 'round';
+			ctx.miterLimit = 2;
+			ctx.strokeText(lines[i], x, y);
+		}
+
+		ctx.fillStyle = fontColor;
+		ctx.fillText(lines[i], x, y);
+	}
+
+	// Write PNG
+	const pngBuffer = canvas.toBuffer('image/png');
+	fs.writeFileSync(outputPath, pngBuffer);
+
+	return { pngPath: outputPath, width: canvasWidth, height: canvasHeight };
+}
+
+/** Word-wrap text to fit within maxWidth pixels. */
+function wrapText(ctx: SKRSContext2D, text: string, maxWidth: number): string[] {
+	const paragraphs = text.split('\n');
+	const lines: string[] = [];
+
+	for (const paragraph of paragraphs) {
+		if (paragraph === '') {
+			lines.push('');
+			continue;
+		}
+		const words = paragraph.split(/\s+/);
+		let currentLine = '';
+
+		for (const word of words) {
+			const testLine = currentLine ? `${currentLine} ${word}` : word;
+			const metrics = ctx.measureText(testLine);
+			if (metrics.width > maxWidth && currentLine) {
+				lines.push(currentLine);
+				currentLine = word;
+			} else {
+				currentLine = testLine;
+			}
+		}
+		if (currentLine) lines.push(currentLine);
+	}
+
+	return lines.length > 0 ? lines : [''];
+}

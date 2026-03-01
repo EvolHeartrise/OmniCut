@@ -5,10 +5,11 @@
 
 import * as path from 'node:path';
 import * as fs from 'node:fs';
-import type { ClipRegion, ClipEntry, EffectEntry } from '../types.js';
+import type { ClipRegion, ClipEntry, EffectEntry, SubtitleAnimation } from '../types.js';
 import { runFfmpeg } from './ffmpeg.js';
 import { renderEffectOverlay, clearEffectRendererCache } from './effectRenderer.js';
 import { renderChatEffectVideo, clearChatEffectCache } from './chatEffectRenderer.js';
+import { renderSubtitleOverlay } from './subtitleRenderer.js';
 import {
 	resolveClip, buildAudioArgs, buildVideoEncoderArgs, createTempDir, cleanupTempDir,
 	concatClipFiles, buildOutputPath
@@ -94,6 +95,12 @@ export async function exportVideo(
 			const hasOverlays = overlappingEffects.length > 0;
 
 			if (hasOverlays || hasZoom) {
+				if (overlappingEffects.length > 0) {
+					console.log(`[export] Clip ${i}: ${overlappingEffects.length} overlay(s), ss=${trimStart.toFixed(3)} t=${dur.toFixed(3)} speed=${speed}`);
+					for (const eff of overlappingEffects) {
+						console.log(`[export]   overlay: pos=(${eff.x},${eff.y}) local=[${eff.localStart.toFixed(3)},${eff.localEnd.toFixed(3)}] raw=${!!eff.rawVideo} video=${eff.videoPath}`);
+					}
+				}
 				for (const eff of overlappingEffects) {
 					const itsoffset = ['-itsoffset', (trimStart + eff.localStart).toFixed(3)];
 					if (eff.rawVideo) {
@@ -103,6 +110,13 @@ export async function exportVideo(
 							'-s', `${eff.rawVideo.width}x${eff.rawVideo.height}`,
 							'-r', `${eff.rawVideo.fps}`,
 							'-i', eff.videoPath!
+						);
+					} else if (eff.animation) {
+						// Animated subtitle: loop the PNG as a 30fps video so fade filters work
+						extraInputs.push(
+							...itsoffset,
+							'-loop', '1', '-framerate', '30',
+							'-i', eff.pngPath!
 						);
 					} else {
 						extraInputs.push(...itsoffset, '-i', eff.videoPath ?? eff.pngPath!);
@@ -147,7 +161,19 @@ export async function exportVideo(
 						filterGraph += `;[${inputIdx}:v]${alphaFmt}[${prepLabel}]`;
 						overlayInput = prepLabel;
 					}
-					filterGraph += `;[${prevLabel}][${overlayInput}]overlay=${ox}:${oy}:enable='between(t,${enableStart},${enableEnd})'[${nextLabel}]`;
+
+					// Build overlay filter — use animated expressions for subtitle effects
+					if (eff.animation) {
+						const anim = eff.animation;
+						const overlayExpr = buildAnimatedOverlay(
+							overlayInput, prevLabel, nextLabel,
+							ox, oy, parseFloat(enableStart), parseFloat(enableEnd),
+							anim, ss
+						);
+						filterGraph += overlayExpr;
+					} else {
+						filterGraph += `;[${prevLabel}][${overlayInput}]overlay=${ox}:${oy}:enable='between(t,${enableStart},${enableEnd})'[${nextLabel}]`;
+					}
 					prevLabel = nextLabel;
 				}
 
@@ -163,6 +189,10 @@ export async function exportVideo(
 				// If no overlays and no zooms produced outv (shouldn't happen), rename
 				if (prevLabel === 'base') {
 					filterGraph = filterGraph.replace('[base]', '[outv]');
+				}
+
+				if (overlappingEffects.length > 0) {
+					console.log(`[export]   filter_complex: ${filterGraph}`);
 				}
 
 					videoFilterArgs = [
@@ -260,6 +290,14 @@ export interface ResolvedEffect {
 	scale?: number;      // uniform scale multiplier (default 1)
 	/** If set, videoPath is a raw RGBA file — needs explicit format args on input. */
 	rawVideo?: { width: number; height: number; fps: number };
+	/** Subtitle animation config — only set for subtitle effects. */
+	animation?: {
+		animIn: SubtitleAnimation;
+		animOut: SubtitleAnimation;
+		animDuration: number;
+		width: number;   // rendered PNG width (for slide calculations)
+		height: number;  // rendered PNG height
+	};
 }
 
 /** Info about a clip needed for resolving twitch-chat effects. */
@@ -340,6 +378,33 @@ export async function resolveOverlappingEffects(
 			} catch (err) {
 				console.warn(`[exporter] Failed to render twitch-chat effect ${ei}:`, err instanceof Error ? err.message : err);
 			}
+		} else if (effect.type === 'subtitle') {
+			// subtitle: render styled text as PNG
+			if (!effect.subtitleText) continue;
+
+			const pngPath = path.join(tempDir, `subtitle_${clipIdx}_${ei}.png`);
+			const result = await renderSubtitleOverlay({
+				text: effect.subtitleText,
+				outputPath: pngPath,
+				fontSize: effect.subtitleFontSize,
+				fontColor: effect.subtitleFontColor,
+				outlineColor: effect.subtitleOutlineColor,
+				outlineWidth: effect.subtitleOutlineWidth,
+				fontWeight: effect.subtitleFontWeight,
+				maxWidth: effect.subtitleMaxWidth,
+				textAlign: effect.subtitleTextAlign,
+			});
+
+			// Center horizontally at the specified x position
+			const x = Math.round(effect.x * videoWidth - result.width / 2);
+			const y = Math.round(effect.y * videoHeight);
+			const animIn = effect.subtitleAnimIn ?? 'none';
+			const animOut = effect.subtitleAnimOut ?? 'none';
+			const animDuration = effect.subtitleAnimDuration ?? 0.3;
+			const animation = (animIn !== 'none' || animOut !== 'none')
+				? { animIn, animOut, animDuration, width: result.width, height: result.height }
+				: undefined;
+			results.push({ pngPath, x, y, localStart, localEnd, animation });
 		} else {
 			// chat-message: render static PNG
 			if (!effect.twitchId) continue;
@@ -442,6 +507,195 @@ export function buildZoomFilter(
 	const ssH = videoH * ZOOM_SUPERSAMPLE;
 
 	return `;[${inputLabel}]scale=${ssW}:${ssH}:flags=bilinear,zoompan=z='${zExpr}':x='(${xExpr})*iw':y='(${yExpr})*ih':d=1:s=${videoW}x${videoH}:fps=${fps}[${outputLabel}]`;
+}
+
+// --- Subtitle animation helpers ---
+
+/**
+ * Build an FFmpeg overlay filter with animated position/alpha for subtitle effects.
+ *
+ * FFmpeg overlay filter supports expressions for x, y, and the `enable` expression.
+ * The `t` variable in overlay refers to the *main input* timestamp.
+ * For alpha we multiply the overlay's alpha channel via `colorchannelmixer` before
+ * feeding it to overlay, using `t` from a sendcmd-like approach — but since
+ * colorchannelmixer doesn't support per-frame expressions, we instead use the
+ * overlay `format=auto` and `[overlay_input]fade` filter to get alpha animation.
+ *
+ * Strategy:
+ * - Position animations (slide, bounce): use overlay x/y expressions
+ * - Alpha animations (fade, pop): chain `fade=in`/`fade=out` filters on the overlay input
+ * - Combined: both
+ */
+export function buildAnimatedOverlay(
+	overlayInput: string,
+	prevLabel: string,
+	nextLabel: string,
+	baseX: number,
+	baseY: number,
+	enableStart: number,
+	enableEnd: number,
+	anim: NonNullable<ResolvedEffect['animation']>,
+	ss: number
+): string {
+	const T0 = enableStart.toFixed(3);
+	const T1 = enableEnd.toFixed(3);
+	const dur = anim.animDuration;
+	const w = anim.width * ss;
+	const h = anim.height * ss;
+	const effectDuration = enableEnd - enableStart;
+	const filterParts: string[] = [];
+
+	// Time boundaries for animation phases (in overlay-local time)
+	// The overlay input is fed via -itsoffset so its t=0 aligns with enableStart.
+	// In the overlay filter, `t` refers to the main video's time.
+	// So we use absolute time values.
+	const inEnd = enableStart + dur;
+	const outStart = enableEnd - dur;
+
+	// In the overlay filter, x/y expressions use `t` = main video time
+	// We build expressions in terms of this `t`.
+
+	// --- X expression ---
+	let xExpr = `${baseX}`;
+	const xIn = buildPositionAnim(anim.animIn, 'in', 'x', baseX, baseY, w, h, enableStart, inEnd, dur);
+	const xOut = buildPositionAnim(anim.animOut, 'out', 'x', baseX, baseY, w, h, outStart, enableEnd, dur);
+	if (xIn || xOut) {
+		// Phase: in-anim | steady | out-anim
+		const steady = `${baseX}`;
+		if (xIn && xOut) {
+			xExpr = `if(lt(t,${inEnd.toFixed(3)}),${xIn},if(gt(t,${outStart.toFixed(3)}),${xOut},${steady}))`;
+		} else if (xIn) {
+			xExpr = `if(lt(t,${inEnd.toFixed(3)}),${xIn},${steady})`;
+		} else {
+			xExpr = `if(gt(t,${outStart.toFixed(3)}),${xOut},${steady})`;
+		}
+	}
+
+	// --- Y expression ---
+	let yExpr = `${baseY}`;
+	const yIn = buildPositionAnim(anim.animIn, 'in', 'y', baseX, baseY, w, h, enableStart, inEnd, dur);
+	const yOut = buildPositionAnim(anim.animOut, 'out', 'y', baseX, baseY, w, h, outStart, enableEnd, dur);
+	if (yIn || yOut) {
+		const steady = `${baseY}`;
+		if (yIn && yOut) {
+			yExpr = `if(lt(t,${inEnd.toFixed(3)}),${yIn},if(gt(t,${outStart.toFixed(3)}),${yOut},${steady}))`;
+		} else if (yIn) {
+			yExpr = `if(lt(t,${inEnd.toFixed(3)}),${yIn},${steady})`;
+		} else {
+			yExpr = `if(gt(t,${outStart.toFixed(3)}),${yOut},${steady})`;
+		}
+	}
+
+	// --- Alpha (fade) via FFmpeg fade filter on the overlay input ---
+	// The overlay input has already been prepared (format=yuva420p, optional scale).
+	// -itsoffset shifts the overlay stream's PTS to start at enableStart,
+	// so the fade filter's `st` must use absolute (enableStart-based) times.
+	// All animation types get a subtle fade — not just 'fade' and 'pop'
+	const needsFadeIn = anim.animIn !== 'none';
+	const needsFadeOut = anim.animOut !== 'none';
+
+	let inputForOverlay = overlayInput;
+	if (needsFadeIn || needsFadeOut) {
+		const parts: string[] = [];
+		if (needsFadeIn) {
+			const fadeDur = anim.animIn === 'pop' ? dur * 0.6 : dur;
+			parts.push(`fade=t=in:st=${enableStart.toFixed(3)}:d=${fadeDur.toFixed(3)}:alpha=1`);
+		}
+		if (needsFadeOut) {
+			const fadeOutStart = enableEnd - dur;
+			const fadeDur = anim.animOut === 'pop' ? dur * 0.6 : dur;
+			parts.push(`fade=t=out:st=${fadeOutStart.toFixed(3)}:d=${fadeDur.toFixed(3)}:alpha=1`);
+		}
+		const fadeLabel = `af${nextLabel}`;
+		filterParts.push(`;[${overlayInput}]${parts.join(',')}[${fadeLabel}]`);
+		inputForOverlay = fadeLabel;
+	}
+
+	filterParts.push(`;[${prevLabel}][${inputForOverlay}]overlay=x='${xExpr}':y='${yExpr}':enable='between(t,${T0},${T1})'[${nextLabel}]`);
+
+	return filterParts.join('');
+}
+
+/**
+ * Build a position expression for a single axis during an animation phase.
+ * Returns null if this animation type doesn't affect the given axis.
+ *
+ * For 'in' phase: progress goes 0→1 over [phaseStart, phaseEnd]
+ * For 'out' phase: progress goes 0→1 over [phaseStart, phaseEnd]
+ */
+function buildPositionAnim(
+	animType: SubtitleAnimation,
+	phase: 'in' | 'out',
+	axis: 'x' | 'y',
+	baseX: number, baseY: number,
+	w: number, h: number,
+	phaseStart: number, phaseEnd: number,
+	dur: number
+): string | null {
+	// Progress: 0→1 over the phase
+	const p = `clip((t-${phaseStart.toFixed(3)})/${dur.toFixed(3)},0,1)`;
+
+	if (animType === 'slide-up') {
+		if (axis !== 'y') return null;
+		const offset = h * 1.5; // slide distance
+		if (phase === 'in') {
+			// Start below (baseY + offset), end at baseY
+			return `${baseY}+${offset.toFixed(1)}*(1-${p})`;
+		} else {
+			// Start at baseY, slide up (baseY - offset*p)
+			return `${baseY}-${offset.toFixed(1)}*${p}`;
+		}
+	}
+
+	if (animType === 'slide-down') {
+		if (axis !== 'y') return null;
+		const offset = h * 1.5;
+		if (phase === 'in') {
+			return `${baseY}-${offset.toFixed(1)}*(1-${p})`;
+		} else {
+			return `${baseY}+${offset.toFixed(1)}*${p}`;
+		}
+	}
+
+	if (animType === 'slide-left') {
+		if (axis !== 'x') return null;
+		const offset = w * 2;
+		if (phase === 'in') {
+			// Start to the right (baseX + offset), slide left to baseX
+			return `${baseX}+${offset.toFixed(1)}*(1-${p})`;
+		} else {
+			// Slide left from baseX
+			return `${baseX}-${offset.toFixed(1)}*${p}`;
+		}
+	}
+
+	if (animType === 'slide-right') {
+		if (axis !== 'x') return null;
+		const offset = w * 2;
+		if (phase === 'in') {
+			return `${baseX}-${offset.toFixed(1)}*(1-${p})`;
+		} else {
+			return `${baseX}+${offset.toFixed(1)}*${p}`;
+		}
+	}
+
+	if (animType === 'bounce') {
+		if (axis !== 'y') return null;
+		const offset = h * 1.5;
+		if (phase === 'in') {
+			// Ease-out with overshoot: use a cubic bezier-like overshoot
+			// p goes 0→1; we want position to overshoot slightly then settle
+			// eased = 1 - (1-p)^2 * cos(p * PI)  — overshoots at ~0.7 then settles
+			const eased = `(1-(1-${p})*(1-${p})*cos(${p}*3.14159))`;
+			return `${baseY}+${offset.toFixed(1)}*(1-clip(${eased},0,1.2))`;
+		} else {
+			// Accelerate out
+			return `${baseY}-${offset.toFixed(1)}*(${p}*${p})`;
+		}
+	}
+
+	// fade, pop, none — don't affect position
+	return null;
 }
 
 let nvencCached: boolean | null = null;

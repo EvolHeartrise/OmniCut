@@ -234,12 +234,16 @@ export async function renderChatEffectVideo(opts: {
 	const rawPath = outputPath.replace(/\.\w+$/, '.rgba');
 	const totalFrames = Math.ceil(dur * FPS);
 
+	console.log(`[chat-fx] Rendering ${totalFrames} frames (${dur.toFixed(2)}s) ${pixelW}x${pixelH} → ${rawPath}`);
+	console.log(`[chat-fx]   stream time ${localStart.toFixed(2)}→${localEnd.toFixed(2)}, ${prepared.length} messages loaded (chatOffset=${chatOffset})`);
+
 	const fd = fs.openSync(rawPath, 'w');
 
 	const canvas = createCanvas(pixelW, pixelH);
 	const ctx = canvas.getContext('2d');
 	let lastMsgIds: string | null = null;
 	let lastFrameBuf: Buffer | null = null;
+	let uniqueFrames = 0;
 
 	for (let frame = 0; frame < totalFrames; frame++) {
 		const currentTime = localStart + frame / FPS;
@@ -265,12 +269,17 @@ export async function renderChatEffectVideo(opts: {
 			const imageData = ctx.getImageData(0, 0, pixelW, pixelH);
 			lastFrameBuf = Buffer.from(imageData.data);  // copy the RGBA data
 			lastMsgIds = msgIds;
+			uniqueFrames++;
 		}
 
 		fs.writeSync(fd, lastFrameBuf);
 	}
 
 	fs.closeSync(fd);
+
+	const expectedSize = totalFrames * pixelW * pixelH * 4;
+	const actualSize = fs.statSync(rawPath).size;
+	console.log(`[chat-fx]   ${uniqueFrames} unique frames, raw file ${actualSize} bytes (expected ${expectedSize}, ${actualSize === expectedSize ? 'OK' : 'MISMATCH!'})`);
 
 	return { videoPath: rawPath, width: pixelW, height: pixelH, raw: true as const, fps: FPS };
 }
