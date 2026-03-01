@@ -129,7 +129,9 @@ export async function renderEffectOverlay(opts: {
 		for (const seg of line.segments) {
 			if (seg.type === 'badge') {
 				if (seg.image) {
+					ctx.imageSmoothingEnabled = false;
 					ctx.drawImage(seg.image, x, baseline - CHAT_BADGE_SIZE + 2, CHAT_BADGE_SIZE, CHAT_BADGE_SIZE);
+					ctx.imageSmoothingEnabled = true;
 				}
 				x += seg.width;
 			} else if (seg.type === 'emote') {

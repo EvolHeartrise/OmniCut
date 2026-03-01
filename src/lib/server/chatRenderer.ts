@@ -27,7 +27,7 @@ export function buildChatFonts(fontWeight?: number): { font: string; boldFont: s
 }
 export const CHAT_LINE_HEIGHT = 1.4;
 export const CHAT_TEXT_COLOR = '#efeff1';
-export const CHAT_BADGE_SIZE = 18;
+export const CHAT_BADGE_SIZE = 11;
 export const CHAT_BADGE_MARGIN = 3;
 export const CHAT_EMOTE_HEIGHT = 23; // ~1.75em at 13px
 export const CHAT_PAD_X = 12;
