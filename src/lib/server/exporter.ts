@@ -81,27 +81,44 @@ export async function exportVideo(
 				streamLocalStart: clipLocalStart,
 				streamLocalEnd: clipLocalEnd
 			} : undefined;
-			const overlappingEffects = await resolveOverlappingEffects(
-				effectEntries, clipCompStart, clipCompEnd, clipDur, tempDir, i,
+
+			// Split effects into pre-zoom (affected by zoom) and post-zoom (ignoreZoom).
+			// When no zoom is present, all effects go through the normal (pre-zoom) path.
+			const preZoomEntries = hasZoom
+				? (effectEntries ?? []).filter(e => !e.ignoreZoom)
+				: effectEntries;
+			const postZoomEntries = hasZoom
+				? (effectEntries ?? []).filter(e => e.type !== 'zoom' && e.ignoreZoom)
+				: [];
+
+			const preZoomEffects = await resolveOverlappingEffects(
+				preZoomEntries, clipCompStart, clipCompEnd, clipDur, tempDir, i,
 				srcW, srcH, clipCtx,
 				hasZoom ? ZOOM_SUPERSAMPLE : 1
 			);
+			const postZoomEffects = postZoomEntries.length > 0 ? await resolveOverlappingEffects(
+				postZoomEntries, clipCompStart, clipCompEnd, clipDur, tempDir, i,
+				srcW, srcH, clipCtx, 1, 'pz_'
+			) : [];
+
+			// Combine for FFmpeg input ordering: pre-zoom first, then post-zoom
+			const allEffects = [...preZoomEffects, ...postZoomEffects];
 
 			const audioArgs = buildAudioArgs(speed);
 
 			// Build ffmpeg args — use filter_complex when effects or zooms present
 			const extraInputs: string[] = [];
 			let videoFilterArgs: string[];
-			const hasOverlays = overlappingEffects.length > 0;
+			const hasOverlays = allEffects.length > 0;
 
 			if (hasOverlays || hasZoom) {
-				if (overlappingEffects.length > 0) {
-					console.log(`[export] Clip ${i}: ${overlappingEffects.length} overlay(s), ss=${trimStart.toFixed(3)} t=${dur.toFixed(3)} speed=${speed}`);
-					for (const eff of overlappingEffects) {
-						console.log(`[export]   overlay: pos=(${eff.x},${eff.y}) local=[${eff.localStart.toFixed(3)},${eff.localEnd.toFixed(3)}] raw=${!!eff.rawVideo} video=${eff.videoPath}`);
+				if (allEffects.length > 0) {
+					console.log(`[export] Clip ${i}: ${preZoomEffects.length} pre-zoom + ${postZoomEffects.length} post-zoom overlay(s), ss=${trimStart.toFixed(3)} t=${dur.toFixed(3)} speed=${speed}`);
+					for (const eff of allEffects) {
+						console.log(`[export]   overlay: pos=(${eff.x},${eff.y}) local=[${eff.localStart.toFixed(3)},${eff.localEnd.toFixed(3)}] raw=${!!eff.rawVideo} ignoreZoom=${!!eff.ignoreZoom}`);
 					}
 				}
-				for (const eff of overlappingEffects) {
+				for (const eff of allEffects) {
 					const itsoffset = ['-itsoffset', (trimStart + eff.localStart).toFixed(3)];
 					if (eff.rawVideo) {
 						extraInputs.push(
@@ -134,12 +151,12 @@ export async function exportVideo(
 				let filterGraph = `[0:v]${speedFilter}format=yuv420p${scaleUp}[base]`;
 				let prevLabel = 'base';
 
-				// 1. Overlay chain (composited at ss resolution when zoom is present)
-				for (let ei = 0; ei < overlappingEffects.length; ei++) {
-					const eff = overlappingEffects[ei];
-					const inputIdx = ei + 1;
-					const isLastOverlay = ei === overlappingEffects.length - 1;
-					const nextLabel = isLastOverlay && !hasZoom ? 'outv' : `v${ei}`;
+				// 1. Pre-zoom overlay chain (composited at ss resolution when zoom is present)
+				for (let ei = 0; ei < preZoomEffects.length; ei++) {
+					const eff = preZoomEffects[ei];
+					const inputIdx = ei + 1;  // offset by 1 for concat input [0]
+					const isLastBeforeZoom = ei === preZoomEffects.length - 1;
+					const nextLabel = isLastBeforeZoom && !hasZoom && postZoomEffects.length === 0 ? 'outv' : `v${ei}`;
 					const enableStart = (trimStart + eff.localStart).toFixed(3);
 					const enableEnd = (trimStart + eff.localEnd).toFixed(3);
 					const alphaFmt = 'format=yuva420p';
@@ -177,12 +194,49 @@ export async function exportVideo(
 					prevLabel = nextLabel;
 				}
 
-				// 2. Zoom chain (after all overlays — zooms the composited frame)
+				// 2. Zoom chain (after pre-zoom overlays — zooms the composited frame)
 				const zoomFps = probe.fps > 0 ? probe.fps : 30;
 				for (let zi = 0; zi < clipZooms.length; zi++) {
 					const isLast = zi === clipZooms.length - 1;
-					const nextLabel = isLast ? 'outv' : `zm${zi}`;
+					const nextLabel = isLast && postZoomEffects.length === 0 ? 'outv' : `zm${zi}`;
 					filterGraph += buildZoomFilter(prevLabel, nextLabel, clipZooms[zi], trimStart, srcW, srcH, zoomFps);
+					prevLabel = nextLabel;
+				}
+
+				// 3. Post-zoom overlay chain (ignoreZoom effects — at output resolution, no supersample)
+				for (let ei = 0; ei < postZoomEffects.length; ei++) {
+					const eff = postZoomEffects[ei];
+					const inputIdx = preZoomEffects.length + ei + 1;  // offset past pre-zoom inputs + concat
+					const isLast = ei === postZoomEffects.length - 1;
+					const nextLabel = isLast ? 'outv' : `pz${ei}`;
+					const enableStart = (trimStart + eff.localStart).toFixed(3);
+					const enableEnd = (trimStart + eff.localEnd).toFixed(3);
+					const alphaFmt = 'format=yuva420p';
+					// Post-zoom overlays at output resolution — no supersample scaling
+					const ox = eff.x;
+					const oy = eff.y;
+					let overlayInput: string;
+					const effScale = (eff.scale && eff.scale !== 1) ? eff.scale : 1;
+					if (effScale !== 1) {
+						const scaledLabel = `ps${ei}`;
+						filterGraph += `;[${inputIdx}:v]scale=iw*${effScale}:ih*${effScale},${alphaFmt}[${scaledLabel}]`;
+						overlayInput = scaledLabel;
+					} else {
+						const prepLabel = `pp${ei}`;
+						filterGraph += `;[${inputIdx}:v]${alphaFmt}[${prepLabel}]`;
+						overlayInput = prepLabel;
+					}
+
+					if (eff.animation) {
+						const overlayExpr = buildAnimatedOverlay(
+							overlayInput, prevLabel, nextLabel,
+							ox, oy, parseFloat(enableStart), parseFloat(enableEnd),
+							eff.animation, 1  // ss=1 for post-zoom
+						);
+						filterGraph += overlayExpr;
+					} else {
+						filterGraph += `;[${prevLabel}][${overlayInput}]overlay=${ox}:${oy}:enable='between(t,${enableStart},${enableEnd})'[${nextLabel}]`;
+					}
 					prevLabel = nextLabel;
 				}
 
@@ -191,7 +245,7 @@ export async function exportVideo(
 					filterGraph = filterGraph.replace('[base]', '[outv]');
 				}
 
-				if (overlappingEffects.length > 0) {
+				if (allEffects.length > 0) {
 					console.log(`[export]   filter_complex: ${filterGraph}`);
 				}
 
@@ -319,6 +373,8 @@ export interface ResolvedEffect {
 		width: number;   // rendered overlay width (for slide calculations)
 		height: number;  // rendered overlay height
 	};
+	/** When true, composited after zoom — stays fixed in screen space. */
+	ignoreZoom?: boolean;
 }
 
 /** Info about a clip needed for resolving twitch-chat effects. */
@@ -346,7 +402,8 @@ export async function resolveOverlappingEffects(
 	videoWidth = 1920,
 	videoHeight = 1080,
 	clipContext?: ClipContext,
-	chatScaleBoost = 1
+	chatScaleBoost = 1,
+	filePrefix = ''
 ): Promise<ResolvedEffect[]> {
 	if (!effectEntries || effectEntries.length === 0) return [];
 
@@ -379,7 +436,7 @@ export async function resolveOverlappingEffects(
 			const streamStart = clipContext.streamLocalStart + overlapFracStart * clipStreamDur;
 			const streamEnd = clipContext.streamLocalStart + overlapFracEnd * clipStreamDur;
 
-			const videoOutPath = path.join(tempDir, `chatfx_${clipIdx}_${ei}.webm`);
+			const videoOutPath = path.join(tempDir, `${filePrefix}chatfx_${clipIdx}_${ei}.webm`);
 			try {
 				const result = await renderChatEffectVideo({
 					streamId: clipContext.streamId,
@@ -425,7 +482,7 @@ export async function resolveOverlappingEffects(
 			const scaledH = Math.round(img.height * scale);
 			const sp = shadowPadding(effect.shadow);
 
-			const pngPath = path.join(tempDir, `image_${clipIdx}_${ei}.png`);
+			const pngPath = path.join(tempDir, `${filePrefix}image_${clipIdx}_${ei}.png`);
 
 			if (scale !== 1 || opacity < 1 || effect.shadow || !imgFilePath.toLowerCase().endsWith('.png')) {
 				// Re-render via canvas at scaled size with opacity and optional shadow
@@ -459,7 +516,7 @@ export async function resolveOverlappingEffects(
 			// subtitle: render styled text as PNG
 			if (!effect.subtitleText) continue;
 
-			const pngPath = path.join(tempDir, `subtitle_${clipIdx}_${ei}.png`);
+			const pngPath = path.join(tempDir, `${filePrefix}subtitle_${clipIdx}_${ei}.png`);
 			const result = await renderSubtitleOverlay({
 				text: effect.subtitleText,
 				outputPath: pngPath,
@@ -486,7 +543,7 @@ export async function resolveOverlappingEffects(
 			// chat-message: render static PNG
 			if (!effect.twitchId) continue;
 
-			const pngPath = path.join(tempDir, `effect_${clipIdx}_${ei}.png`);
+			const pngPath = path.join(tempDir, `${filePrefix}effect_${clipIdx}_${ei}.png`);
 			const result = await renderEffectOverlay({
 				twitchId: effect.twitchId,
 				outputPath: pngPath,
@@ -511,6 +568,8 @@ export async function resolveOverlappingEffects(
 			resolved.animation = { animIn, animOut, animDuration,
 				width: resolved.overlayWidth, height: resolved.overlayHeight };
 		}
+
+		if (effect.ignoreZoom) resolved.ignoreZoom = true;
 
 		results.push(resolved);
 	}
@@ -679,6 +738,51 @@ export function buildAnimatedOverlay(
 		}
 	}
 
+	// --- Pop scale animation ---
+	// Pop requires animated scaling of the overlay input. We use FFmpeg's scale filter
+	// with eval=frame and expression-based dimensions. The scale filter's `t` follows
+	// the overlay stream's PTS (shifted by -itsoffset, so t starts at enableStart).
+	const hasPopIn = anim.animIn === 'pop';
+	const hasPopOut = anim.animOut === 'pop';
+	const hasPop = hasPopIn || hasPopOut;
+
+	// Build a scale factor expression (1.0 = full size, 0.3 = starting size for pop)
+	// Scale filter `t` = overlay stream time = main video time (due to -itsoffset)
+	let scaleExpr: string | null = null;
+	if (hasPop) {
+		// Build piecewise scale factor: in-phase | steady | out-phase
+		const popMinScale = 0.3;
+		const popRange = 1 - popMinScale; // 0.7
+		const pieces: string[] = [];
+
+		if (hasPopIn) {
+			// p = clip((t - enableStart) / dur, 0, 1), eased = 1 - (1-p)^2
+			const p = `clip((t-${enableStart.toFixed(3)})/${dur.toFixed(3)},0,1)`;
+			const eased = `(1-(1-${p})*(1-${p}))`;
+			const inScale = `(${popMinScale}+${popRange}*${eased})`;
+			pieces.push(`if(lt(t,${inEnd.toFixed(3)}),${inScale}`);
+		}
+		if (hasPopOut) {
+			// p = clip((t - outStart) / dur, 0, 1), eased = p^2
+			const p = `clip((t-${outStart.toFixed(3)})/${dur.toFixed(3)},0,1)`;
+			const eased = `(${p}*${p})`;
+			const outScale = `(1-${popRange}*${eased})`;
+			if (hasPopIn) {
+				pieces.push(`if(gt(t,${outStart.toFixed(3)}),${outScale},1)`);
+			} else {
+				pieces.push(`if(gt(t,${outStart.toFixed(3)}),${outScale}`);
+			}
+		}
+
+		if (hasPopIn && hasPopOut) {
+			scaleExpr = `${pieces[0]},${pieces[1]})`;
+		} else if (hasPopIn) {
+			scaleExpr = `${pieces[0]},1)`;
+		} else {
+			scaleExpr = `${pieces[0]},1)`;
+		}
+	}
+
 	// --- Alpha (fade) via FFmpeg fade filter on the overlay input ---
 	// The overlay input has already been prepared (format=yuva420p, optional scale).
 	// -itsoffset shifts the overlay stream's PTS to start at enableStart,
@@ -688,20 +792,47 @@ export function buildAnimatedOverlay(
 	const needsFadeOut = anim.animOut !== 'none';
 
 	let inputForOverlay = overlayInput;
-	if (needsFadeIn || needsFadeOut) {
-		const parts: string[] = [];
-		if (needsFadeIn) {
-			const fadeDur = anim.animIn === 'pop' ? dur * 0.6 : dur;
-			parts.push(`fade=t=in:st=${enableStart.toFixed(3)}:d=${fadeDur.toFixed(3)}:alpha=1`);
+
+	// Chain: [input] → scale (pop) → fade → [overlay]
+	const chainFilters: string[] = [];
+	if (scaleExpr) {
+		// Animated scale for pop: scale with eval=frame so expressions re-evaluate per frame.
+		// Adjust to even dimensions (required by yuva420p).
+		chainFilters.push(`scale=w='trunc(iw*${scaleExpr}/2)*2':h='trunc(ih*${scaleExpr}/2)*2':eval=frame`);
+	}
+	if (needsFadeIn) {
+		const fadeDur = anim.animIn === 'pop' ? dur * 0.6 : dur;
+		chainFilters.push(`fade=t=in:st=${enableStart.toFixed(3)}:d=${fadeDur.toFixed(3)}:alpha=1`);
+	}
+	if (needsFadeOut) {
+		const fadeOutStart = enableEnd - dur;
+		const fadeDur = anim.animOut === 'pop' ? dur * 0.6 : dur;
+		chainFilters.push(`fade=t=out:st=${fadeOutStart.toFixed(3)}:d=${fadeDur.toFixed(3)}:alpha=1`);
+	}
+
+	if (chainFilters.length > 0) {
+		const chainLabel = `af${nextLabel}`;
+		filterParts.push(`;[${overlayInput}]${chainFilters.join(',')}[${chainLabel}]`);
+		inputForOverlay = chainLabel;
+	}
+
+	// --- Overlay position ---
+	// For pop animation, the overlay size changes so we need to adjust x/y to keep it
+	// centered at the intended position. The overlay's rendered size changes by the scale
+	// factor, so we offset by half the size difference: x + w/2*(1-scaleFactor)
+	if (hasPop) {
+		const sf = scaleExpr!;
+		// Adjust x: baseX + w/2 * (1 - scaleFactor)
+		const xCenter = `${baseX}+${(w / 2).toFixed(1)}*(1-${sf})`;
+		const yCenter = `${baseY}+${(h / 2).toFixed(1)}*(1-${sf})`;
+
+		// Merge with existing position animations (slide + pop would be unusual but handle it)
+		if (xExpr === `${baseX}`) {
+			xExpr = xCenter;
 		}
-		if (needsFadeOut) {
-			const fadeOutStart = enableEnd - dur;
-			const fadeDur = anim.animOut === 'pop' ? dur * 0.6 : dur;
-			parts.push(`fade=t=out:st=${fadeOutStart.toFixed(3)}:d=${fadeDur.toFixed(3)}:alpha=1`);
+		if (yExpr === `${baseY}`) {
+			yExpr = yCenter;
 		}
-		const fadeLabel = `af${nextLabel}`;
-		filterParts.push(`;[${overlayInput}]${parts.join(',')}[${fadeLabel}]`);
-		inputForOverlay = fadeLabel;
 	}
 
 	filterParts.push(`;[${prevLabel}][${inputForOverlay}]overlay=x='${xExpr}':y='${yExpr}':enable='between(t,${T0},${T1})'[${nextLabel}]`);

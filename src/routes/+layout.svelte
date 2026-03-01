@@ -115,6 +115,7 @@
 	:global(.main-content) {
 		flex: 1;
 		min-height: 0;
+		min-width: 0;
 		overflow: hidden;
 		display: flex;
 	}

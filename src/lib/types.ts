@@ -88,6 +88,8 @@ export interface EffectEntry {
 	animOut?: OverlayAnimation;
 	/** Animation duration in seconds (default 0.3). */
 	animDuration?: number;
+	/** When true, overlay stays fixed in screen space — composited after zoom (default false). */
+	ignoreZoom?: boolean;
 	/** Optional drop shadow for overlay effects (not applicable to 'zoom'). */
 	shadow?: {
 		color: string;      // CSS color, e.g. 'rgba(0,0,0,0.8)'

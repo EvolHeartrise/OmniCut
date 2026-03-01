@@ -124,7 +124,7 @@
 	let resolvedCamBounds = $state<CameraBoundsEntry | null>(null);
 
 	// --- Waveform ---
-	const WAVEFORM_BINS = 800;
+	const WAVEFORM_BINS = 2000;
 	let waveformBgCanvas = $state<HTMLCanvasElement | null>(null);
 	let waveformFgCanvas = $state<HTMLCanvasElement | null>(null);
 	let waveformSeekEl = $state<HTMLElement | null>(null);
@@ -427,25 +427,16 @@
 		if (maxPeak < 0.001) maxPeak = 1;
 
 		const barW = w / WAVEFORM_BINS;
-		const halfH = h / 2;
 
-		// Center line (bg only)
-		bgCtx.strokeStyle = '#1a1a2e';
-		bgCtx.lineWidth = 1;
-		bgCtx.beginPath();
-		bgCtx.moveTo(0, halfH);
-		bgCtx.lineTo(w, halfH);
-		bgCtx.stroke();
-
-		// Draw bars: bg = unplayed color, fg = played color
+		// Draw bars: peaks upward from bottom
 		bgCtx.fillStyle = '#2a2a4a';
 		fgCtx.fillStyle = '#7c3aed';
 		for (let i = 0; i < WAVEFORM_BINS; i++) {
 			const amp = waveformPeaks[i] / maxPeak;
-			const barH = Math.max(1, amp * (halfH - 2));
+			const barH = Math.max(0.5, amp * (h - 2));
 			const x = i * barW;
-			bgCtx.fillRect(x, halfH - barH, barW - 0.5, barH * 2);
-			fgCtx.fillRect(x, halfH - barH, barW - 0.5, barH * 2);
+			bgCtx.fillRect(x, h - barH, Math.max(barW - 0.5, 0.5), barH);
+			fgCtx.fillRect(x, h - barH, Math.max(barW - 0.5, 0.5), barH);
 		}
 	}
 

@@ -151,14 +151,30 @@ export async function exportVerticalVideo(
 				streamLocalStart: clipLocalStart,
 				streamLocalEnd: clipLocalEnd
 			} : undefined;
-			const overlappingEffects = await resolveOverlappingEffects(
-				effectEntries, clipCompStart, clipCompEnd, clipDur, tempDir, i,
+
+			// Split effects into pre-zoom (affected by zoom) and post-zoom (ignoreZoom).
+			// When no zoom is present, all effects go through the normal (pre-zoom) path.
+			const preZoomEntries = hasZoom
+				? (effectEntries ?? []).filter(e => !e.ignoreZoom)
+				: effectEntries;
+			const postZoomEntries = hasZoom
+				? (effectEntries ?? []).filter(e => e.type !== 'zoom' && e.ignoreZoom)
+				: [];
+
+			const preZoomEffects = await resolveOverlappingEffects(
+				preZoomEntries, clipCompStart, clipCompEnd, clipDur, tempDir, i,
 				OUT_W, OUT_H, clipCtx,
 				hasZoom ? ZOOM_SUPERSAMPLE : 1
 			);
+			const postZoomEffects = postZoomEntries.length > 0 ? await resolveOverlappingEffects(
+				postZoomEntries, clipCompStart, clipCompEnd, clipDur, tempDir, i,
+				OUT_W, OUT_H, clipCtx, 1, 'pz_'
+			) : [];
+
+			const allEffects = [...preZoomEffects, ...postZoomEffects];
 
 			const extraInputs: string[] = [];
-			for (const eff of overlappingEffects) {
+			for (const eff of allEffects) {
 				const itsoffset = ['-itsoffset', (trimStart + eff.localStart).toFixed(3)];
 				if (eff.rawVideo) {
 					extraInputs.push(
@@ -200,12 +216,12 @@ export async function exportVerticalVideo(
 			let finalLabel = 'vbase';
 			const fps = probe.fps > 0 ? probe.fps : 30;
 
-			// 1. Overlay chain (composited at ss resolution when zoom is present)
-			for (let ei = 0; ei < overlappingEffects.length; ei++) {
-				const eff = overlappingEffects[ei];
+			// 1. Pre-zoom overlay chain (composited at ss resolution when zoom is present)
+			for (let ei = 0; ei < preZoomEffects.length; ei++) {
+				const eff = preZoomEffects[ei];
 				const inputIdx = ei + 1;
-				const isLastOverlay = ei === overlappingEffects.length - 1;
-				const nextLabel = isLastOverlay && !hasZoom ? 'outv' : `ov${ei}`;
+				const isLastBeforeZoom = ei === preZoomEffects.length - 1;
+				const nextLabel = isLastBeforeZoom && !hasZoom && postZoomEffects.length === 0 ? 'outv' : `ov${ei}`;
 				const enableStart = (trimStart + eff.localStart).toFixed(3);
 				const enableEnd = (trimStart + eff.localEnd).toFixed(3);
 				const alphaFmt = 'format=yuva420p';
@@ -238,15 +254,50 @@ export async function exportVerticalVideo(
 				finalLabel = nextLabel;
 			}
 
-			// 2. Zoom chain (after all overlays — zooms the composited frame)
+			// 2. Zoom chain (after pre-zoom overlays — zooms the composited frame)
 			for (let zi = 0; zi < clipZooms.length; zi++) {
 				const isLast = zi === clipZooms.length - 1;
-				const nextLabel = isLast ? 'outv' : `vz${zi}`;
+				const nextLabel = isLast && postZoomEffects.length === 0 ? 'outv' : `vz${zi}`;
 				filterGraph += buildZoomFilter(finalLabel, nextLabel, clipZooms[zi], trimStart, OUT_W, OUT_H, fps);
 				finalLabel = nextLabel;
 			}
 
-			if (overlappingEffects.length === 0 && !hasZoom) {
+			// 3. Post-zoom overlay chain (ignoreZoom effects — at output resolution, no supersample)
+			for (let ei = 0; ei < postZoomEffects.length; ei++) {
+				const eff = postZoomEffects[ei];
+				const inputIdx = preZoomEffects.length + ei + 1;
+				const isLast = ei === postZoomEffects.length - 1;
+				const nextLabel = isLast ? 'outv' : `vpz${ei}`;
+				const enableStart = (trimStart + eff.localStart).toFixed(3);
+				const enableEnd = (trimStart + eff.localEnd).toFixed(3);
+				const alphaFmt = 'format=yuva420p';
+				const ox = eff.x;
+				const oy = eff.y;
+				let overlayInput: string;
+				const effScale = (eff.scale && eff.scale !== 1) ? eff.scale : 1;
+				if (effScale !== 1) {
+					const scaledLabel = `vps${ei}`;
+					filterGraph += `;[${inputIdx}:v]scale=iw*${effScale}:ih*${effScale},${alphaFmt}[${scaledLabel}]`;
+					overlayInput = scaledLabel;
+				} else {
+					const prepLabel = `vpp${ei}`;
+					filterGraph += `;[${inputIdx}:v]${alphaFmt}[${prepLabel}]`;
+					overlayInput = prepLabel;
+				}
+				if (eff.animation) {
+					const overlayExpr = buildAnimatedOverlay(
+						overlayInput, finalLabel, nextLabel,
+						ox, oy, parseFloat(enableStart), parseFloat(enableEnd),
+						eff.animation, 1
+					);
+					filterGraph += overlayExpr;
+				} else {
+					filterGraph += `;[${finalLabel}][${overlayInput}]overlay=${ox}:${oy}:enable='between(t,${enableStart},${enableEnd})'[${nextLabel}]`;
+				}
+				finalLabel = nextLabel;
+			}
+
+			if (allEffects.length === 0 && !hasZoom) {
 				filterGraph = filterGraph.replace('[vbase]', '[outv]');
 			}
 
@@ -256,10 +307,10 @@ export async function exportVerticalVideo(
 
 			const videoArgs = buildVideoEncoderArgs(useNvenc, gop);
 
-			if (overlappingEffects.length > 0) {
-				console.log(`[vertical-export] Clip ${i}: ${overlappingEffects.length} overlay(s), ss=${trimStart.toFixed(3)} t=${dur.toFixed(3)} speed=${speed}`);
-				for (const eff of overlappingEffects) {
-					console.log(`[vertical-export]   overlay: pos=(${eff.x},${eff.y}) local=[${eff.localStart.toFixed(3)},${eff.localEnd.toFixed(3)}] raw=${!!eff.rawVideo} video=${eff.videoPath}`);
+			if (allEffects.length > 0) {
+				console.log(`[vertical-export] Clip ${i}: ${preZoomEffects.length} pre-zoom + ${postZoomEffects.length} post-zoom overlay(s), ss=${trimStart.toFixed(3)} t=${dur.toFixed(3)} speed=${speed}`);
+				for (const eff of allEffects) {
+					console.log(`[vertical-export]   overlay: pos=(${eff.x},${eff.y}) local=[${eff.localStart.toFixed(3)},${eff.localEnd.toFixed(3)}] raw=${!!eff.rawVideo} ignoreZoom=${!!eff.ignoreZoom}`);
 				}
 				console.log(`[vertical-export]   filter_complex: ${filterGraph}`);
 			}

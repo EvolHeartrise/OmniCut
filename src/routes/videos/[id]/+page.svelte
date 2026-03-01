@@ -234,6 +234,19 @@
 	const CULL_MARGIN = 200;
 	let ignoreScrollEvents = false;
 
+	// Ghost playhead (mouse hover)
+	let ghostX = $state<number | null>(null);
+
+	function handleTimelineMouseMove(e: MouseEvent) {
+		if (!scrollAreaEl) return;
+		const rect = scrollAreaEl.getBoundingClientRect();
+		ghostX = e.clientX - rect.left + scrollAreaEl.scrollLeft;
+	}
+
+	function handleTimelineMouseLeave() {
+		ghostX = null;
+	}
+
 	function updateViewport() {
 		if (!scrollAreaEl) return;
 		viewportLeft = scrollAreaEl.scrollLeft;
@@ -813,18 +826,156 @@
 	}
 
 	// --- Waveform + transcription (per-clip) ---
-	const WAVEFORM_BINS = 800;
-	let waveformBgCanvas = $state<HTMLCanvasElement | null>(null);
-	let waveformFgCanvas = $state<HTMLCanvasElement | null>(null);
-	let waveformSeekEl = $state<HTMLElement | null>(null);
-	let waveformPeaks = new Float32Array(WAVEFORM_BINS);
+	const WAVEFORM_BINS = 2000;
 	let waveformActive = false;
-	let isDraggingWaveform = $state(false);
-	let scanAbort: AbortController | null = null;
 	let rafId: number | null = null;
 	let clipProgress = $state(0);
 	let clipDurationText = $state('0:00');
+	let clipDurationSec = $state(0);
 	let transcriptionRegions = $state<Array<{ startFrac: number; endFrac: number; text: string }>>([]);
+
+	let clipCurrentTimeText = $derived(formatDuration(clipProgress * clipDurationSec));
+
+	// --- Per-clip waveform cache for timeline overlay ---
+	let clipWaveformCache = $state<Map<string, Float32Array>>(new Map());
+	let clipWaveformAborts = new Map<string, AbortController>();
+
+	function fetchClipWaveform(entry: ClipEntry, clip: ClipRegion) {
+		const cacheKey = `${clip.id}:${entry.trimStart || 0}:${entry.trimEnd || 0}`;
+		if (clipWaveformCache.has(cacheKey)) return;
+		if (clipWaveformAborts.has(cacheKey)) return;
+
+		const tb = trimmedBounds(entry, clip);
+		if (!tb) return;
+		const { trimmedStart, trimmedEnd } = tb;
+
+		const abort = new AbortController();
+		clipWaveformAborts.set(cacheKey, abort);
+
+		fetch(`/api/waveform/${clip.streamId}?start=${trimmedStart.toFixed(3)}&end=${trimmedEnd.toFixed(3)}`, {
+			signal: abort.signal
+		})
+			.then((r) => {
+				if (!r.ok) throw new Error(r.statusText);
+				return r.arrayBuffer();
+			})
+			.then((buf) => {
+				if (abort.signal.aborted) return;
+				const samples = new Int16Array(buf);
+				const bins = WAVEFORM_BINS;
+				const samplesPerBin = Math.max(1, Math.floor(samples.length / bins));
+				const peaks = new Float32Array(bins);
+				for (let bin = 0; bin < bins; bin++) {
+					const start = bin * samplesPerBin;
+					const end = Math.min(start + samplesPerBin, samples.length);
+					let sum = 0;
+					for (let i = start; i < end; i++) {
+						const s = samples[i] / 32768;
+						sum += s * s;
+					}
+					peaks[bin] = Math.sqrt(sum / (end - start));
+				}
+				clipWaveformCache = new Map(clipWaveformCache).set(cacheKey, peaks);
+			})
+			.catch(() => {})
+			.finally(() => {
+				clipWaveformAborts.delete(cacheKey);
+			});
+	}
+
+	function getClipWaveformKey(entry: ClipEntry, clip: ClipRegion): string {
+		return `${clip.id}:${entry.trimStart || 0}:${entry.trimEnd || 0}`;
+	}
+
+	function drawClipWaveformCanvas(canvas: HTMLCanvasElement, peaks: Float32Array, progress: number, color: string) {
+		const ctx = canvas.getContext('2d');
+		if (!ctx) return;
+
+		const dpr = window.devicePixelRatio || 1;
+		const rect = canvas.getBoundingClientRect();
+		const w = rect.width;
+		const h = rect.height;
+		if (w === 0 || h === 0) return;
+		const pw = Math.round(w * dpr);
+		const ph = Math.round(h * dpr);
+
+		if (canvas.width !== pw || canvas.height !== ph) {
+			canvas.width = pw;
+			canvas.height = ph;
+		}
+		ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+		ctx.clearRect(0, 0, w, h);
+
+		let maxPeak = 0;
+		for (let i = 0; i < peaks.length; i++) {
+			if (peaks[i] > maxPeak) maxPeak = peaks[i];
+		}
+		if (maxPeak < 0.001) maxPeak = 1;
+
+		const barW = w / peaks.length;
+
+		// Draw bars (peaks upward from bottom)
+		for (let i = 0; i < peaks.length; i++) {
+			const amp = peaks[i] / maxPeak;
+			const barH = Math.max(0.5, amp * (h - 2));
+			const x = i * barW;
+			const frac = x / w;
+			if (frac < progress) {
+				ctx.fillStyle = '#fff';
+				ctx.globalAlpha = 0.6;
+			} else {
+				ctx.fillStyle = '#fff';
+				ctx.globalAlpha = 0.25;
+			}
+			ctx.fillRect(x, h - barH, Math.max(barW - 0.5, 0.5), barH);
+		}
+		ctx.globalAlpha = 1;
+	}
+
+	// Fetch waveforms for all clips in the layout
+	$effect(() => {
+		for (const cl of clipLayout) {
+			if (!cl.clip) continue;
+			fetchClipWaveform(cl.entry, cl.clip);
+		}
+	});
+
+	// Map of clip-block canvas elements for drawing
+	let clipCanvasMap = new Map<number, HTMLCanvasElement>();
+
+	function clipWaveformAction(el: HTMLCanvasElement, index: () => number) {
+		clipCanvasMap.set(index(), el);
+		return {
+			update() { clipCanvasMap.set(index(), el); },
+			destroy() { clipCanvasMap.delete(index()); }
+		};
+	}
+
+	// Redraw all clip waveforms on changes
+	$effect(() => {
+		// Re-read dependencies
+		void clipLayout;
+		void clipWaveformCache;
+		void compositionTime;
+		// Schedule a draw on next frame
+		requestAnimationFrame(() => {
+			for (const cl of clipLayout) {
+				const canvas = clipCanvasMap.get(cl.index);
+				if (!canvas || !cl.clip) continue;
+				const key = getClipWaveformKey(cl.entry, cl.clip);
+				const peaks = clipWaveformCache.get(key);
+				if (!peaks) continue;
+				// Compute per-clip progress
+				let progress = 0;
+				if (compositionTime >= cl.startOffset + cl.effectiveDuration) {
+					progress = 1;
+				} else if (compositionTime > cl.startOffset) {
+					progress = (compositionTime - cl.startOffset) / cl.effectiveDuration;
+				}
+				drawClipWaveformCanvas(canvas, peaks, progress, cl.color);
+			}
+		});
+	});
 
 	/** Trimmed local bounds for a clip entry — accounts for trimStart/trimEnd. */
 	function trimmedBounds(entry: ClipEntry, clip: ClipRegion) {
@@ -857,100 +1008,9 @@
 		}
 	});
 
-	// --- Waveform drawing + scan ---
-	function drawStaticWaveform() {
-		const bg = waveformBgCanvas;
-		const fg = waveformFgCanvas;
-		if (!bg || !fg) return;
-		const bgCtx = bg.getContext('2d');
-		const fgCtx = fg.getContext('2d');
-		if (!bgCtx || !fgCtx) return;
-
-		const dpr = window.devicePixelRatio || 1;
-		const rect = bg.getBoundingClientRect();
-		const w = rect.width;
-		const h = rect.height;
-		const pw = Math.round(w * dpr);
-		const ph = Math.round(h * dpr);
-
-		for (const [canvas, ctx] of [[bg, bgCtx], [fg, fgCtx]] as const) {
-			if (canvas.width !== pw || canvas.height !== ph) {
-				canvas.width = pw;
-				canvas.height = ph;
-			}
-			ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-			ctx.clearRect(0, 0, w, h);
-		}
-
-		let maxPeak = 0;
-		for (let i = 0; i < WAVEFORM_BINS; i++) {
-			if (waveformPeaks[i] > maxPeak) maxPeak = waveformPeaks[i];
-		}
-		if (maxPeak < 0.001) maxPeak = 1;
-
-		const barW = w / WAVEFORM_BINS;
-		const halfH = h / 2;
-
-		bgCtx.strokeStyle = '#1a1a2e';
-		bgCtx.lineWidth = 1;
-		bgCtx.beginPath();
-		bgCtx.moveTo(0, halfH);
-		bgCtx.lineTo(w, halfH);
-		bgCtx.stroke();
-
-		bgCtx.fillStyle = '#2a2a4a';
-		fgCtx.fillStyle = '#7c3aed';
-		for (let i = 0; i < WAVEFORM_BINS; i++) {
-			const amp = waveformPeaks[i] / maxPeak;
-			const barH = Math.max(1, amp * (halfH - 2));
-			const x = i * barW;
-			bgCtx.fillRect(x, halfH - barH, barW - 0.5, barH * 2);
-			fgCtx.fillRect(x, halfH - barH, barW - 0.5, barH * 2);
-		}
-	}
-
 	function stopWaveformScan() {
-		if (scanAbort) {
-			scanAbort.abort();
-			scanAbort = null;
-		}
-	}
-
-	function startWaveformScan(entry: ClipEntry, clip: ClipRegion) {
-		stopWaveformScan();
-		const tb = trimmedBounds(entry, clip);
-		if (!tb) return;
-		const { trimmedStart, trimmedEnd } = tb;
-
-		const abort = new AbortController();
-		scanAbort = abort;
-
-		fetch(`/api/waveform/${clip.streamId}?start=${trimmedStart.toFixed(3)}&end=${trimmedEnd.toFixed(3)}`, {
-			signal: abort.signal
-		})
-			.then((r) => {
-				if (!r.ok) throw new Error(r.statusText);
-				return r.arrayBuffer();
-			})
-			.then((buf) => {
-				if (abort.signal.aborted) return;
-				const samples = new Int16Array(buf);
-				const samplesPerBin = Math.max(1, Math.floor(samples.length / WAVEFORM_BINS));
-				const peaks = new Float32Array(WAVEFORM_BINS);
-				for (let bin = 0; bin < WAVEFORM_BINS; bin++) {
-					const start = bin * samplesPerBin;
-					const end = Math.min(start + samplesPerBin, samples.length);
-					let sum = 0;
-					for (let i = start; i < end; i++) {
-						const s = samples[i] / 32768;
-						sum += s * s;
-					}
-					peaks[bin] = Math.sqrt(sum / (end - start));
-				}
-				waveformPeaks = peaks;
-				drawStaticWaveform();
-			})
-			.catch(() => {});
+		for (const abort of clipWaveformAborts.values()) abort.abort();
+		clipWaveformAborts.clear();
 	}
 
 	function waveformLoop() {
@@ -964,10 +1024,15 @@
 				if (tb) {
 					const elapsed = previewVideoEl.currentTime - tb.trimmedStart;
 					clipProgress = tb.trimmedDur > 0 ? Math.max(0, Math.min(1, elapsed / tb.trimmedDur)) : 0;
+					const layoutEntry = clipLayout[currentPreviewIndex];
+					if (layoutEntry) {
+						compositionTime = layoutEntry.startOffset + Math.max(0, elapsed) / (entry.speed || 1);
+						previewCurrentTime = formatDuration(compositionTime);
+					}
 				}
 			}
 		}
-		if (previewPlaying || isDraggingWaveform) {
+		if (previewPlaying) {
 			rafId = requestAnimationFrame(waveformLoop);
 		}
 	}
@@ -975,49 +1040,6 @@
 	function startWaveformLoop() {
 		if (rafId != null) return;
 		rafId = requestAnimationFrame(waveformLoop);
-	}
-
-	// --- Waveform pointer handlers ---
-	function waveformSeekFromEvent(e: PointerEvent) {
-		const el = waveformSeekEl;
-		if (!el) return;
-		const rect = el.getBoundingClientRect();
-		clipProgress = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-	}
-
-	function handleWaveformPointerDown(e: PointerEvent) {
-		if (e.button !== 0) return;
-		isDraggingWaveform = true;
-		isSeeking = true;
-		(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-		waveformSeekFromEvent(e);
-		startWaveformLoop();
-	}
-
-	function handleWaveformPointerMove(e: PointerEvent) {
-		if (!isDraggingWaveform) return;
-		waveformSeekFromEvent(e);
-	}
-
-	function handleWaveformPointerUp(e: PointerEvent) {
-		if (!isDraggingWaveform) return;
-		isDraggingWaveform = false;
-		waveformSeekFromEvent(e);
-		// Convert clipProgress → composition time and seek
-		const entry = entries[currentPreviewIndex];
-		const clip = entry ? resolveClip(entry.clipId) : undefined;
-		if (previewVideoEl && entry && clip) {
-			const tb = trimmedBounds(entry, clip);
-			if (tb) {
-				const elapsed = clipProgress * tb.trimmedDur;
-				const layoutEntry = clipLayout[currentPreviewIndex];
-				if (layoutEntry) {
-					const compTime = layoutEntry.startOffset + elapsed / (entry.speed || 1);
-					seekToCompositionTime(compTime);
-				}
-			}
-		}
-		isSeeking = false;
 	}
 
 	function loadPreviewClip(index: number, autoPlay = true) {
@@ -1147,42 +1169,34 @@
 		previewPlaying = !previewPlaying;
 	}
 
-	// Clip-change detection: reset waveform, start new scan, fetch transcription.
-	// We build a reactive key from the preview index + whether the clip/stream data
-	// is available. This way the effect re-fires when stores populate (e.g. on direct
-	// page load where refreshStreams() completes after initial render).
+	// Clip-change detection: update clipDurationText, fetch transcription.
 	let prevWaveformKey = '';
 	$effect(() => {
 		const idx = currentPreviewIndex;
 		const entry = entries[idx];
 		const clip = entry ? resolveClip(entry.clipId) : undefined;
 		const stream = clip ? streamMap.get(clip.streamId) : undefined;
-		// Build a key that changes when the index changes OR when data becomes available
 		const key = `${idx}:${clip?.id ?? ''}:${stream?.id ?? ''}`;
 		if (key === prevWaveformKey) return;
 		prevWaveformKey = key;
 
-		// Reset waveform
 		clipProgress = 0;
-		waveformPeaks = new Float32Array(WAVEFORM_BINS);
-		drawStaticWaveform();
-		stopWaveformScan();
 		transcriptionRegions = [];
 
 		if (!entry || !clip) {
 			clipDurationText = '0:00';
+			clipDurationSec = 0;
 			return;
 		}
 
 		const tb = untrack(() => trimmedBounds(entry, clip));
 		if (!tb) {
 			clipDurationText = '0:00';
+			clipDurationSec = 0;
 			return;
 		}
-		clipDurationText = formatDuration(tb.trimmedDur / (entry.speed || 1));
-
-		// Start waveform scan
-		startWaveformScan(entry, clip);
+		clipDurationSec = tb.trimmedDur / (entry.speed || 1);
+		clipDurationText = formatDuration(clipDurationSec);
 
 		// Fetch transcription for trimmed range
 		getMultiStreamTranscriptions({ ranges: [{ streamId: clip.streamId, from: tb.trimmedStart, to: tb.trimmedEnd }] })
@@ -1198,20 +1212,17 @@
 			});
 	});
 
-	// Waveform canvas lifecycle
+	// Waveform loop lifecycle
 	$effect(() => {
-		if (waveformBgCanvas && waveformFgCanvas) {
-			waveformActive = true;
-			drawStaticWaveform();
-			if (previewPlaying) startWaveformLoop();
-			return () => {
-				waveformActive = false;
-				if (rafId != null) {
-					cancelAnimationFrame(rafId);
-					rafId = null;
-				}
-			};
-		}
+		waveformActive = true;
+		if (previewPlaying) startWaveformLoop();
+		return () => {
+			waveformActive = false;
+			if (rafId != null) {
+				cancelAnimationFrame(rafId);
+				rafId = null;
+			}
+		};
 	});
 
 	// Cleanup
@@ -1617,7 +1628,7 @@
 	</div>
 {:else}
 	<div class="editor-page main-content">
-		<div class="nle-layout">
+		<div class="nle-layout" class:nle-layout-vertical={format === 'mobile_short'}>
 			<!-- TOP ROW: Preview + Properties -->
 			<div class="preview-panel">
 				<div class="preview-main">
@@ -1746,52 +1757,7 @@
 						{/each}
 					</div>
 				</div>
-				<div class="video-controls">
-					<div class="timeline-row">
-						<button class="btn-ctl" onclick={togglePreviewPlay}>
-							{previewPlaying ? '\u23F8' : '\u25B6'}
-						</button>
-						<!-- svelte-ignore a11y_no_static_element_interactions -->
-						<div
-							class="waveform-seek"
-							bind:this={waveformSeekEl}
-							onpointerdown={handleWaveformPointerDown}
-							onpointermove={handleWaveformPointerMove}
-							onpointerup={handleWaveformPointerUp}
-						>
-							<canvas bind:this={waveformBgCanvas} class="waveform-canvas"></canvas>
-							<canvas
-								bind:this={waveformFgCanvas}
-								class="waveform-canvas waveform-fg"
-								style="clip-path: inset(0 {(1 - clipProgress) * 100}% 0 0)"
-							></canvas>
-							{#each transcriptionRegions as region}
-								<div
-									class="transcript-region"
-									style="left: {region.startFrac * 100}%; width: {(region.endFrac - region.startFrac) * 100}%"
-									title={region.text}
-								></div>
-							{/each}
-							<div class="waveform-playhead" style="left: {clipProgress * 100}%"></div>
-						</div>
-					</div>
-					<div class="transport-row">
-						<span class="vid-time">{previewCurrentTime}</span>
-						<span class="vid-time" style="color: #555">/</span>
-						<span class="vid-time">{formatDuration(totalDuration)}</span>
-						{#if entries.length > 0}
-							<span class="transport-clip-info">
-								Clip {currentPreviewIndex + 1}/{entries.length}
-								{#if resolveClip(entries[currentPreviewIndex]?.clipId ?? '')}
-									{@const curClip = resolveClip(entries[currentPreviewIndex]?.clipId ?? '')!}
-									— {curClip.title || clipChannel(curClip)}
-								{/if}
-							</span>
-						{/if}
-						<span style="flex:1"></span>
-						<span class="vid-time">{clipDurationText}</span>
-					</div>
-				</div>
+				<div class="video-controls"></div>
 				</div>
 				{#if chatPanelOpen}
 					<ClipChatPanel
@@ -2285,6 +2251,20 @@
 								</div>
 							{/if}
 						</div>
+
+						<div class="props-section">
+							<div class="prop-field">
+								<label class="prop-label">
+									<input
+										type="checkbox"
+										checked={!!selEffect.ignoreZoom}
+										onchange={() => updateEffectEntry(selEffect.id, { ignoreZoom: !selEffect.ignoreZoom })}
+									/>
+									Ignore Zoom
+								</label>
+								<span style="font-size: 0.55rem; color: #64748b; display: block; margin-top: 2px">Stay fixed in screen space during zoom effects</span>
+							</div>
+						</div>
 						{/if}
 
 						{#if !isChatPanel && !isZoom && !isSubtitle && !isImage && msg}
@@ -2480,6 +2460,19 @@
 					<span class="tl-time">{formatDuration(compositionTime)}</span>
 					<span class="tl-sep">/</span>
 					<span class="tl-time">{formatDuration(totalDuration)}</span>
+					{#if entries.length > 0}
+						<span class="tl-sep" style="color: #333">|</span>
+						<span class="tl-time tl-time-clip">{clipCurrentTimeText}</span>
+						<span class="tl-sep tl-sep-clip">/</span>
+						<span class="tl-time tl-time-clip">{clipDurationText}</span>
+						<span class="transport-clip-info">
+							Clip {currentPreviewIndex + 1}/{entries.length}
+							{#if resolveClip(entries[currentPreviewIndex]?.clipId ?? '')}
+								{@const curClip = resolveClip(entries[currentPreviewIndex]?.clipId ?? '')!}
+								— {curClip.title || clipChannel(curClip)}
+							{/if}
+						</span>
+					{/if}
 					<div class="tl-spacer"></div>
 					<button class="btn-tl btn-tl-sm" onclick={() => { showClipPicker = !showClipPicker; }} title="Add clips">
 						{showClipPicker ? 'Done' : '+ Add Clips'}
@@ -2562,7 +2555,7 @@
 							{@const trackIdx = effectTrackCount - 1 - i}
 							<div class="tl-label-row" style="height: 30px"><span class="tl-label-icon" style="color: #38bdf8">[FX{trackIdx > 0 ? trackIdx : ''}]</span><span class="tl-label-text">Effects</span></div>
 						{/each}
-						<div class="tl-label-row" style="height: 40px"><span class="tl-label-icon">[V]</span><span class="tl-label-text">Video</span></div>
+						<div class="tl-label-row" style="height: 64px"><span class="tl-label-icon">[V]</span><span class="tl-label-text">Video</span></div>
 					</div>
 
 					<!-- Scrollable timeline area -->
@@ -2572,6 +2565,8 @@
 						bind:this={scrollAreaEl}
 						onscroll={handleScroll}
 						onmousedown={handleTimelineClick}
+						onmousemove={handleTimelineMouseMove}
+						onmouseleave={handleTimelineMouseLeave}
 					>
 						<div class="tl-content" style="width: {contentWidth}px">
 							<!-- Time ruler -->
@@ -2632,7 +2627,7 @@
 							{/each}
 
 							<!-- [V] Video Track -->
-							<div class="tl-track tl-track-video" style="height: 40px">
+							<div class="tl-track tl-track-video" style="height: 64px">
 								{#each clipLayout as cl (cl.entry.clipId + '-' + cl.index)}
 									{@const leftPx = cl.startOffset * pixelsPerSecond}
 									{@const widthPx = cl.effectiveDuration * pixelsPerSecond}
@@ -2649,6 +2644,10 @@
 											onclick={(e) => handleClipClick(e, cl.index)}
 											onmousedown={(e) => handleReorderStart(e, cl.index)}
 										>
+											<canvas
+												class="clip-waveform-canvas"
+												use:clipWaveformAction={() => cl.index}
+											></canvas>
 											<!-- Trim handles -->
 											<!-- svelte-ignore a11y_no_static_element_interactions -->
 											<div class="trim-handle trim-handle-start" onmousedown={(e) => handleTrimStart(e, cl.index)}></div>
@@ -2673,6 +2672,11 @@
 								{/if}
 							</div>
 
+							<!-- Ghost playhead (mouse hover) -->
+							{#if ghostX !== null}
+								<div class="tl-ghost-playhead" style="left: {ghostX}px"></div>
+							{/if}
+
 							<!-- Playhead -->
 							<div class="tl-playhead" style="left: {playheadX}px"></div>
 						</div>
@@ -2693,6 +2697,7 @@
 	.editor-page {
 		flex: 1;
 		min-height: 0;
+		min-width: 0;
 		overflow: hidden;
 	}
 
@@ -2725,7 +2730,47 @@
 		grid-template-columns: 1fr 320px;
 		grid-template-rows: 1fr auto;
 		height: 100%;
+		width: 100%;
+		min-height: 0;
+		min-width: 0;
 		overflow: hidden;
+	}
+
+	/* --- 9:16 vertical layout: Timeline | Properties | Preview --- */
+	.nle-layout-vertical {
+		grid-template-columns: 1fr 300px auto;
+		grid-template-rows: 1fr;
+	}
+
+	.nle-layout-vertical .timeline-area {
+		grid-column: 1;
+		grid-row: 1;
+		height: auto;
+		border-top: none;
+		border-right: 1px solid #2a2a4a;
+	}
+
+	.nle-layout-vertical .tl-toolbar {
+		flex-wrap: wrap;
+	}
+
+	.nle-layout-vertical .properties-panel {
+		grid-column: 2;
+		grid-row: 1;
+		border-bottom: none;
+		border-right: 1px solid #1a1a2e;
+	}
+
+	.nle-layout-vertical .preview-panel {
+		grid-column: 3;
+		grid-row: 1;
+		border-right: none;
+		border-left: 1px solid #1a1a2e;
+		flex-direction: column;
+		overflow: hidden;
+		height: 100%;
+		max-height: 100%;
+		aspect-ratio: 9 / 16;
 	}
 
 	/* ============================================================
@@ -2737,6 +2782,8 @@
 		display: flex;
 		flex-direction: row;
 		overflow: hidden;
+		min-height: 0;
+		min-width: 0;
 		border-right: 1px solid #1a1a2e;
 		background: #0a0a1a;
 	}
@@ -2787,92 +2834,6 @@
 		flex-shrink: 0;
 	}
 
-	.timeline-row {
-		display: flex;
-		align-items: stretch;
-		flex-shrink: 0;
-	}
-
-	.timeline-row .btn-ctl {
-		border-radius: 0;
-		padding: 0;
-		width: 44px;
-		flex-shrink: 0;
-		text-align: center;
-	}
-
-	.waveform-seek {
-		position: relative;
-		height: 64px;
-		cursor: pointer;
-		touch-action: none;
-		flex: 1;
-		min-width: 0;
-	}
-
-	.waveform-canvas {
-		display: block;
-		width: 100%;
-		height: 100%;
-	}
-
-	.waveform-fg {
-		position: absolute;
-		top: 0;
-		left: 0;
-	}
-
-	.waveform-playhead {
-		position: absolute;
-		top: 0;
-		bottom: 0;
-		width: 2px;
-		background: #fff;
-		box-shadow: 0 0 6px #7c3aed;
-		pointer-events: none;
-		transform: translateX(-1px);
-	}
-
-	.transcript-region {
-		position: absolute;
-		top: 0;
-		bottom: 0;
-		background: rgba(56, 189, 248, 0.15);
-		border-left: 1px solid rgba(56, 189, 248, 0.3);
-		pointer-events: none;
-	}
-
-	.transport-row {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-		padding: 4px 16px 6px;
-	}
-
-	.vid-time {
-		font-size: 0.7rem;
-		color: #888;
-		font-variant-numeric: tabular-nums;
-		font-family: monospace;
-		min-width: 3em;
-		text-align: center;
-	}
-
-	.btn-ctl {
-		background: #2a2a4a;
-		border: none;
-		color: #ccc;
-		padding: 6px 14px;
-		border-radius: 4px;
-		cursor: pointer;
-		font-size: 0.85rem;
-	}
-
-	.btn-ctl:hover {
-		background: #3a3a5a;
-		color: #fff;
-	}
-
 	.transport-clip-info {
 		font-size: 0.7rem;
 		color: #888;
@@ -2890,6 +2851,7 @@
 		display: flex;
 		flex-direction: column;
 		overflow-y: auto;
+		min-height: 0;
 		padding: 16px;
 		background: #0d0d1f;
 		border-bottom: 1px solid #1a1a2e;
@@ -3206,6 +3168,9 @@
 		display: flex;
 		flex-direction: column;
 		height: 280px;
+		min-height: 0;
+		min-width: 0;
+		overflow: hidden;
 		background: #0a0a1a;
 		border-top: 1px solid #2a2a4a;
 		user-select: none;
@@ -3253,6 +3218,15 @@
 	.tl-sep {
 		color: #555;
 		font-size: 0.7rem;
+	}
+
+	.tl-time-clip {
+		color: #888;
+		font-size: 0.7rem;
+	}
+
+	.tl-sep-clip {
+		color: #444;
 	}
 
 	.tl-spacer {
@@ -3473,8 +3447,18 @@
 		cursor: grab;
 		overflow: hidden;
 		display: flex;
-		align-items: center;
+		align-items: flex-end;
 		transition: opacity 0.1s;
+	}
+
+	.clip-waveform-canvas {
+		position: absolute;
+		top: 0;
+		left: 0;
+		width: 100%;
+		height: 100%;
+		pointer-events: none;
+		border-radius: 4px;
 	}
 
 	.clip-block:hover {
@@ -3495,14 +3479,15 @@
 
 	.clip-label {
 		position: relative;
+		z-index: 1;
 		font-size: 0.6rem;
 		color: rgba(255, 255, 255, 0.9);
 		white-space: nowrap;
 		overflow: hidden;
 		text-overflow: ellipsis;
 		pointer-events: none;
-		text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
-		padding: 0 10px;
+		text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+		padding: 0 10px 4px;
 		line-height: 1.2;
 		flex: 1;
 		min-width: 0;
@@ -3551,6 +3536,16 @@
 	}
 
 	/* --- Playhead --- */
+	.tl-ghost-playhead {
+		position: absolute;
+		top: 0;
+		bottom: 0;
+		width: 1px;
+		background: rgba(255, 255, 255, 0.15);
+		pointer-events: none;
+		z-index: 9;
+	}
+
 	.tl-playhead {
 		position: absolute;
 		top: 0;
@@ -3855,6 +3850,7 @@
 		position: absolute;
 		pointer-events: auto;
 		padding: 4px 8px;
+		width: max-content;
 		white-space: pre-wrap;
 		word-wrap: break-word;
 		cursor: grab;
