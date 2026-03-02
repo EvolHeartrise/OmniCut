@@ -5,7 +5,6 @@
  */
 
 import { newExportId } from '../ids.js';
-import type { ClipEntry, EffectEntry } from '../types.js';
 import { getClipRegion } from './clipManager.js';
 import { validateClipIds } from './clipValidation.js';
 import { getVideo } from './videoManager.js';
@@ -147,16 +146,13 @@ async function runExport(exportId: string): Promise<void> {
 	const record = db.loadExport(exportId);
 	if (!record) return;
 
-	// Build a map from clipId → ClipEntry for trim/speed/transition metadata
-	const entryMap = new Map<string, ClipEntry>();
-	if (record.clipEntries) {
-		for (const entry of record.clipEntries) {
-			entryMap.set(entry.clipId, entry);
-		}
-	}
+	// Resolve clip IDs → ClipRegion objects paired with their entries by index,
+	// so duplicate clipIds each keep their own ClipEntry.
+	const resolved = record.clipIds
+		.map((id, i) => ({ clip: getClipRegion(id), entry: record.clipEntries?.[i] }))
+		.filter((p) => p.clip !== undefined);
 
-	// Resolve clip IDs → ClipRegion objects, preserving caller-specified order
-	const clips = record.clipIds.map((id) => getClipRegion(id)).filter((c) => c !== undefined);
+	const clips = resolved.map((p) => p.clip!);
 
 	if (clips.length === 0) {
 		db.updateExportStatus(exportId, 'error', undefined, 'No valid clips found');
@@ -164,8 +160,7 @@ async function runExport(exportId: string): Promise<void> {
 		return;
 	}
 
-	// Collect the ordered clip entries (for exporters that support effects)
-	const clipEntries = clips.map((clip) => entryMap.get(clip.id));
+	const clipEntries = resolved.map((p) => p.entry);
 
 	// Compute composition-time offsets for each clip (used to map effectEntries to per-clip windows)
 	const compOffsets: number[] = [];

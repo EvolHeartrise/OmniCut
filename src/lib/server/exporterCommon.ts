@@ -136,6 +136,26 @@ export function cleanupTempDir(tempDir: string): void {
 }
 
 /**
+ * Probe the video stream duration of a file in seconds. Returns 0 on failure.
+ * Uses the video track specifically to avoid AAC encoder priming inflating the duration.
+ */
+async function probeVideoDuration(filePath: string): Promise<number> {
+	try {
+		const proc = Bun.spawn(
+			['ffprobe', '-v', 'quiet', '-select_streams', 'v:0',
+				'-show_entries', 'stream=duration', '-of', 'default=noprint_wrappers=1:nokey=1', filePath],
+			{ stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' }
+		);
+		const stdout = await new Response(proc.stdout).text();
+		await proc.exited;
+		const dur = parseFloat(stdout.trim());
+		return isFinite(dur) && dur > 0 ? dur : 0;
+	} catch {
+		return 0;
+	}
+}
+
+/**
  * Concatenate multiple clip files into a single output using ffmpeg concat demuxer.
  * If there's only one file, it's renamed instead (no re-encode).
  */
@@ -149,8 +169,17 @@ export async function concatClipFiles(
 		return;
 	}
 
+	// Probe video stream durations in parallel — use video-track timing for concat
+	// rather than container duration (which includes AAC encoder priming, causing gaps).
+	const durations = await Promise.all(clipFiles.map(probeVideoDuration));
+
 	const concatListPath = path.join(tempDir, 'final_concat.txt');
-	fs.writeFileSync(concatListPath, clipFiles.map((f) => ffmpegConcatEscape(f)).join('\n'));
+	const lines: string[] = [];
+	for (let i = 0; i < clipFiles.length; i++) {
+		lines.push(ffmpegConcatEscape(clipFiles[i]));
+		if (durations[i] > 0) lines.push(`duration ${durations[i].toFixed(6)}`);
+	}
+	fs.writeFileSync(concatListPath, lines.join('\n'));
 
 	await runFfmpeg([
 		'-f', 'concat', '-safe', '0', '-i', concatListPath,
