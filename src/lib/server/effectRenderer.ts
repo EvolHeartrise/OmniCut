@@ -24,7 +24,7 @@ import {
 	CHAT_PAD_X,
 	CHAT_PAD_Y,
 } from './chatRenderer.js';
-import type { ShadowConfig } from './exporter.js';
+import type { ShadowConfig } from './exporterTypes.js';
 
 // Default max width for effect overlays (pixels at 1920-wide resolution)
 const DEFAULT_MAX_WIDTH = 400;

@@ -17,7 +17,7 @@ import {
 	CHAT_BADGE_SIZE, CHAT_EMOTE_HEIGHT, CHAT_PAD_X, CHAT_PAD_Y,
 	type PreparedMessage
 } from './chatRenderer.js';
-import type { ShadowConfig } from './exporter.js';
+import type { ShadowConfig } from './exporterTypes.js';
 
 const MAX_VISIBLE = 200;
 const FPS = 30;

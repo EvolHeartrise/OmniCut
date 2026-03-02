@@ -5,7 +5,7 @@
 
 import * as fs from 'node:fs';
 import { createCanvas, type SKRSContext2D } from '@napi-rs/canvas';
-import type { ShadowConfig } from './exporter.js';
+import type { ShadowConfig } from './exporterTypes.js';
 
 const DEFAULT_FONT_SIZE = 48;
 const DEFAULT_FONT_COLOR = '#FFFFFF';

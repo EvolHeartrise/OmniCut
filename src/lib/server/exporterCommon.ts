@@ -6,7 +6,7 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import type { ClipRegion, ClipEntry, EffectEntry } from '../types.js';
-import type { StreamLookup } from './exporter.js';
+import type { StreamLookup } from './exporterTypes.js';
 import { parseRelevantSegments, ffmpegConcatEscape, buildConcatContent } from './hlsUtils.js';
 import { runFfmpeg } from './ffmpeg.js';
 
@@ -153,7 +153,6 @@ export async function concatClipFiles(
 	fs.writeFileSync(concatListPath, clipFiles.map((f) => ffmpegConcatEscape(f)).join('\n'));
 
 	await runFfmpeg([
-		'-fflags', '+genpts',
 		'-f', 'concat', '-safe', '0', '-i', concatListPath,
 		'-c', 'copy',
 		'-movflags', '+faststart',
@@ -167,8 +166,8 @@ export async function concatClipFiles(
  */
 export function buildVideoEncoderArgs(useNvenc: boolean, gop?: number): string[] {
 	const args = useNvenc
-		? ['-c:v', 'h264_nvenc', '-preset', 'p4', '-profile:v', 'high', '-qp', '18', '-rc-lookahead', '32', '-bf', '2']
-		: ['-c:v', 'libx264', '-preset', 'medium', '-profile:v', 'high', '-crf', '18', '-bf', '2'];
+		? ['-c:v', 'h264_nvenc', '-preset', 'p4', '-profile:v', 'high', '-qp', '18', '-rc-lookahead', '32']
+		: ['-c:v', 'libx264', '-preset', 'medium', '-profile:v', 'high', '-crf', '18'];
 	if (gop !== undefined) {
 		args.push('-g', `${gop}`, '-flags', '+cgop');
 	}
@@ -306,4 +305,57 @@ export function buildAudioMixFilter(
 		audioOutLabel: outLabel,
 		totalAudioInputs: audioOverlays.length
 	};
+}
+
+/** Probe a video file's width, height, and framerate. */
+export async function probeVideo(filePath: string): Promise<{ width: number; height: number; fps: number }> {
+	try {
+		const proc = Bun.spawn(
+			['ffprobe', '-v', 'quiet', '-select_streams', 'v:0',
+				'-show_entries', 'stream=width,height,r_frame_rate', '-of', 'json', filePath],
+			{ stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' }
+		);
+		const stdout = await new Response(proc.stdout).text();
+		const code = await proc.exited;
+		if (code !== 0) return { width: 0, height: 0, fps: 0 };
+		const data = JSON.parse(stdout);
+		const stream = data.streams?.[0];
+		const width = parseInt(stream?.width, 10) || 0;
+		const height = parseInt(stream?.height, 10) || 0;
+		let fps = 0;
+		if (stream?.r_frame_rate) {
+			const [num, den] = stream.r_frame_rate.split('/').map(Number);
+			if (den > 0) fps = Math.round(num / den);
+		}
+		return { width, height, fps };
+	} catch {
+		return { width: 0, height: 0, fps: 0 };
+	}
+}
+
+let nvencCached: boolean | null = null;
+
+/** Test if NVENC is available by encoding a tiny synthetic video (result cached). */
+export async function detectNvenc(): Promise<boolean> {
+	if (nvencCached !== null) return nvencCached;
+	try {
+		const proc = Bun.spawn(
+			[
+				'ffmpeg',
+				'-f', 'lavfi', '-i', 'nullsrc=s=64x64:d=0.1',
+				'-f', 'lavfi', '-i', 'anullsrc=d=0.1',
+				'-c:v', 'h264_nvenc', '-preset', 'p4', '-qp', '18',
+				'-c:a', 'aac',
+				'-f', 'null', '-'
+			],
+			{ stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' }
+		);
+
+		const code = await proc.exited;
+		nvencCached = code === 0;
+		return nvencCached;
+	} catch {
+		nvencCached = false;
+		return false;
+	}
 }
