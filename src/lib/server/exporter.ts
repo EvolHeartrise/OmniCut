@@ -6,9 +6,9 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import type { ClipRegion, ClipEntry, EffectEntry, OverlayAnimation, EasingFunction } from '../types.js';
-import { runFfmpeg } from './ffmpeg.js';
+import { runFfmpeg, spawnFfmpegWithPipe } from './ffmpeg.js';
 import { renderEffectOverlay, clearEffectRendererCache } from './effectRenderer.js';
-import { renderChatEffectVideo, clearChatEffectCache } from './chatEffectRenderer.js';
+import { prepareChatEffect, renderChatEffectVideo, clearChatEffectCache, type FrameSink } from './chatEffectRenderer.js';
 import { renderSubtitleOverlay } from './subtitleRenderer.js';
 import {
 	resolveClip, buildAudioArgs, buildVideoEncoderArgs, createTempDir, cleanupTempDir,
@@ -113,14 +113,38 @@ export async function exportVideo(
 			const extraInputs: string[] = [];
 			let videoFilterArgs: string[];
 			const hasOverlays = allEffects.length > 0;
+			let pipeEffect: ResolvedEffect | null = null;
 
 			if (hasOverlays || hasZoom) {
 				if (allEffects.length > 0) {
 					console.log(`[export] Clip ${i}: ${preZoomEffects.length} pre-zoom + ${postZoomEffects.length} post-zoom overlay(s), ss=${trimStart.toFixed(3)} t=${dur.toFixed(3)} speed=${speed}`);
 					for (const eff of allEffects) {
-						console.log(`[export]   overlay: pos=(${eff.x},${eff.y}) local=[${eff.localStart.toFixed(3)},${eff.localEnd.toFixed(3)}] raw=${!!eff.rawVideo} ignoreZoom=${!!eff.ignoreZoom}`);
+						console.log(`[export]   overlay: pos=(${eff.x},${eff.y}) local=[${eff.localStart.toFixed(3)},${eff.localEnd.toFixed(3)}] raw=${!!eff.rawVideo} piped=${!!eff.deferredRender} ignoreZoom=${!!eff.ignoreZoom}`);
 					}
 				}
+
+				// Pick at most ONE deferred-render effect to pipe via stdin.
+				// Any additional deferred effects must fall back to file-based rendering.
+				for (const eff of allEffects) {
+					if (eff.rawVideo && eff.deferredRender) {
+						if (!pipeEffect) {
+							pipeEffect = eff;
+						} else {
+							// Fallback: render to file
+							const rawPath = path.join(tempDir, `chatfx_fallback_${i}_${allEffects.indexOf(eff)}.rgba`);
+							const fd = fs.openSync(rawPath, 'w');
+							try {
+								await eff.deferredRender({
+									write(buf: Buffer) { fs.writeSync(fd, buf); },
+									async flush() {}
+								});
+							} finally { fs.closeSync(fd); }
+							eff.videoPath = rawPath;
+							eff.deferredRender = undefined;
+						}
+					}
+				}
+
 				for (const eff of allEffects) {
 					const itsoffset = ['-itsoffset', (trimStart + eff.localStart).toFixed(3)];
 					if (eff.rawVideo) {
@@ -129,7 +153,7 @@ export async function exportVideo(
 							'-f', 'rawvideo', '-pix_fmt', 'rgba',
 							'-s', `${eff.rawVideo.width}x${eff.rawVideo.height}`,
 							'-r', `${eff.rawVideo.fps}`,
-							'-i', eff.videoPath!
+							'-i', eff.deferredRender ? 'pipe:0' : eff.videoPath!
 						);
 					} else if (eff.animation) {
 						// Animated overlay: loop the PNG as a 30fps video so fade filters work
@@ -254,7 +278,7 @@ export async function exportVideo(
 
 				// Audio overlay mixing
 				const audioNextIdx = 1 + allEffects.length;
-				const audioMix = buildAudioMixFilter(audioOverlays, audioNextIdx, speed, clipDur);
+				const audioMix = buildAudioMixFilter(audioOverlays, audioNextIdx, speed, clipDur, trimStart);
 				if (audioMix.totalAudioInputs > 0) {
 					extraInputs.push(...audioMix.extraInputs);
 					filterGraph += ';' + audioMix.audioFilterGraph;
@@ -273,7 +297,7 @@ export async function exportVideo(
 
 				if (audioOverlays.length > 0) {
 					// Need filter_complex for audio mixing even without video overlays
-					const audioMix = buildAudioMixFilter(audioOverlays, 1, speed, clipDur);
+					const audioMix = buildAudioMixFilter(audioOverlays, 1, speed, clipDur, trimStart);
 					extraInputs.push(...audioMix.extraInputs);
 					// Build a combined filter with video + audio
 					const fullFilter = `[0:v]${vFilters.join(',')}[outv];${audioMix.audioFilterGraph}`;
@@ -294,7 +318,7 @@ export async function exportVideo(
 			// When using audio filter_complex, skip -af args (already handled in filter graph)
 			const hasAudioMix = audioOverlays.length > 0;
 
-			await runFfmpeg([
+			const ffmpegArgs = [
 				'-fflags', '+genpts',
 				'-f', 'concat', '-safe', '0', '-i', concatPath,
 				...extraInputs,
@@ -306,7 +330,35 @@ export async function exportVideo(
 				'-video_track_timescale', '90000',
 				'-movflags', '+faststart',
 				'-y', outFile
-			], 2000);
+			];
+
+			if (pipeEffect?.deferredRender) {
+				// Stream raw RGBA frames directly to FFmpeg stdin
+				const handle = spawnFfmpegWithPipe(ffmpegArgs);
+				const pipeSink: FrameSink = {
+					write(buf: Buffer) { handle.stdin.write(buf); },
+					async flush() { await handle.stdin.flush(); },
+				};
+
+				let renderError: Error | null = null;
+				try {
+					await pipeEffect.deferredRender(pipeSink);
+				} catch (err) {
+					renderError = err instanceof Error ? err : new Error(String(err));
+				}
+
+				try { handle.stdin.end(); } catch { /* pipe may already be closed */ }
+
+				try {
+					await handle.waitForExit(2000);
+				} catch (ffmpegErr) {
+					if (renderError) console.warn('[export] Render also failed:', renderError.message);
+					throw ffmpegErr;
+				}
+				if (renderError) throw renderError;
+			} else {
+				await runFfmpeg(ffmpegArgs, 2000);
+			}
 
 			clipFiles.push(outFile);
 		}
@@ -405,6 +457,8 @@ export interface ResolvedEffect {
 	};
 	/** When true, composited after zoom — stays fixed in screen space. */
 	ignoreZoom?: boolean;
+	/** Deferred frame renderer — streams raw RGBA to a pipe instead of reading from a file. */
+	deferredRender?: (sink: FrameSink) => Promise<void>;
 }
 
 /** Info about a clip needed for resolving twitch-chat effects. */
@@ -456,7 +510,7 @@ export async function resolveOverlappingEffects(
 		let resolved: ResolvedEffect | null = null;
 
 		if (effect.type === 'twitch-chat') {
-			// Render scrolling chat panel as transparent WebM
+			// Prepare scrolling chat panel — defers frame rendering for pipe-based streaming
 			if (!clipContext) continue;
 
 			// Map the overlap window to stream-local time
@@ -466,14 +520,12 @@ export async function resolveOverlappingEffects(
 			const streamStart = clipContext.streamLocalStart + overlapFracStart * clipStreamDur;
 			const streamEnd = clipContext.streamLocalStart + overlapFracEnd * clipStreamDur;
 
-			const videoOutPath = path.join(tempDir, `${filePrefix}chatfx_${clipIdx}_${ei}.webm`);
 			try {
-				const result = await renderChatEffectVideo({
+				const prepared = await prepareChatEffect({
 					streamId: clipContext.streamId,
 					channel: clipContext.channel,
 					localStart: streamStart,
 					localEnd: streamEnd,
-					outputPath: videoOutPath,
 					panelWidth: effect.panelWidth,
 					panelHeight: effect.panelHeight,
 					chatOffset: effect.chatOffset,
@@ -486,12 +538,14 @@ export async function resolveOverlappingEffects(
 				const chatSc = (effect.chatScale ?? 1) * chatScaleBoost;
 				const x = Math.round(effect.x * videoWidth) - Math.round(sp.left * chatSc);
 				const y = Math.round(effect.y * videoHeight) - Math.round(sp.top * chatSc);
-				// Scale is baked into the render — no FFmpeg upscale needed
-				const rawVideo = result.raw ? { width: result.width, height: result.height, fps: result.fps } : undefined;
-				resolved = { videoPath: result.videoPath, x, y, localStart, localEnd, rawVideo,
-					overlayWidth: result.width, overlayHeight: result.height };
+				resolved = {
+					x, y, localStart, localEnd,
+					rawVideo: { width: prepared.width, height: prepared.height, fps: prepared.fps },
+					overlayWidth: prepared.width, overlayHeight: prepared.height,
+					deferredRender: prepared.renderFrames
+				};
 			} catch (err) {
-				console.warn(`[exporter] Failed to render twitch-chat effect ${ei}:`, err instanceof Error ? err.message : err);
+				console.warn(`[exporter] Failed to prepare twitch-chat effect ${ei}:`, err instanceof Error ? err.message : err);
 			}
 		} else if (effect.type === 'image') {
 			// image: load uploaded image, optionally scale, apply opacity, apply shadow

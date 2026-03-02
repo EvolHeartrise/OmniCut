@@ -244,14 +244,16 @@ export function resolveAudioOverlays(
  * @param audioOverlays Resolved audio overlays for this clip
  * @param nextInputIdx The next available ffmpeg input index (after video overlays)
  * @param speed Playback speed multiplier
- * @param trimStart Seek offset into the source concat (for itsoffset alignment)
  * @param clipDur Duration of the clip in real time (after speed)
+ * @param trimStart Output -ss seek offset (seconds) — added to adelay so overlay audio
+ *                  isn't clipped by the output seek that discards pre-clip content
  */
 export function buildAudioMixFilter(
 	audioOverlays: ResolvedAudioOverlay[],
 	nextInputIdx: number,
 	speed: number,
-	clipDur: number
+	clipDur: number,
+	trimStart = 0
 ): { extraInputs: string[]; audioFilterGraph: string; audioOutLabel: string; totalAudioInputs: number } {
 	if (audioOverlays.length === 0) {
 		return { extraInputs: [], audioFilterGraph: '', audioOutLabel: '', totalAudioInputs: 0 };
@@ -282,8 +284,10 @@ export function buildAudioMixFilter(
 		);
 
 		const label = `aov${i}`;
-		// Apply volume, atempo for speed, and delay to align with clip position
-		const delayMs = Math.round((ao.clipOffset / speed) * 1000);
+		// Apply volume, atempo for speed, and delay to align with clip position.
+		// trimStart compensates for the output -ss seek that discards the pre-clip
+		// portion of the filter graph — without it the overlay audio starts early.
+		const delayMs = Math.round((trimStart + ao.clipOffset / speed) * 1000);
 		const volFilter = `volume=${ao.volume.toFixed(3)}`;
 		const atempoFilter = atempoChain.length > 0 ? `,${atempoChain.join(',')}` : '';
 		const delayFilter = delayMs > 0 ? `,adelay=${delayMs}|${delayMs}` : '';

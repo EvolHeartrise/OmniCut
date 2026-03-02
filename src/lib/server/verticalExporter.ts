@@ -5,11 +5,12 @@
  */
 
 import * as path from 'node:path';
+import * as fs from 'node:fs';
 import type { ClipRegion, CameraBoundsEntry, ClipEntry, EffectEntry, VerticalSlot, VerticalLayout } from '../types.js';
-import { runFfmpeg } from './ffmpeg.js';
-import { detectNvenc, probeVideo, resolveOverlappingEffects, resolveZoomEffects, buildZoomFilter, buildAnimatedOverlay, ZOOM_SUPERSAMPLE, type StreamLookup, type ClipContext } from './exporter.js';
+import { runFfmpeg, spawnFfmpegWithPipe } from './ffmpeg.js';
+import { detectNvenc, probeVideo, resolveOverlappingEffects, resolveZoomEffects, buildZoomFilter, buildAnimatedOverlay, ZOOM_SUPERSAMPLE, type StreamLookup, type ClipContext, type ResolvedEffect } from './exporter.js';
 import { clearEffectRendererCache } from './effectRenderer.js';
-import { clearChatEffectCache } from './chatEffectRenderer.js';
+import { clearChatEffectCache, type FrameSink } from './chatEffectRenderer.js';
 import {
 	resolveClip, buildAudioArgs, buildVideoEncoderArgs, createTempDir, cleanupTempDir,
 	concatClipFiles, buildOutputPath, resolveAudioOverlays, buildAudioMixFilter
@@ -177,6 +178,28 @@ export async function exportVerticalVideo(
 			const allEffects = [...preZoomEffects, ...postZoomEffects];
 
 			const extraInputs: string[] = [];
+
+			// Pick at most ONE deferred-render effect to pipe via stdin.
+			let pipeEffect: ResolvedEffect | null = null;
+			for (const eff of allEffects) {
+				if (eff.rawVideo && eff.deferredRender) {
+					if (!pipeEffect) {
+						pipeEffect = eff;
+					} else {
+						const rawPath = path.join(tempDir, `chatfx_fallback_${i}_${allEffects.indexOf(eff)}.rgba`);
+						const fd = fs.openSync(rawPath, 'w');
+						try {
+							await eff.deferredRender({
+								write(buf: Buffer) { fs.writeSync(fd, buf); },
+								async flush() {}
+							});
+						} finally { fs.closeSync(fd); }
+						eff.videoPath = rawPath;
+						eff.deferredRender = undefined;
+					}
+				}
+			}
+
 			for (const eff of allEffects) {
 				const itsoffset = ['-itsoffset', (trimStart + eff.localStart).toFixed(3)];
 				if (eff.rawVideo) {
@@ -185,7 +208,7 @@ export async function exportVerticalVideo(
 						'-f', 'rawvideo', '-pix_fmt', 'rgba',
 						'-s', `${eff.rawVideo.width}x${eff.rawVideo.height}`,
 						'-r', `${eff.rawVideo.fps}`,
-						'-i', eff.videoPath!
+						'-i', eff.deferredRender ? 'pipe:0' : eff.videoPath!
 					);
 				} else if (eff.animation) {
 					// Animated overlay: loop the PNG as a 30fps video so fade filters work
@@ -312,7 +335,7 @@ export async function exportVerticalVideo(
 
 			// Audio overlay mixing
 			const audioNextIdx = 1 + allEffects.length;
-			const audioMix = buildAudioMixFilter(audioOverlays, audioNextIdx, speed, clipDur);
+			const audioMix = buildAudioMixFilter(audioOverlays, audioNextIdx, speed, clipDur, trimStart);
 			if (audioMix.totalAudioInputs > 0) {
 				extraInputs.push(...audioMix.extraInputs);
 				filterGraph += ';' + audioMix.audioFilterGraph;
@@ -321,7 +344,7 @@ export async function exportVerticalVideo(
 			if (allEffects.length > 0) {
 				console.log(`[vertical-export] Clip ${i}: ${preZoomEffects.length} pre-zoom + ${postZoomEffects.length} post-zoom overlay(s), ss=${trimStart.toFixed(3)} t=${dur.toFixed(3)} speed=${speed}`);
 				for (const eff of allEffects) {
-					console.log(`[vertical-export]   overlay: pos=(${eff.x},${eff.y}) local=[${eff.localStart.toFixed(3)},${eff.localEnd.toFixed(3)}] raw=${!!eff.rawVideo} ignoreZoom=${!!eff.ignoreZoom}`);
+					console.log(`[vertical-export]   overlay: pos=(${eff.x},${eff.y}) local=[${eff.localStart.toFixed(3)},${eff.localEnd.toFixed(3)}] raw=${!!eff.rawVideo} piped=${!!eff.deferredRender} ignoreZoom=${!!eff.ignoreZoom}`);
 				}
 				console.log(`[vertical-export]   filter_complex: ${filterGraph}`);
 			}
@@ -344,7 +367,33 @@ export async function exportVerticalVideo(
 				'-movflags', '+faststart',
 				'-y', outFile
 			];
-			await runFfmpeg(ffmpegArgs, 2000);
+
+			if (pipeEffect?.deferredRender) {
+				const handle = spawnFfmpegWithPipe(ffmpegArgs);
+				const pipeSink: FrameSink = {
+					write(buf: Buffer) { handle.stdin.write(buf); },
+					async flush() { await handle.stdin.flush(); },
+				};
+
+				let renderError: Error | null = null;
+				try {
+					await pipeEffect.deferredRender(pipeSink);
+				} catch (err) {
+					renderError = err instanceof Error ? err : new Error(String(err));
+				}
+
+				try { handle.stdin.end(); } catch { /* pipe may already be closed */ }
+
+				try {
+					await handle.waitForExit(2000);
+				} catch (ffmpegErr) {
+					if (renderError) console.warn('[vertical-export] Render also failed:', renderError.message);
+					throw ffmpegErr;
+				}
+				if (renderError) throw renderError;
+			} else {
+				await runFfmpeg(ffmpegArgs, 2000);
+			}
 
 			verticalFiles.push(outFile);
 		}

@@ -23,6 +23,25 @@ const MAX_VISIBLE = 200;
 const FPS = 30;
 
 // ---------------------------------------------------------------------------
+// Types for the two-phase prepare/render pipeline
+// ---------------------------------------------------------------------------
+
+/** Accepts raw RGBA frame buffers. Implemented by pipe-based or file-based sinks. */
+export interface FrameSink {
+	write(buf: Buffer): void;
+	flush(): Promise<void>;
+}
+
+/** Result of prepareChatEffect() — metadata plus a deferred render function. */
+export interface PreparedChatEffect {
+	width: number;
+	height: number;
+	fps: number;
+	/** Render all frames to the provided sink. Caller owns sink lifecycle (end/close). */
+	renderFrames(sink: FrameSink): Promise<void>;
+}
+
+// ---------------------------------------------------------------------------
 // Timestamp jittering for VOD chat (moved from chatOverlayExporter.ts)
 // ---------------------------------------------------------------------------
 
@@ -146,32 +165,34 @@ export function clearChatEffectCache(): void {
 }
 
 // ---------------------------------------------------------------------------
-// Main render function
+// Two-phase pipeline: prepare (load data + layout) then render (write frames)
 // ---------------------------------------------------------------------------
 
 /**
- * Render a scrolling Twitch chat panel as raw RGBA frames written to a file.
- * The output is a raw video file (no container/codec) — the exporter reads it
- * with `-f rawvideo -pix_fmt rgba -s WxH -r fps`.
- * This bypasses VP9 encoding entirely, guaranteeing alpha is preserved.
+ * Prepare a chat effect: load messages, fetch emotes/badges, compute layout.
+ * Returns metadata (width/height/fps) and a deferred renderFrames() function
+ * that can write to any FrameSink (pipe or file).
+ *
+ * This separation allows the exporter to:
+ * 1. Get metadata for building FFmpeg args
+ * 2. Spawn FFmpeg with stdin: 'pipe'
+ * 3. Stream frames directly to FFmpeg without a temp file
  */
-export async function renderChatEffectVideo(opts: {
+export async function prepareChatEffect(opts: {
 	streamId: string;
 	channel: string;
-	localStart: number;   // stream-local seconds
+	localStart: number;
 	localEnd: number;
-	outputPath: string;
-	panelWidth?: number;  // default 340
-	panelHeight?: number; // default 1080
-	chatOffset?: number;  // shift chat timeline in seconds (default 0)
-	fontWeight?: number;  // CSS font-weight for chat text (default 400)
-	chatScale?: number;   // render at scaled resolution for crisp output (default 1)
+	panelWidth?: number;
+	panelHeight?: number;
+	chatOffset?: number;
+	fontWeight?: number;
+	chatScale?: number;
 	shadow?: ShadowConfig;
-}): Promise<{ videoPath: string; width: number; height: number; raw: true; fps: number }> {
+}): Promise<PreparedChatEffect> {
 	const {
 		streamId, channel,
 		localStart, localEnd,
-		outputPath,
 		panelWidth = 340,
 		panelHeight = 1080,
 		chatOffset = 0,
@@ -184,19 +205,14 @@ export async function renderChatEffectVideo(opts: {
 	if (dur <= 0) throw new Error('Chat effect duration must be positive');
 
 	// 1. Load chat messages (with backfill so the panel isn't empty at the start)
-	//    chatOffset shifts which chat messages are shown: positive = pull from later in the stream
 	const BACKFILL_SECONDS = 60;
 	const chatStart = localStart + chatOffset;
 	const chatEnd = localEnd + chatOffset;
 	const fetchStart = Math.max(0, chatStart - BACKFILL_SECONDS);
 	const chatMessages = loadChatMessagesInRange(streamId, fetchStart, chatEnd);
-	// Shift timestamps back by chatOffset so they align with the video timeline
 	for (const msg of chatMessages) {
 		msg.timestamp -= chatOffset;
 	}
-	// Don't clamp backfilled messages — keep their original timestamps so they're
-	// already visible at frame 0 (timestamp < localStart ≤ currentTime from the start).
-	// This avoids the "catching up" effect where all backfilled messages appear rapidly.
 	jitterTimestamps(chatMessages);
 
 	// 2. Fetch emotes + badges (cached)
@@ -238,86 +254,119 @@ export async function renderChatEffectVideo(opts: {
 	);
 	const { font: chatFont, boldFont: chatBoldFont } = buildChatFonts(fontWeight);
 
-	// 5. Render frames → raw RGBA file (no container, no codec)
-	// The exporter reads this with explicit rawvideo format, guaranteeing alpha.
-	// Render at scaled resolution so text/emotes are crisp (no blurry FFmpeg upscale).
-	const pixelW = Math.round(panelWidth * chatScale) & ~1;   // even width
-	const pixelH = Math.round(panelHeight * chatScale) & ~1;  // even height
-
-	// Shadow padding (scaled to match render resolution)
+	// 5. Compute pixel dimensions
+	const pixelW = Math.round(panelWidth * chatScale) & ~1;
+	const pixelH = Math.round(panelHeight * chatScale) & ~1;
 	const sp = shadow ? shadowPad(shadow, chatScale) : { top: 0, right: 0, bottom: 0, left: 0 };
-	const outW = (pixelW + sp.left + sp.right) & ~1;  // keep even
+	const outW = (pixelW + sp.left + sp.right) & ~1;
 	const outH = (pixelH + sp.top + sp.bottom) & ~1;
-
-	const rawPath = outputPath.replace(/\.\w+$/, '.rgba');
 	const totalFrames = Math.ceil(dur * FPS);
 
-	console.log(`[chat-fx] Rendering ${totalFrames} frames (${dur.toFixed(2)}s) ${outW}x${outH} → ${rawPath}`);
+	console.log(`[chat-fx] Prepared ${totalFrames} frames (${dur.toFixed(2)}s) ${outW}x${outH}`);
 	console.log(`[chat-fx]   stream time ${localStart.toFixed(2)}→${localEnd.toFixed(2)}, ${prepared.length} messages loaded (chatOffset=${chatOffset})`);
 
+	return {
+		width: outW,
+		height: outH,
+		fps: FPS,
+
+		async renderFrames(sink: FrameSink): Promise<void> {
+			const canvas = createCanvas(pixelW, pixelH);
+			const ctx = canvas.getContext('2d');
+			const shadowCanvas = shadow ? createCanvas(outW, outH) : null;
+			const shadowCtx = shadowCanvas?.getContext('2d') ?? null;
+
+			let lastMsgIds: string | null = null;
+			let lastFrameBuf: Buffer | null = null;
+			let uniqueFrames = 0;
+
+			for (let frame = 0; frame < totalFrames; frame++) {
+				const currentTime = localStart + frame / FPS;
+				const elapsedMs = (frame / FPS) * 1000;
+
+				let lo2 = 0, hi2 = prepared.length;
+				while (lo2 < hi2) {
+					const mid = (lo2 + hi2) >>> 1;
+					if (prepared[mid].timestamp <= currentTime) lo2 = mid + 1;
+					else hi2 = mid;
+				}
+				const startIdx = Math.max(0, lo2 - MAX_VISIBLE);
+				const msgIds = `${startIdx}:${lo2}`;
+
+				if (msgIds !== lastMsgIds || hasAnimated || !lastFrameBuf) {
+					ctx.save();
+					ctx.scale(chatScale, chatScale);
+					renderFrame(ctx, prepared, currentTime, elapsedMs, panelWidth, panelHeight, chatFont, chatBoldFont);
+					ctx.restore();
+
+					if (shadowCtx && shadow) {
+						shadowCtx.clearRect(0, 0, outW, outH);
+						shadowCtx.shadowColor = shadow.color;
+						shadowCtx.shadowBlur = shadow.blur * chatScale;
+						shadowCtx.shadowOffsetX = shadow.offsetX * chatScale;
+						shadowCtx.shadowOffsetY = shadow.offsetY * chatScale;
+						shadowCtx.drawImage(canvas, sp.left, sp.top);
+						const imageData = shadowCtx.getImageData(0, 0, outW, outH);
+						lastFrameBuf = Buffer.from(imageData.data);
+					} else {
+						const imageData = ctx.getImageData(0, 0, pixelW, pixelH);
+						lastFrameBuf = Buffer.from(imageData.data);
+					}
+					lastMsgIds = msgIds;
+					uniqueFrames++;
+				}
+
+				sink.write(lastFrameBuf);
+				await sink.flush();
+			}
+
+			console.log(`[chat-fx]   ${uniqueFrames} unique frames rendered`);
+		}
+	};
+}
+
+// ---------------------------------------------------------------------------
+// File-based wrapper (backward compat + fallback for multiple raw effects)
+// ---------------------------------------------------------------------------
+
+/**
+ * Render a scrolling Twitch chat panel as raw RGBA frames written to a file.
+ * This is a convenience wrapper around prepareChatEffect() that writes to disk.
+ * Used as a fallback when piping to FFmpeg stdin is not possible.
+ */
+export async function renderChatEffectVideo(opts: {
+	streamId: string;
+	channel: string;
+	localStart: number;
+	localEnd: number;
+	outputPath: string;
+	panelWidth?: number;
+	panelHeight?: number;
+	chatOffset?: number;
+	fontWeight?: number;
+	chatScale?: number;
+	shadow?: ShadowConfig;
+}): Promise<{ videoPath: string; width: number; height: number; raw: true; fps: number }> {
+	const prepared = await prepareChatEffect(opts);
+	const rawPath = opts.outputPath.replace(/\.\w+$/, '.rgba');
+
+	console.log(`[chat-fx] Writing ${prepared.width}x${prepared.height} to file: ${rawPath}`);
 	const fd = fs.openSync(rawPath, 'w');
 
-	const canvas = createCanvas(pixelW, pixelH);
-	const ctx = canvas.getContext('2d');
-
-	// Shadow canvas (only created if shadow is present)
-	const shadowCanvas = shadow ? createCanvas(outW, outH) : null;
-	const shadowCtx = shadowCanvas?.getContext('2d') ?? null;
-
-	let lastMsgIds: string | null = null;
-	let lastFrameBuf: Buffer | null = null;
-	let uniqueFrames = 0;
-
-	for (let frame = 0; frame < totalFrames; frame++) {
-		const currentTime = localStart + frame / FPS;
-		const elapsedMs = (frame / FPS) * 1000;
-
-		// Binary search for visible message range
-		let lo2 = 0, hi2 = prepared.length;
-		while (lo2 < hi2) {
-			const mid = (lo2 + hi2) >>> 1;
-			if (prepared[mid].timestamp <= currentTime) lo2 = mid + 1;
-			else hi2 = mid;
-		}
-		const startIdx = Math.max(0, lo2 - MAX_VISIBLE);
-		const msgIds = `${startIdx}:${lo2}`;
-
-		if (msgIds !== lastMsgIds || hasAnimated || !lastFrameBuf) {
-			// Scale the canvas context so all drawing (text, emotes, badges) is
-			// rendered natively at the target resolution — no post-render upscale.
-			ctx.save();
-			ctx.scale(chatScale, chatScale);
-			renderFrame(ctx, prepared, currentTime, elapsedMs, panelWidth, panelHeight, chatFont, chatBoldFont);
-			ctx.restore();
-
-			if (shadowCtx && shadow) {
-				// Two-pass: draw content canvas onto shadow canvas with shadow applied
-				shadowCtx.clearRect(0, 0, outW, outH);
-				shadowCtx.shadowColor = shadow.color;
-				shadowCtx.shadowBlur = shadow.blur * chatScale;
-				shadowCtx.shadowOffsetX = shadow.offsetX * chatScale;
-				shadowCtx.shadowOffsetY = shadow.offsetY * chatScale;
-				shadowCtx.drawImage(canvas, sp.left, sp.top);
-				const imageData = shadowCtx.getImageData(0, 0, outW, outH);
-				lastFrameBuf = Buffer.from(imageData.data);
-			} else {
-				const imageData = ctx.getImageData(0, 0, pixelW, pixelH);
-				lastFrameBuf = Buffer.from(imageData.data);
-			}
-			lastMsgIds = msgIds;
-			uniqueFrames++;
-		}
-
-		fs.writeSync(fd, lastFrameBuf);
+	try {
+		await prepared.renderFrames({
+			write(buf: Buffer) { fs.writeSync(fd, buf); },
+			async flush() { /* no-op for sync file writes */ }
+		});
+	} finally {
+		fs.closeSync(fd);
 	}
 
-	fs.closeSync(fd);
-
-	const expectedSize = totalFrames * outW * outH * 4;
+	const expectedSize = Math.ceil((opts.localEnd - opts.localStart) * FPS) * prepared.width * prepared.height * 4;
 	const actualSize = fs.statSync(rawPath).size;
-	console.log(`[chat-fx]   ${uniqueFrames} unique frames, raw file ${actualSize} bytes (expected ${expectedSize}, ${actualSize === expectedSize ? 'OK' : 'MISMATCH!'})`);
+	console.log(`[chat-fx]   raw file ${actualSize} bytes (expected ${expectedSize}, ${actualSize === expectedSize ? 'OK' : 'MISMATCH!'})`);
 
-	return { videoPath: rawPath, width: outW, height: outH, raw: true as const, fps: FPS };
+	return { videoPath: rawPath, width: prepared.width, height: prepared.height, raw: true as const, fps: prepared.fps };
 }
 
 function shadowPad(shadow: ShadowConfig, scale: number): { top: number; right: number; bottom: number; left: number } {
