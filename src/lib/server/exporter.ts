@@ -526,6 +526,7 @@ export async function resolveOverlappingEffects(
 					channel: clipContext.channel,
 					localStart: streamStart,
 					localEnd: streamEnd,
+					targetDur: localEnd - localStart, // composition-time duration for FFmpeg
 					panelWidth: effect.panelWidth,
 					panelHeight: effect.panelHeight,
 					chatOffset: effect.chatOffset,

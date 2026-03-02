@@ -183,6 +183,10 @@ export async function prepareChatEffect(opts: {
 	channel: string;
 	localStart: number;
 	localEnd: number;
+	/** Composition-time duration the FFmpeg overlay needs (seconds).
+	 *  When the clip speed != 1, this differs from localEnd - localStart (stream time).
+	 *  Defaults to localEnd - localStart. */
+	targetDur?: number;
 	panelWidth?: number;
 	panelHeight?: number;
 	chatOffset?: number;
@@ -203,6 +207,11 @@ export async function prepareChatEffect(opts: {
 
 	const dur = localEnd - localStart;
 	if (dur <= 0) throw new Error('Chat effect duration must be positive');
+	// targetDur is the composition-time duration FFmpeg needs (differs from dur when speed != 1).
+	// Add a small safety margin to prevent eof_action=repeat freezing the last frames.
+	const SAFETY_FRAMES = FPS; // 1 second of safety margin
+	const targetDur = opts.targetDur ?? dur;
+	const streamRate = dur / targetDur; // how fast to advance through stream time per composition second
 
 	// 1. Load chat messages (with backfill so the panel isn't empty at the start)
 	const BACKFILL_SECONDS = 60;
@@ -260,9 +269,9 @@ export async function prepareChatEffect(opts: {
 	const sp = shadow ? shadowPad(shadow, chatScale) : { top: 0, right: 0, bottom: 0, left: 0 };
 	const outW = (pixelW + sp.left + sp.right) & ~1;
 	const outH = (pixelH + sp.top + sp.bottom) & ~1;
-	const totalFrames = Math.ceil(dur * FPS);
+	const totalFrames = Math.ceil(targetDur * FPS) + SAFETY_FRAMES;
 
-	console.log(`[chat-fx] Prepared ${totalFrames} frames (${dur.toFixed(2)}s) ${outW}x${outH}`);
+	console.log(`[chat-fx] Prepared ${totalFrames} frames (targetDur=${targetDur.toFixed(2)}s, streamDur=${dur.toFixed(2)}s, rate=${streamRate.toFixed(3)}) ${outW}x${outH}`);
 	console.log(`[chat-fx]   stream time ${localStart.toFixed(2)}→${localEnd.toFixed(2)}, ${prepared.length} messages loaded (chatOffset=${chatOffset})`);
 
 	return {
@@ -281,8 +290,11 @@ export async function prepareChatEffect(opts: {
 			let uniqueFrames = 0;
 
 			for (let frame = 0; frame < totalFrames; frame++) {
-				const currentTime = localStart + frame / FPS;
-				const elapsedMs = (frame / FPS) * 1000;
+				// Advance through stream time at streamRate (matches video speed).
+				// Clamp to localEnd so safety-margin frames show the final chat state.
+				const compositionSec = frame / FPS;
+				const currentTime = Math.min(localStart + compositionSec * streamRate, localEnd);
+				const elapsedMs = compositionSec * 1000;
 
 				let lo2 = 0, hi2 = prepared.length;
 				while (lo2 < hi2) {
@@ -362,7 +374,8 @@ export async function renderChatEffectVideo(opts: {
 		fs.closeSync(fd);
 	}
 
-	const expectedSize = Math.ceil((opts.localEnd - opts.localStart) * FPS) * prepared.width * prepared.height * 4;
+	const totalFrameCount = Math.ceil((opts.localEnd - opts.localStart) * FPS) + FPS; // matches totalFrames in prepareChatEffect
+	const expectedSize = totalFrameCount * prepared.width * prepared.height * 4;
 	const actualSize = fs.statSync(rawPath).size;
 	console.log(`[chat-fx]   raw file ${actualSize} bytes (expected ${expectedSize}, ${actualSize === expectedSize ? 'OK' : 'MISMATCH!'})`);
 

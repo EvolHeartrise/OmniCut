@@ -3,7 +3,7 @@
  * Used by chatEffectRenderer.ts (scrolling chat panel video) and effectRenderer.ts (single-message PNG).
  */
 
-import { loadImage, type SKRSContext2D, type Image } from '@napi-rs/canvas';
+import { loadImage, GlobalFonts, type SKRSContext2D, type Image } from '@napi-rs/canvas';
 import sharp from 'sharp';
 import type { ChatMessage } from './types.js';
 import { parseEmotes, type EmoteMap } from '../emoteParser.js';
@@ -11,18 +11,30 @@ import { resolveBadges, type BadgeMap } from '../badgeParser.js';
 import { usernameColor } from '../utils.js';
 
 // ---------------------------------------------------------------------------
+// Register system emoji font so @napi-rs/canvas can render unicode emoji.
+// Browsers handle this automatically via OS fallback; canvas needs explicit registration.
+// ---------------------------------------------------------------------------
+const EMOJI_FONT_PATH = 'C:/Windows/Fonts/seguiemj.ttf';
+try {
+	GlobalFonts.registerFromPath(EMOJI_FONT_PATH, 'Segoe UI Emoji');
+} catch {
+	console.warn('[chatRenderer] Could not register emoji font — unicode emoji may not render');
+}
+
+// ---------------------------------------------------------------------------
 // Layout constants (matching ReviewChatPanel CSS)
 // ---------------------------------------------------------------------------
 
-export const CHAT_FONT = '13px Inter, Arial, sans-serif';
-export const CHAT_BOLD_FONT = 'bold 13px Inter, Arial, sans-serif';
+const EMOJI_FALLBACK = ", 'Segoe UI Emoji'";
+export const CHAT_FONT = `13px Inter, Arial${EMOJI_FALLBACK}, sans-serif`;
+export const CHAT_BOLD_FONT = `bold 13px Inter, Arial${EMOJI_FALLBACK}, sans-serif`;
 
 /** Build font strings for a given weight (default 400 normal / 700 bold). */
 export function buildChatFonts(fontWeight?: number): { font: string; boldFont: string } {
 	if (!fontWeight || fontWeight === 400) return { font: CHAT_FONT, boldFont: CHAT_BOLD_FONT };
 	return {
-		font: `${fontWeight} 13px Inter, Arial, sans-serif`,
-		boldFont: `${Math.min(900, fontWeight + 300)} 13px Inter, Arial, sans-serif`
+		font: `${fontWeight} 13px Inter, Arial${EMOJI_FALLBACK}, sans-serif`,
+		boldFont: `${Math.min(900, fontWeight + 300)} 13px Inter, Arial${EMOJI_FALLBACK}, sans-serif`
 	};
 }
 export const CHAT_LINE_HEIGHT = 1.4;
