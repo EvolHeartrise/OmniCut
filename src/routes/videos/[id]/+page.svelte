@@ -17,6 +17,7 @@
 		getMultiStreamTranscriptions,
 		getChatMessageByTwitchId,
 		uploadOverlayImageCmd,
+		uploadOverlayAudioCmd,
 		getCensorTerms,
 		addCensorTermCmd,
 		removeCensorTermCmd
@@ -444,8 +445,8 @@
 			subtitleFontWeight: 700,
 			subtitleMaxWidth: 900,
 			subtitleTextAlign: 'center',
-			animIn: 'pop',
-			animOut: 'pop',
+			animIn: 'grow',
+			animOut: 'shrink',
 			animDuration: 0.3,
 		};
 		effectEntries = [...effectEntries, entry];
@@ -471,11 +472,22 @@
 		const files = e.dataTransfer?.files;
 		if (!files || files.length === 0) return;
 		const file = files[0];
+
+		if (file.type.startsWith('audio/')) {
+			await handleAudioDrop(file);
+			return;
+		}
+
 		if (!file.type.startsWith('image/')) return;
 
 		// Read file as base64
 		const arrayBuf = await file.arrayBuffer();
-		const base64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuf)));
+		const bytes = new Uint8Array(arrayBuf);
+		let binary = '';
+		for (let j = 0; j < bytes.length; j += 8192) {
+			binary += String.fromCharCode(...bytes.subarray(j, j + 8192));
+		}
+		const base64 = btoa(binary);
 
 		// Upload to server
 		const result = await uploadOverlayImageCmd({ data: base64, filename: file.name });
@@ -506,6 +518,45 @@
 		selectedEffectId = id;
 	}
 
+	async function handleAudioDrop(file: File) {
+		const arrayBuf = await file.arrayBuffer();
+		const bytes = new Uint8Array(arrayBuf);
+		let binary = '';
+		for (let j = 0; j < bytes.length; j += 8192) {
+			binary += String.fromCharCode(...bytes.subarray(j, j + 8192));
+		}
+		const base64 = btoa(binary);
+
+		const result = await uploadOverlayAudioCmd({ data: base64, filename: file.name });
+
+		const id = nanoid(12);
+		const entry: EffectEntry = {
+			id,
+			type: 'audio',
+			startTime: compositionTime,
+			duration: result.duration || 5,
+			x: 0,
+			y: 0,
+			audioId: result.id,
+			audioVolume: 1,
+			audioDuration: result.duration || 0,
+		};
+		effectEntries = [...effectEntries, entry];
+		selectedEffectId = id;
+	}
+
+	/** Apply an easing function to a linear progress value (0-1). */
+	function applyEasing(p: number, easing: import('$lib/types').EasingFunction): number {
+		switch (easing) {
+			case 'linear': return p;
+			case 'ease-in': return p * p;
+			case 'ease-out': return 1 - (1 - p) * (1 - p);
+			case 'ease-in-out': return p < 0.5 ? 2 * p * p : 1 - 2 * (1 - p) * (1 - p);
+			case 'bounce': return 1 + (1 - p) * (1 - p) * (2.5 * p - 1);
+			default: return p;
+		}
+	}
+
 	/** Compute inline CSS for overlay in/out animation based on current composition time.
 	 *  Works for all overlay effect types. Pass centered=true for subtitle-style centering. */
 	function overlayAnimStyle(entry: EffectEntry, t: number, centered = false): string {
@@ -513,6 +564,8 @@
 		const animOut = entry.animOut ?? 'none';
 		const dur = entry.animDuration ?? 0.3;
 		const effectEnd = entry.startTime + entry.duration;
+		const inEasing = entry.animInEasing ?? 'ease-out';
+		const outEasing = entry.animOutEasing ?? 'ease-in';
 
 		if (animIn === 'none' && animOut === 'none') {
 			return centered ? 'transform: translateX(-50%)' : '';
@@ -527,25 +580,23 @@
 		const inElapsed = t - entry.startTime;
 		if (inElapsed < dur && animIn !== 'none') {
 			const p = Math.max(0, Math.min(1, inElapsed / dur));
-			const eased = 1 - (1 - p) * (1 - p); // ease-out quadratic
+			const eased = applyEasing(p, inEasing);
 
 			// All in-animations get a subtle fade
 			opacity = eased;
 
-			if (animIn === 'pop') {
+			if (animIn === 'grow') {
 				scale = 0.3 + 0.7 * eased;
+			} else if (animIn === 'shrink') {
+				scale = 1.7 - 0.7 * eased;
 			} else if (animIn === 'slide-up') {
-				offsetY = (1 - eased) * 80;
+				offsetY = (1 - eased) * 25;
 			} else if (animIn === 'slide-down') {
-				offsetY = -(1 - eased) * 80;
+				offsetY = -(1 - eased) * 25;
 			} else if (animIn === 'slide-left') {
-				offsetX = (1 - eased) * 200;
+				offsetX = (1 - eased) * 50;
 			} else if (animIn === 'slide-right') {
-				offsetX = -(1 - eased) * 200;
-			} else if (animIn === 'bounce') {
-				const bounce = 1 - (1 - p) * (1 - p) * Math.cos(p * Math.PI * 2);
-				const clamped = Math.min(bounce, 1.15);
-				offsetY = (1 - clamped) * 80;
+				offsetX = -(1 - eased) * 50;
 			}
 		}
 
@@ -553,23 +604,23 @@
 		const outElapsed = t - (effectEnd - dur);
 		if (outElapsed > 0 && animOut !== 'none') {
 			const p = Math.max(0, Math.min(1, outElapsed / dur));
-			const eased = p * p; // ease-in quadratic
+			const eased = applyEasing(p, outEasing);
 
 			// All out-animations get a subtle fade
 			opacity *= (1 - eased);
 
-			if (animOut === 'pop') {
+			if (animOut === 'grow') {
+				scale *= (1 + 0.7 * eased);
+			} else if (animOut === 'shrink') {
 				scale *= (1 - eased * 0.7);
 			} else if (animOut === 'slide-up') {
-				offsetY = -eased * 80;
+				offsetY = -eased * 25;
 			} else if (animOut === 'slide-down') {
-				offsetY = eased * 80;
+				offsetY = eased * 25;
 			} else if (animOut === 'slide-left') {
-				offsetX = -eased * 200;
+				offsetX = -eased * 50;
 			} else if (animOut === 'slide-right') {
-				offsetX = eased * 200;
-			} else if (animOut === 'bounce') {
-				offsetY = -eased * eased * 80;
+				offsetX = eased * 50;
 			}
 		}
 
@@ -600,7 +651,7 @@
 	// Effects visible at current composition time (sorted by track: lower tracks first = rendered behind)
 	let visibleEffects = $derived(
 		effectEntries
-			.filter((e) => compositionTime >= e.startTime && compositionTime < e.startTime + e.duration)
+			.filter((e) => e.type !== 'audio' && compositionTime >= e.startTime && compositionTime < e.startTime + e.duration)
 			.sort((a, b) => (a.track ?? 0) - (b.track ?? 0))
 	);
 
@@ -728,8 +779,55 @@
 	let previewPlayerAreaEl = $state<HTMLDivElement | null>(null);
 	let previewHls: Hls | null = null;
 	let previewPlaying = $state(false);
+	let previewPlaybackRate = $state(1);
 	let previewProgress = $state(0);
 	let previewCurrentTime = $state('0:00');
+
+	// Audio effect preview playback
+	let audioPreviewEls = new Map<string, HTMLAudioElement>();
+
+	function syncAudioEffects() {
+		const ct = compositionTime;
+		for (const entry of effectEntries) {
+			if (entry.type !== 'audio' || !entry.audioId) continue;
+			const end = entry.startTime + entry.duration;
+			const isActive = ct >= entry.startTime && ct < end;
+			let el = audioPreviewEls.get(entry.id);
+
+			if (isActive && previewPlaying) {
+				if (!el) {
+					el = new Audio(`/api/overlay-audio/${entry.audioId}`);
+					el.volume = entry.audioVolume ?? 1;
+					audioPreviewEls.set(entry.id, el);
+				}
+				el.volume = entry.audioVolume ?? 1;
+				el.playbackRate = previewPlaybackRate;
+				const targetTime = (ct - entry.startTime) + (entry.audioOffset ?? 0);
+				if (Math.abs(el.currentTime - targetTime) > 0.3) {
+					el.currentTime = targetTime;
+				}
+				if (el.paused) el.play().catch(() => {});
+			} else if (el) {
+				if (!el.paused) el.pause();
+				if (!isActive) {
+					audioPreviewEls.delete(entry.id);
+				}
+			}
+		}
+		// Clean up elements for removed effects
+		for (const [id, el] of audioPreviewEls) {
+			if (!effectEntries.some(e => e.id === id)) {
+				el.pause();
+				audioPreviewEls.delete(id);
+			}
+		}
+	}
+
+	function pauseAllAudioEffects() {
+		for (const el of audioPreviewEls.values()) {
+			el.pause();
+		}
+	}
 
 	// Track the video's actual rendered bounds within the player area (object-fit: contain)
 	let videoBounds = $state({ left: 0, top: 0, width: 0, height: 0 });
@@ -1059,6 +1157,7 @@
 		const localStart = clip.startTime - anchor + offset + (entry.trimStart || 0);
 
 		previewHls = setupHls(Hls, previewVideoEl, url, localStart, () => {
+			previewVideoEl!.playbackRate = previewPlaybackRate;
 			if (autoPlay) {
 				previewVideoEl!.play().then(() => { previewPlaying = true; startWaveformLoop(); }).catch(() => {});
 			}
@@ -1086,6 +1185,7 @@
 			} else {
 				previewVideoEl.pause();
 				previewPlaying = false;
+				pauseAllAudioEffects();
 				previewProgress = 1;
 				previewCurrentTime = formatDuration(totalDuration);
 				compositionTime = totalDuration;
@@ -1103,6 +1203,7 @@
 			previewProgress = totalDuration > 0 ? Math.max(0, Math.min(1, compositionTime / totalDuration)) : 0;
 			previewCurrentTime = formatDuration(compositionTime);
 		}
+		syncAudioEffects();
 	}
 
 	function seekToCompositionTime(targetTime: number) {
@@ -1141,6 +1242,7 @@
 			const anchor = stream.startedAt / 1000;
 			const localStart = clip.startTime - anchor + offset + (entry.trimStart || 0) + offsetInClip;
 			previewHls = setupHls(Hls, previewVideoEl, url, localStart, () => {
+				previewVideoEl!.playbackRate = previewPlaybackRate;
 				if (previewPlaying) previewVideoEl!.play().catch(() => {});
 			});
 		} else {
@@ -1155,6 +1257,7 @@
 		if (!previewVideoEl) return;
 		if (previewPlaying) {
 			previewVideoEl.pause();
+			pauseAllAudioEffects();
 		} else {
 			if (compositionTime >= totalDuration && entries.length > 0) {
 				compositionTime = 0;
@@ -1167,6 +1270,11 @@
 			startWaveformLoop();
 		}
 		previewPlaying = !previewPlaying;
+	}
+
+	function setPreviewRate(rate: number) {
+		previewPlaybackRate = Math.max(0.25, Math.min(4, rate));
+		if (previewVideoEl) previewVideoEl.playbackRate = previewPlaybackRate;
 	}
 
 	// Clip-change detection: update clipDurationText, fetch transcription.
@@ -1595,6 +1703,12 @@
 			selectedEffectId = null;
 			showClipPicker = false;
 			addingEffect = false;
+		} else if (e.key === 'ArrowUp') {
+			e.preventDefault();
+			setPreviewRate(previewPlaybackRate + 0.25);
+		} else if (e.key === 'ArrowDown') {
+			e.preventDefault();
+			setPreviewRate(previewPlaybackRate - 0.25);
 		}
 	}
 
@@ -1725,8 +1839,14 @@
 										<img
 											src="/api/overlay-image/{entry.imageId}"
 											alt="overlay"
-											style="width: {(entry.imageWidth ?? 100) * imgScale}px; height: {(entry.imageHeight ?? 100) * imgScale}px; opacity: {entry.imageOpacity ?? 1}; display: block;"
+											style="{entry.imageWidth ? `width: ${entry.imageWidth * imgScale}px; height: ${(entry.imageHeight ?? entry.imageWidth) * imgScale}px;` : `transform: scale(${imgScale}); transform-origin: 0 0;`} opacity: {entry.imageOpacity ?? 1}; display: block;"
 											draggable="false"
+											onload={(e) => {
+												if (!entry.imageWidth || !entry.imageHeight) {
+													const img = e.target as HTMLImageElement;
+													updateEffectEntry(entry.id, { imageWidth: img.naturalWidth, imageHeight: img.naturalHeight });
+												}
+											}}
 										/>
 									{/if}
 								</div>
@@ -1777,6 +1897,7 @@
 						{@const isZoom = selEffect.type === 'zoom'}
 						{@const isSubtitle = selEffect.type === 'subtitle'}
 						{@const isImage = selEffect.type === 'image'}
+						{@const isAudio = selEffect.type === 'audio'}
 						<div class="props-header">
 							<h3 class="props-title">Effect Properties</h3>
 							<button class="btn-deselect" onclick={() => selectedEffectId = null} title="Deselect">&times;</button>
@@ -1785,7 +1906,7 @@
 						<div class="props-info">
 							<div class="props-row">
 								<span class="props-label">Type</span>
-								<span class="props-value">{isZoom ? 'Zoom & Pan' : isChatPanel ? 'Chat Panel' : isSubtitle ? 'Subtitle' : isImage ? 'Image' : 'Chat Message'}</span>
+								<span class="props-value">{isZoom ? 'Zoom & Pan' : isChatPanel ? 'Chat Panel' : isSubtitle ? 'Subtitle' : isImage ? 'Image' : isAudio ? 'Audio' : 'Chat Message'}</span>
 							</div>
 							{#if selEffect.type === 'chat-message'}
 								<div class="props-row">
@@ -1829,7 +1950,7 @@
 									onchange={(e) => updateEffectEntry(selEffect.id, { duration: +(e.target as HTMLInputElement).value })}
 								/>
 							</div>
-							{#if !isZoom}
+							{#if !isZoom && !isAudio}
 							<div class="prop-field">
 								<label class="prop-label">X Position (0-1)</label>
 								<input
@@ -2101,10 +2222,48 @@
 									/>
 									<span style="font-size: 0.6rem; color: #94a3b8">{(selEffect.imageOpacity ?? 1).toFixed(2)}</span>
 								</div>
+							{:else if isAudio}
+								{#if selEffect.audioId}
+									<div class="prop-field">
+										<label class="prop-label">Preview</label>
+										<!-- svelte-ignore a11y_media_has_caption -->
+										<audio controls src="/api/overlay-audio/{selEffect.audioId}" style="width: 100%; height: 28px; margin-top: 2px"></audio>
+									</div>
+								{/if}
+								<div class="prop-field">
+									<label class="prop-label">Volume</label>
+									<input
+										type="range"
+										class="prop-input"
+										min="0"
+										max="1"
+										step="0.05"
+										value={selEffect.audioVolume ?? 1}
+										oninput={(e) => updateEffectEntry(selEffect.id, { audioVolume: +(e.target as HTMLInputElement).value })}
+									/>
+									<span style="font-size: 0.6rem; color: #94a3b8">{((selEffect.audioVolume ?? 1) * 100).toFixed(0)}%</span>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Audio Start (s)</label>
+									<input
+										type="number"
+										class="prop-input"
+										min="0"
+										step="0.1"
+										value={selEffect.audioOffset ?? 0}
+										onchange={(e) => updateEffectEntry(selEffect.id, { audioOffset: Math.max(0, +(e.target as HTMLInputElement).value) })}
+									/>
+								</div>
+								{#if selEffect.audioDuration}
+									<div class="prop-field">
+										<label class="prop-label">File Duration</label>
+										<span class="props-value">{selEffect.audioDuration.toFixed(1)}s</span>
+									</div>
+								{/if}
 							{/if}
 						</div>
 
-						{#if !isZoom}
+						{#if !isZoom && !isAudio}
 						<div class="props-section">
 							<div class="prop-field" style="margin-top: 4px">
 								<label class="prop-label" style="font-weight:600;color:#94a3b8">Animation</label>
@@ -2118,14 +2277,30 @@
 								>
 									<option value="none">None</option>
 									<option value="fade">Fade In</option>
-									<option value="pop">Pop</option>
+									<option value="grow">Grow</option>
+									<option value="shrink">Shrink</option>
 									<option value="slide-up">Slide Up</option>
 									<option value="slide-down">Slide Down</option>
 									<option value="slide-left">Slide Left</option>
 									<option value="slide-right">Slide Right</option>
+								</select>
+							</div>
+							{#if (selEffect.animIn ?? 'none') !== 'none'}
+							<div class="prop-field">
+								<label class="prop-label">In Easing</label>
+								<select
+									class="prop-input"
+									value={selEffect.animInEasing ?? 'ease-out'}
+									onchange={(e) => updateEffectEntry(selEffect.id, { animInEasing: (e.target as HTMLSelectElement).value as any })}
+								>
+									<option value="linear">Linear</option>
+									<option value="ease-in">Ease In</option>
+									<option value="ease-out">Ease Out</option>
+									<option value="ease-in-out">Ease In-Out</option>
 									<option value="bounce">Bounce</option>
 								</select>
 							</div>
+							{/if}
 							<div class="prop-field">
 								<label class="prop-label">Out Effect</label>
 								<select
@@ -2135,14 +2310,30 @@
 								>
 									<option value="none">None</option>
 									<option value="fade">Fade Out</option>
-									<option value="pop">Pop</option>
+									<option value="grow">Grow</option>
+									<option value="shrink">Shrink</option>
 									<option value="slide-up">Slide Up</option>
 									<option value="slide-down">Slide Down</option>
 									<option value="slide-left">Slide Left</option>
 									<option value="slide-right">Slide Right</option>
+								</select>
+							</div>
+							{#if (selEffect.animOut ?? 'none') !== 'none'}
+							<div class="prop-field">
+								<label class="prop-label">Out Easing</label>
+								<select
+									class="prop-input"
+									value={selEffect.animOutEasing ?? 'ease-in'}
+									onchange={(e) => updateEffectEntry(selEffect.id, { animOutEasing: (e.target as HTMLSelectElement).value as any })}
+								>
+									<option value="linear">Linear</option>
+									<option value="ease-in">Ease In</option>
+									<option value="ease-out">Ease Out</option>
+									<option value="ease-in-out">Ease In-Out</option>
 									<option value="bounce">Bounce</option>
 								</select>
 							</div>
+							{/if}
 							<div class="prop-field">
 								<label class="prop-label">Anim Duration (s)</label>
 								<input
@@ -2457,6 +2648,7 @@
 					<button class="btn-tl" onclick={togglePreviewPlay} title={previewPlaying ? 'Pause' : 'Play'}>
 						{previewPlaying ? '\u23F8' : '\u25B6'}
 					</button>
+					<span class="vid-speed">{previewPlaybackRate}x</span>
 					<span class="tl-time">{formatDuration(compositionTime)}</span>
 					<span class="tl-sep">/</span>
 					<span class="tl-time">{formatDuration(totalDuration)}</span>
@@ -2598,7 +2790,8 @@
 												class:effect-chat-panel={isChatPanel}
 												class:effect-zoom={entry.type === 'zoom'}
 												class:effect-subtitle={entry.type === 'subtitle'}
-																class:effect-image={entry.type === 'image'}
+												class:effect-image={entry.type === 'image'}
+												class:effect-audio={entry.type === 'audio'}
 												style="left: {leftPx}px; width: {widthPx}px"
 												onclick={(e) => handleEffectClick(e, entry.id)}
 												onmousedown={(e) => handleEffectMoveStart(e, entry.id)}
@@ -2614,6 +2807,8 @@
 														{entry.subtitleText?.slice(0, 20) ?? 'Subtitle'}{(entry.subtitleText?.length ?? 0) > 20 ? '...' : ''}
 													{:else if entry.type === 'image'}
 														Image
+													{:else if entry.type === 'audio'}
+														Audio
 													{:else}
 														{emsg?.username ?? entry.twitchId?.slice(0, 8) ?? '?'}
 													{/if}
@@ -3208,6 +3403,16 @@
 		font-size: 0.75rem;
 	}
 
+	.vid-speed {
+		font-size: 0.7rem;
+		color: #7c3aed;
+		font-weight: 600;
+		font-variant-numeric: tabular-nums;
+		font-family: monospace;
+		min-width: 3em;
+		text-align: center;
+	}
+
 	.tl-time {
 		font-size: 0.8rem;
 		color: #e0e0ff;
@@ -3697,6 +3902,11 @@
 	.effect-image {
 		background: rgba(245, 158, 11, 0.3);
 		border-color: rgba(245, 158, 11, 0.4);
+	}
+
+	.effect-audio {
+		background: rgba(6, 182, 212, 0.3);
+		border-color: rgba(6, 182, 212, 0.4);
 	}
 
 	.btn-fx-image {

@@ -733,6 +733,40 @@ export const uploadOverlayImageCmd = command('unchecked', async (args: { data: s
 	return { id: `${id}${ext}`, width: img.width, height: img.height };
 });
 
+/** Upload an overlay audio file (base64 data) → saves to data/audio/ and returns ID + duration. */
+export const uploadOverlayAudioCmd = command('unchecked', async (args: { data: string; filename: string }) => {
+	const { newOverlayAudioId } = await import('$lib/ids.js');
+	const path = await import('node:path');
+	const fs = await import('node:fs');
+
+	const AUDIO_DIR = path.resolve(process.cwd(), 'data', 'audio');
+	if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
+
+	const ext = path.extname(args.filename).toLowerCase() || '.mp3';
+	const id = newOverlayAudioId();
+	const filePath = path.join(AUDIO_DIR, `${id}${ext}`);
+
+	const buffer = Buffer.from(args.data, 'base64');
+	fs.writeFileSync(filePath, buffer);
+
+	// Probe duration via ffprobe
+	let duration = 0;
+	try {
+		const proc = Bun.spawn(
+			['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'json', filePath],
+			{ stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' }
+		);
+		const stdout = await new Response(proc.stdout).text();
+		const code = await proc.exited;
+		if (code === 0) {
+			const data = JSON.parse(stdout);
+			duration = parseFloat(data.format?.duration) || 0;
+		}
+	} catch { /* fallback to 0 */ }
+
+	return { id: `${id}${ext}`, duration };
+});
+
 /** Export selected clips by IDs (in order). */
 export const exportSelectedClipsCmd = command('unchecked', async (args: { clipIds: string[]; title: string; format?: 'standard' | 'mobile_short' }) => {
 	if (!args.clipIds || args.clipIds.length === 0) {

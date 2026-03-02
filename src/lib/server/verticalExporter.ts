@@ -12,7 +12,7 @@ import { clearEffectRendererCache } from './effectRenderer.js';
 import { clearChatEffectCache } from './chatEffectRenderer.js';
 import {
 	resolveClip, buildAudioArgs, buildVideoEncoderArgs, createTempDir, cleanupTempDir,
-	concatClipFiles, buildOutputPath
+	concatClipFiles, buildOutputPath, resolveAudioOverlays, buildAudioMixFilter
 } from './exporterCommon.js';
 
 // Output dimensions
@@ -140,6 +140,9 @@ export async function exportVerticalVideo(
 			// Find overlapping effects for this clip
 			const clipCompStart = compOffsets?.[i] ?? 0;
 			const clipCompEnd = clipCompStart + clipDur;
+
+			// Resolve audio overlays for this clip
+			const audioOverlays = resolveAudioOverlays(effectEntries, clipCompStart, clipCompEnd);
 
 			// Resolve zoom effects first so we know if we need to supersample overlays
 			const clipZooms = resolveZoomEffects(effectEntries, clipCompStart, clipCompEnd, clipDur);
@@ -307,6 +310,14 @@ export async function exportVerticalVideo(
 
 			const videoArgs = buildVideoEncoderArgs(useNvenc, gop);
 
+			// Audio overlay mixing
+			const audioNextIdx = 1 + allEffects.length;
+			const audioMix = buildAudioMixFilter(audioOverlays, audioNextIdx, speed, clipDur);
+			if (audioMix.totalAudioInputs > 0) {
+				extraInputs.push(...audioMix.extraInputs);
+				filterGraph += ';' + audioMix.audioFilterGraph;
+			}
+
 			if (allEffects.length > 0) {
 				console.log(`[vertical-export] Clip ${i}: ${preZoomEffects.length} pre-zoom + ${postZoomEffects.length} post-zoom overlay(s), ss=${trimStart.toFixed(3)} t=${dur.toFixed(3)} speed=${speed}`);
 				for (const eff of allEffects) {
@@ -315,6 +326,8 @@ export async function exportVerticalVideo(
 				console.log(`[vertical-export]   filter_complex: ${filterGraph}`);
 			}
 
+			const hasAudioMix = audioMix.totalAudioInputs > 0;
+
 			const ffmpegArgs = [
 				'-fflags', '+genpts',
 				'-f', 'concat', '-safe', '0', '-i', concatPath,
@@ -322,11 +335,12 @@ export async function exportVerticalVideo(
 				'-ss', trimStart.toFixed(3),
 				'-t', dur.toFixed(3),
 				'-filter_complex', filterGraph,
-				'-map', '[outv]', '-map', '0:a?',
+				'-map', '[outv]',
+				...(hasAudioMix ? ['-map', `[${audioMix.audioOutLabel}]`] : ['-map', '0:a?']),
 				...videoArgs,
 				'-fps_mode', 'cfr',
 				'-r', `${fps}`,
-				...audioArgs,
+				...(hasAudioMix ? ['-c:a', 'aac', '-ar', '48000', '-b:a', '192k'] : audioArgs),
 				'-movflags', '+faststart',
 				'-y', outFile
 			];

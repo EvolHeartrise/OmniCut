@@ -6,3 +6,4 @@ export const newYouTubeAccountId = () => nanoid(12);
 export const newThumbnailId = () => nanoid(12);
 export const newVideoId = () => nanoid(12);
 export const newOverlayImageId = () => nanoid(12);
+export const newOverlayAudioId = () => nanoid(12);

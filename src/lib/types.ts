@@ -24,7 +24,7 @@ export interface CameraBoundsEntry {
 /** An effect placed on the composition timeline. */
 export interface EffectEntry {
 	id: string;               // unique ID (nanoid)
-	type: 'chat-message' | 'twitch-chat' | 'zoom' | 'subtitle' | 'image';
+	type: 'chat-message' | 'twitch-chat' | 'zoom' | 'subtitle' | 'image' | 'audio';
 	/** Composition-time start (seconds from composition start). */
 	startTime: number;
 	/** Duration the effect is visible (seconds). */
@@ -82,12 +82,24 @@ export interface EffectEntry {
 	imageWidth?: number;
 	/** For image type: natural height in pixels (stored on upload). */
 	imageHeight?: number;
+	/** For audio type: ID of the uploaded audio file (filename in data/audio/). */
+	audioId?: string;
+	/** For audio type: volume level 0-1 (default 1). */
+	audioVolume?: number;
+	/** For audio type: natural duration in seconds (stored on upload). */
+	audioDuration?: number;
+	/** For audio type: start offset into the audio file in seconds (default 0). */
+	audioOffset?: number;
 	/** Entrance animation for overlay effects (default 'none'). */
 	animIn?: OverlayAnimation;
 	/** Exit animation for overlay effects (default 'none'). */
 	animOut?: OverlayAnimation;
 	/** Animation duration in seconds (default 0.3). */
 	animDuration?: number;
+	/** Easing function for entrance animation (default 'ease-out'). */
+	animInEasing?: EasingFunction;
+	/** Easing function for exit animation (default 'ease-in'). */
+	animOutEasing?: EasingFunction;
 	/** When true, overlay stays fixed in screen space — composited after zoom (default false). */
 	ignoreZoom?: boolean;
 	/** Optional drop shadow for overlay effects (not applicable to 'zoom'). */
@@ -102,11 +114,18 @@ export interface EffectEntry {
 export type OverlayAnimation =
 	| 'none'
 	| 'fade'
-	| 'pop'
+	| 'grow'
+	| 'shrink'
 	| 'slide-up'
 	| 'slide-down'
 	| 'slide-left'
-	| 'slide-right'
+	| 'slide-right';
+
+export type EasingFunction =
+	| 'linear'
+	| 'ease-in'
+	| 'ease-out'
+	| 'ease-in-out'
 	| 'bounce';
 
 /** @deprecated Use OverlayAnimation instead. */

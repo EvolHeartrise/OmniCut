@@ -5,14 +5,14 @@
 
 import * as path from 'node:path';
 import * as fs from 'node:fs';
-import type { ClipRegion, ClipEntry, EffectEntry, OverlayAnimation } from '../types.js';
+import type { ClipRegion, ClipEntry, EffectEntry, OverlayAnimation, EasingFunction } from '../types.js';
 import { runFfmpeg } from './ffmpeg.js';
 import { renderEffectOverlay, clearEffectRendererCache } from './effectRenderer.js';
 import { renderChatEffectVideo, clearChatEffectCache } from './chatEffectRenderer.js';
 import { renderSubtitleOverlay } from './subtitleRenderer.js';
 import {
 	resolveClip, buildAudioArgs, buildVideoEncoderArgs, createTempDir, cleanupTempDir,
-	concatClipFiles, buildOutputPath
+	concatClipFiles, buildOutputPath, resolveAudioOverlays, buildAudioMixFilter
 } from './exporterCommon.js';
 
 /** Resolved stream info needed for encoding a clip from raw segments. */
@@ -103,6 +103,9 @@ export async function exportVideo(
 
 			// Combine for FFmpeg input ordering: pre-zoom first, then post-zoom
 			const allEffects = [...preZoomEffects, ...postZoomEffects];
+
+			// Resolve audio overlays for this clip
+			const audioOverlays = resolveAudioOverlays(effectEntries, clipCompStart, clipCompEnd);
 
 			const audioArgs = buildAudioArgs(speed);
 
@@ -249,9 +252,18 @@ export async function exportVideo(
 					console.log(`[export]   filter_complex: ${filterGraph}`);
 				}
 
-					videoFilterArgs = [
+				// Audio overlay mixing
+				const audioNextIdx = 1 + allEffects.length;
+				const audioMix = buildAudioMixFilter(audioOverlays, audioNextIdx, speed, clipDur);
+				if (audioMix.totalAudioInputs > 0) {
+					extraInputs.push(...audioMix.extraInputs);
+					filterGraph += ';' + audioMix.audioFilterGraph;
+				}
+
+				videoFilterArgs = [
 					'-filter_complex', filterGraph,
-					'-map', '[outv]', '-map', '0:a:0',
+					'-map', '[outv]',
+					...(audioMix.totalAudioInputs > 0 ? ['-map', `[${audioMix.audioOutLabel}]`] : ['-map', '0:a:0']),
 					...buildVideoEncoderArgs(useNvenc)
 				];
 			} else {
@@ -259,12 +271,28 @@ export async function exportVideo(
 				if (speed !== 1) vFilters.push(`setpts=PTS/${speed}`);
 				vFilters.push('format=yuv420p');
 
-				videoFilterArgs = [
-					'-vf', vFilters.join(','),
-					'-map', '0:v:0', '-map', '0:a:0',
-					...buildVideoEncoderArgs(useNvenc)
-				];
+				if (audioOverlays.length > 0) {
+					// Need filter_complex for audio mixing even without video overlays
+					const audioMix = buildAudioMixFilter(audioOverlays, 1, speed, clipDur);
+					extraInputs.push(...audioMix.extraInputs);
+					// Build a combined filter with video + audio
+					const fullFilter = `[0:v]${vFilters.join(',')}[outv];${audioMix.audioFilterGraph}`;
+					videoFilterArgs = [
+						'-filter_complex', fullFilter,
+						'-map', '[outv]', '-map', `[${audioMix.audioOutLabel}]`,
+						...buildVideoEncoderArgs(useNvenc)
+					];
+				} else {
+					videoFilterArgs = [
+						'-vf', vFilters.join(','),
+						'-map', '0:v:0', '-map', '0:a:0',
+						...buildVideoEncoderArgs(useNvenc)
+					];
+				}
 			}
+
+			// When using audio filter_complex, skip -af args (already handled in filter graph)
+			const hasAudioMix = audioOverlays.length > 0;
 
 			await runFfmpeg([
 				'-fflags', '+genpts',
@@ -274,7 +302,7 @@ export async function exportVideo(
 				'-t', dur.toFixed(3),
 				...videoFilterArgs,
 				'-fps_mode', 'cfr',
-				...audioArgs,
+				...(hasAudioMix ? ['-c:a', 'aac', '-ar', '48000', '-b:a', '192k'] : audioArgs),
 				'-video_track_timescale', '90000',
 				'-movflags', '+faststart',
 				'-y', outFile
@@ -370,6 +398,8 @@ export interface ResolvedEffect {
 		animIn: OverlayAnimation;
 		animOut: OverlayAnimation;
 		animDuration: number;
+		animInEasing: import('$lib/types').EasingFunction;
+		animOutEasing: import('$lib/types').EasingFunction;
 		width: number;   // rendered overlay width (for slide calculations)
 		height: number;  // rendered overlay height
 	};
@@ -478,8 +508,12 @@ export async function resolveOverlappingEffects(
 			const img = await loadImage(imgFilePath);
 			const scale = effect.imageScale ?? 1;
 			const opacity = effect.imageOpacity ?? 1;
-			const scaledW = Math.round(img.width * scale);
-			const scaledH = Math.round(img.height * scale);
+			// Use stored dimensions (same values the preview uses) to ensure consistency.
+			// Fall back to loaded image dimensions if not stored.
+			const naturalW = effect.imageWidth ?? img.width;
+			const naturalH = effect.imageHeight ?? img.height;
+			const scaledW = Math.round(naturalW * scale);
+			const scaledH = Math.round(naturalH * scale);
 			const sp = shadowPadding(effect.shadow);
 
 			const pngPath = path.join(tempDir, `${filePrefix}image_${clipIdx}_${ei}.png`);
@@ -564,8 +598,10 @@ export async function resolveOverlappingEffects(
 		const animIn = effect.animIn ?? 'none';
 		const animOut = effect.animOut ?? 'none';
 		const animDuration = effect.animDuration ?? 0.3;
+		const animInEasing = effect.animInEasing ?? 'ease-out';
+		const animOutEasing = effect.animOutEasing ?? 'ease-in';
 		if (animIn !== 'none' || animOut !== 'none') {
-			resolved.animation = { animIn, animOut, animDuration,
+			resolved.animation = { animIn, animOut, animDuration, animInEasing, animOutEasing,
 				width: resolved.overlayWidth, height: resolved.overlayHeight };
 		}
 
@@ -674,10 +710,24 @@ export function buildZoomFilter(
  * overlay `format=auto` and `[overlay_input]fade` filter to get alpha animation.
  *
  * Strategy:
- * - Position animations (slide, bounce): use overlay x/y expressions
- * - Alpha animations (fade, pop): chain `fade=in`/`fade=out` filters on the overlay input
+ * - Position animations (slide): use overlay x/y expressions with easing
+ * - Scale animations (grow, shrink): animated scale filter
+ * - Alpha animations (fade): chain `fade=in`/`fade=out` filters on the overlay input
  * - Combined: both
  */
+
+/** Build an FFmpeg expression that applies an easing function to linear progress `p`. */
+function ffmpegEasing(p: string, easing: EasingFunction): string {
+	switch (easing) {
+		case 'linear': return p;
+		case 'ease-in': return `(${p}*${p})`;
+		case 'ease-out': return `(1-(1-${p})*(1-${p}))`;
+		case 'ease-in-out': return `if(lt(${p},0.5),2*${p}*${p},1-2*(1-${p})*(1-${p}))`;
+		case 'bounce': return `(1+(1-${p})*(1-${p})*(2.5*${p}-1))`;
+		default: return p;
+	}
+}
+
 export function buildAnimatedOverlay(
 	overlayInput: string,
 	prevLabel: string,
@@ -694,25 +744,16 @@ export function buildAnimatedOverlay(
 	const dur = anim.animDuration;
 	const w = anim.width * ss;
 	const h = anim.height * ss;
-	const effectDuration = enableEnd - enableStart;
 	const filterParts: string[] = [];
 
-	// Time boundaries for animation phases (in overlay-local time)
-	// The overlay input is fed via -itsoffset so its t=0 aligns with enableStart.
-	// In the overlay filter, `t` refers to the main video's time.
-	// So we use absolute time values.
 	const inEnd = enableStart + dur;
 	const outStart = enableEnd - dur;
 
-	// In the overlay filter, x/y expressions use `t` = main video time
-	// We build expressions in terms of this `t`.
-
 	// --- X expression ---
 	let xExpr = `${baseX}`;
-	const xIn = buildPositionAnim(anim.animIn, 'in', 'x', baseX, baseY, w, h, enableStart, inEnd, dur);
-	const xOut = buildPositionAnim(anim.animOut, 'out', 'x', baseX, baseY, w, h, outStart, enableEnd, dur);
+	const xIn = buildPositionAnim(anim.animIn, 'in', 'x', baseX, baseY, w, h, enableStart, inEnd, dur, anim.animInEasing);
+	const xOut = buildPositionAnim(anim.animOut, 'out', 'x', baseX, baseY, w, h, outStart, enableEnd, dur, anim.animOutEasing);
 	if (xIn || xOut) {
-		// Phase: in-anim | steady | out-anim
 		const steady = `${baseX}`;
 		if (xIn && xOut) {
 			xExpr = `if(lt(t,${inEnd.toFixed(3)}),${xIn},if(gt(t,${outStart.toFixed(3)}),${xOut},${steady}))`;
@@ -725,8 +766,8 @@ export function buildAnimatedOverlay(
 
 	// --- Y expression ---
 	let yExpr = `${baseY}`;
-	const yIn = buildPositionAnim(anim.animIn, 'in', 'y', baseX, baseY, w, h, enableStart, inEnd, dur);
-	const yOut = buildPositionAnim(anim.animOut, 'out', 'y', baseX, baseY, w, h, outStart, enableEnd, dur);
+	const yIn = buildPositionAnim(anim.animIn, 'in', 'y', baseX, baseY, w, h, enableStart, inEnd, dur, anim.animInEasing);
+	const yOut = buildPositionAnim(anim.animOut, 'out', 'y', baseX, baseY, w, h, outStart, enableEnd, dur, anim.animOutEasing);
 	if (yIn || yOut) {
 		const steady = `${baseY}`;
 		if (yIn && yOut) {
@@ -738,45 +779,41 @@ export function buildAnimatedOverlay(
 		}
 	}
 
-	// --- Pop scale animation ---
-	// Pop requires animated scaling of the overlay input. We use FFmpeg's scale filter
-	// with eval=frame and expression-based dimensions. The scale filter's `t` follows
-	// the overlay stream's PTS (shifted by -itsoffset, so t starts at enableStart).
-	const hasPopIn = anim.animIn === 'pop';
-	const hasPopOut = anim.animOut === 'pop';
-	const hasPop = hasPopIn || hasPopOut;
+	// --- Scale animation (grow / shrink) ---
+	const hasScaleIn = anim.animIn === 'grow' || anim.animIn === 'shrink';
+	const hasScaleOut = anim.animOut === 'grow' || anim.animOut === 'shrink';
+	const hasScale = hasScaleIn || hasScaleOut;
 
-	// Build a scale factor expression (1.0 = full size, 0.3 = starting size for pop)
-	// Scale filter `t` = overlay stream time = main video time (due to -itsoffset)
 	let scaleExpr: string | null = null;
-	if (hasPop) {
-		// Build piecewise scale factor: in-phase | steady | out-phase
-		const popMinScale = 0.3;
-		const popRange = 1 - popMinScale; // 0.7
+	if (hasScale) {
 		const pieces: string[] = [];
 
-		if (hasPopIn) {
-			// p = clip((t - enableStart) / dur, 0, 1), eased = 1 - (1-p)^2
+		if (hasScaleIn) {
 			const p = `clip((t-${enableStart.toFixed(3)})/${dur.toFixed(3)},0,1)`;
-			const eased = `(1-(1-${p})*(1-${p}))`;
-			const inScale = `(${popMinScale}+${popRange}*${eased})`;
+			const eased = ffmpegEasing(p, anim.animInEasing);
+			// grow: scale 0.3→1; shrink: scale 1.7→1
+			const inScale = anim.animIn === 'grow'
+				? `(0.3+0.7*${eased})`
+				: `(1.7-0.7*${eased})`;
 			pieces.push(`if(lt(t,${inEnd.toFixed(3)}),${inScale}`);
 		}
-		if (hasPopOut) {
-			// p = clip((t - outStart) / dur, 0, 1), eased = p^2
+		if (hasScaleOut) {
 			const p = `clip((t-${outStart.toFixed(3)})/${dur.toFixed(3)},0,1)`;
-			const eased = `(${p}*${p})`;
-			const outScale = `(1-${popRange}*${eased})`;
-			if (hasPopIn) {
+			const eased = ffmpegEasing(p, anim.animOutEasing);
+			// grow: scale 1→1.7; shrink: scale 1→0.3
+			const outScale = anim.animOut === 'grow'
+				? `(1+0.7*${eased})`
+				: `(1-0.7*${eased})`;
+			if (hasScaleIn) {
 				pieces.push(`if(gt(t,${outStart.toFixed(3)}),${outScale},1)`);
 			} else {
 				pieces.push(`if(gt(t,${outStart.toFixed(3)}),${outScale}`);
 			}
 		}
 
-		if (hasPopIn && hasPopOut) {
+		if (hasScaleIn && hasScaleOut) {
 			scaleExpr = `${pieces[0]},${pieces[1]})`;
-		} else if (hasPopIn) {
+		} else if (hasScaleIn) {
 			scaleExpr = `${pieces[0]},1)`;
 		} else {
 			scaleExpr = `${pieces[0]},1)`;
@@ -784,29 +821,23 @@ export function buildAnimatedOverlay(
 	}
 
 	// --- Alpha (fade) via FFmpeg fade filter on the overlay input ---
-	// The overlay input has already been prepared (format=yuva420p, optional scale).
-	// -itsoffset shifts the overlay stream's PTS to start at enableStart,
-	// so the fade filter's `st` must use absolute (enableStart-based) times.
-	// All animation types get a subtle fade — not just 'fade' and 'pop'
 	const needsFadeIn = anim.animIn !== 'none';
 	const needsFadeOut = anim.animOut !== 'none';
 
 	let inputForOverlay = overlayInput;
 
-	// Chain: [input] → scale (pop) → fade → [overlay]
+	// Chain: [input] → scale (grow/shrink) → fade → [overlay]
 	const chainFilters: string[] = [];
 	if (scaleExpr) {
-		// Animated scale for pop: scale with eval=frame so expressions re-evaluate per frame.
-		// Adjust to even dimensions (required by yuva420p).
 		chainFilters.push(`scale=w='trunc(iw*${scaleExpr}/2)*2':h='trunc(ih*${scaleExpr}/2)*2':eval=frame`);
 	}
 	if (needsFadeIn) {
-		const fadeDur = anim.animIn === 'pop' ? dur * 0.6 : dur;
+		const fadeDur = hasScaleIn ? dur * 0.6 : dur;
 		chainFilters.push(`fade=t=in:st=${enableStart.toFixed(3)}:d=${fadeDur.toFixed(3)}:alpha=1`);
 	}
 	if (needsFadeOut) {
 		const fadeOutStart = enableEnd - dur;
-		const fadeDur = anim.animOut === 'pop' ? dur * 0.6 : dur;
+		const fadeDur = hasScaleOut ? dur * 0.6 : dur;
 		chainFilters.push(`fade=t=out:st=${fadeOutStart.toFixed(3)}:d=${fadeDur.toFixed(3)}:alpha=1`);
 	}
 
@@ -817,16 +848,12 @@ export function buildAnimatedOverlay(
 	}
 
 	// --- Overlay position ---
-	// For pop animation, the overlay size changes so we need to adjust x/y to keep it
-	// centered at the intended position. The overlay's rendered size changes by the scale
-	// factor, so we offset by half the size difference: x + w/2*(1-scaleFactor)
-	if (hasPop) {
-		const sf = scaleExpr!;
-		// Adjust x: baseX + w/2 * (1 - scaleFactor)
-		const xCenter = `${baseX}+${(w / 2).toFixed(1)}*(1-${sf})`;
-		const yCenter = `${baseY}+${(h / 2).toFixed(1)}*(1-${sf})`;
+	// For scale animations, adjust x/y to keep overlay centered at the intended position.
+	// Use overlay_w/overlay_h (actual scaled dims from the scale filter) for accuracy.
+	if (hasScale) {
+		const xCenter = `${baseX}+(${w}-overlay_w)/2`;
+		const yCenter = `${baseY}+(${h}-overlay_h)/2`;
 
-		// Merge with existing position animations (slide + pop would be unusual but handle it)
 		if (xExpr === `${baseX}`) {
 			xExpr = xCenter;
 		}
@@ -843,9 +870,6 @@ export function buildAnimatedOverlay(
 /**
  * Build a position expression for a single axis during an animation phase.
  * Returns null if this animation type doesn't affect the given axis.
- *
- * For 'in' phase: progress goes 0→1 over [phaseStart, phaseEnd]
- * For 'out' phase: progress goes 0→1 over [phaseStart, phaseEnd]
  */
 function buildPositionAnim(
 	animType: OverlayAnimation,
@@ -854,71 +878,53 @@ function buildPositionAnim(
 	baseX: number, baseY: number,
 	w: number, h: number,
 	phaseStart: number, phaseEnd: number,
-	dur: number
+	dur: number,
+	easing: EasingFunction
 ): string | null {
-	// Progress: 0→1 over the phase
 	const p = `clip((t-${phaseStart.toFixed(3)})/${dur.toFixed(3)},0,1)`;
+	const ep = ffmpegEasing(p, easing);
 
 	if (animType === 'slide-up') {
 		if (axis !== 'y') return null;
-		const offset = h * 1.5; // slide distance
+		const offset = h * 0.4;
 		if (phase === 'in') {
-			// Start below (baseY + offset), end at baseY
-			return `${baseY}+${offset.toFixed(1)}*(1-${p})`;
+			return `${baseY}+${offset.toFixed(1)}*(1-${ep})`;
 		} else {
-			// Start at baseY, slide up (baseY - offset*p)
-			return `${baseY}-${offset.toFixed(1)}*${p}`;
+			return `${baseY}-${offset.toFixed(1)}*${ep}`;
 		}
 	}
 
 	if (animType === 'slide-down') {
 		if (axis !== 'y') return null;
-		const offset = h * 1.5;
+		const offset = h * 0.4;
 		if (phase === 'in') {
-			return `${baseY}-${offset.toFixed(1)}*(1-${p})`;
+			return `${baseY}-${offset.toFixed(1)}*(1-${ep})`;
 		} else {
-			return `${baseY}+${offset.toFixed(1)}*${p}`;
+			return `${baseY}+${offset.toFixed(1)}*${ep}`;
 		}
 	}
 
 	if (animType === 'slide-left') {
 		if (axis !== 'x') return null;
-		const offset = w * 2;
+		const offset = w * 0.5;
 		if (phase === 'in') {
-			// Start to the right (baseX + offset), slide left to baseX
-			return `${baseX}+${offset.toFixed(1)}*(1-${p})`;
+			return `${baseX}+${offset.toFixed(1)}*(1-${ep})`;
 		} else {
-			// Slide left from baseX
-			return `${baseX}-${offset.toFixed(1)}*${p}`;
+			return `${baseX}-${offset.toFixed(1)}*${ep}`;
 		}
 	}
 
 	if (animType === 'slide-right') {
 		if (axis !== 'x') return null;
-		const offset = w * 2;
+		const offset = w * 0.5;
 		if (phase === 'in') {
-			return `${baseX}-${offset.toFixed(1)}*(1-${p})`;
+			return `${baseX}-${offset.toFixed(1)}*(1-${ep})`;
 		} else {
-			return `${baseX}+${offset.toFixed(1)}*${p}`;
+			return `${baseX}+${offset.toFixed(1)}*${ep}`;
 		}
 	}
 
-	if (animType === 'bounce') {
-		if (axis !== 'y') return null;
-		const offset = h * 1.5;
-		if (phase === 'in') {
-			// Ease-out with overshoot: use a cubic bezier-like overshoot
-			// p goes 0→1; we want position to overshoot slightly then settle
-			// eased = 1 - (1-p)^2 * cos(p * PI)  — overshoots at ~0.7 then settles
-			const eased = `(1-(1-${p})*(1-${p})*cos(${p}*3.14159))`;
-			return `${baseY}+${offset.toFixed(1)}*(1-clip(${eased},0,1.2))`;
-		} else {
-			// Accelerate out
-			return `${baseY}-${offset.toFixed(1)}*(${p}*${p})`;
-		}
-	}
-
-	// fade, pop, none — don't affect position
+	// fade, grow, shrink, none — don't affect position
 	return null;
 }
 
