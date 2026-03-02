@@ -24,7 +24,7 @@ export interface CameraBoundsEntry {
 /** An effect placed on the composition timeline. */
 export interface EffectEntry {
 	id: string;               // unique ID (nanoid)
-	type: 'chat-message' | 'twitch-chat' | 'zoom' | 'subtitle' | 'image' | 'audio';
+	type: 'chat-message' | 'twitch-chat' | 'subtitle' | 'image' | 'audio' | 'view';
 	/** Composition-time start (seconds from composition start). */
 	startTime: number;
 	/** Duration the effect is visible (seconds). */
@@ -46,14 +46,25 @@ export interface EffectEntry {
 	chatFontWeight?: number;
 	/** Effects track index (0-based, default 0). Higher tracks render on top. */
 	track?: number;
-	/** For zoom type: start crop region (normalized 0-1). Width = height fraction (aspect-ratio locked). */
-	zoomStartX?: number;
-	zoomStartY?: number;
-	zoomStartW?: number;  // fraction of video width (default 1 = full frame)
-	/** For zoom type: end crop region (normalized 0-1). */
-	zoomEndX?: number;
-	zoomEndY?: number;
-	zoomEndW?: number;
+	/** For view type: preset source region ('full' = entire frame, 'camera' = webcam bounds). Omit for custom/animated. */
+	viewSourceType?: 'full' | 'camera';
+	/** For view type: animated source crop start region (normalized 0-1). */
+	viewSourceStartX?: number;
+	viewSourceStartY?: number;
+	viewSourceStartW?: number;
+	viewSourceStartH?: number;
+	/** For view type: animated source crop end region (normalized 0-1). */
+	viewSourceEndX?: number;
+	viewSourceEndY?: number;
+	viewSourceEndW?: number;
+	viewSourceEndH?: number;
+	/** For view type: destination rect on output canvas (normalized 0-1). */
+	viewDestX?: number;
+	viewDestY?: number;
+	viewDestW?: number;
+	viewDestH?: number;
+	/** For view type: z-order for layering when views overlap (default 0). */
+	viewZOrder?: number;
 	/** For subtitle type: the text to display. */
 	subtitleText?: string;
 	/** For subtitle type: font size in pixels (default 48). */
@@ -100,9 +111,7 @@ export interface EffectEntry {
 	animInEasing?: EasingFunction;
 	/** Easing function for exit animation (default 'ease-in'). */
 	animOutEasing?: EasingFunction;
-	/** When true, overlay stays fixed in screen space — composited after zoom (default false). */
-	ignoreZoom?: boolean;
-	/** Optional drop shadow for overlay effects (not applicable to 'zoom'). */
+	/** Optional drop shadow for overlay effects. */
 	shadow?: {
 		color: string;      // CSS color, e.g. 'rgba(0,0,0,0.8)'
 		blur: number;       // blur radius in pixels
@@ -141,22 +150,6 @@ export interface ClipEntry {
 	transitionDuration?: number; // seconds (default 0.5)
 }
 
-export type VerticalSlotType = 'full' | 'camera' | 'custom';
-
-export interface VerticalSlot {
-	type: VerticalSlotType;
-	/** Custom crop region (normalized 0-1). Only used when type === 'custom'. */
-	cropX?: number;
-	cropY?: number;
-	cropW?: number;
-	cropH?: number;
-}
-
-export interface VerticalLayout {
-	top: VerticalSlot;
-	bottom: VerticalSlot;
-}
-
 /** Video composition — an ordered collection of clips with effects. */
 export interface VideoRecord {
 	id: string;
@@ -165,7 +158,6 @@ export interface VideoRecord {
 	clipEntries: ClipEntry[];
 	format: 'standard' | 'mobile_short';
 	effectEntries?: EffectEntry[];
-	verticalLayout?: VerticalLayout;
 	createdAt: number;
 	updatedAt: number;
 }

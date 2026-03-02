@@ -11,19 +11,6 @@ import {
 	createVideo, updateVideo, deleteVideo, getVideo, getAllVideos
 } from '../streamManager.js';
 
-const verticalSlotSchema = z.object({
-	type: z.enum(['full', 'camera', 'custom']),
-	cropX: z.number().min(0).max(1).optional(),
-	cropY: z.number().min(0).max(1).optional(),
-	cropW: z.number().min(0).max(1).optional(),
-	cropH: z.number().min(0).max(1).optional()
-});
-
-const verticalLayoutSchema = z.object({
-	top: verticalSlotSchema,
-	bottom: verticalSlotSchema
-}).optional().describe('Vertical (9:16) layout: top/bottom slot config. Each slot type: "full" (entire frame), "camera" (webcam bounds), or "custom" (user crop region).');
-
 export function registerVideoTools(server: ToolRegistrar): void {
 	// --- create_video ---
 	server.tool(
@@ -34,13 +21,12 @@ export function registerVideoTools(server: ToolRegistrar): void {
 			title: z.string().describe('Video title'),
 			description: z.string().optional(),
 			format: z.enum(['standard', 'mobile_short']).optional().default('standard')
-				.describe('"standard" (16:9) or "mobile_short" (9:16)'),
-			verticalLayout: verticalLayoutSchema
+				.describe('"standard" (16:9) or "mobile_short" (9:16)')
 		},
-		async ({ clipIds, title, description, format, verticalLayout }) => {
+		async ({ clipIds, title, description, format }) => {
 			try {
 				const clipEntries = clipIds.map((clipId) => ({ clipId }));
-				const video = createVideo({ title, description, clipEntries, format, verticalLayout });
+				const video = createVideo({ title, description, clipEntries, format });
 				return jsonResult({ success: true, video, message: `Video "${title}" created with ${clipIds.length} clip(s).` });
 			} catch (err) {
 				return textResult(`Failed to create video: ${err instanceof Error ? err.message : String(err)}`, true);
@@ -73,17 +59,15 @@ export function registerVideoTools(server: ToolRegistrar): void {
 			title: z.string().optional(),
 			description: z.string().optional(),
 			clipIds: z.array(z.string()).optional().describe('New ordered clip IDs (replaces all entries)'),
-			format: z.enum(['standard', 'mobile_short']).optional(),
-			verticalLayout: verticalLayoutSchema
+			format: z.enum(['standard', 'mobile_short']).optional()
 		},
-		async ({ id, title, description, clipIds, format, verticalLayout }) => {
+		async ({ id, title, description, clipIds, format }) => {
 			try {
 				const updates: Parameters<typeof updateVideo>[1] = {};
 				if (title !== undefined) updates.title = title;
 				if (description !== undefined) updates.description = description;
 				if (clipIds !== undefined) updates.clipEntries = clipIds.map((clipId) => ({ clipId }));
 				if (format !== undefined) updates.format = format;
-				if (verticalLayout !== undefined) updates.verticalLayout = verticalLayout;
 				const video = updateVideo(id, updates);
 				return jsonResult({ success: true, video });
 			} catch (err) {

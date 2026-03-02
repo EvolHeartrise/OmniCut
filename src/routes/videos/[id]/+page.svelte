@@ -25,7 +25,7 @@
 	import { getCameraBounds } from '$lib/stores/streams.js';
 	import { untrack } from 'svelte';
 	import { formatDuration, getClipLocalBounds, setupHls, usernameColor } from '$lib/utils.js';
-	import type { ClipEntry, EffectEntry, VerticalLayout, CameraBoundsEntry } from '$lib/types.js';
+	import type { ClipEntry, EffectEntry, CameraBoundsEntry } from '$lib/types.js';
 	import type { ClipRegion } from '$lib/stores/streams.js';
 	import { computeTickInterval, handleTimelineWheel, zoomIn as tzZoomIn, zoomOut as tzZoomOut } from '$lib/timeline.js';
 	import { TRACK_COLORS } from '$lib/constants.js';
@@ -49,7 +49,6 @@
 
 	// --- Effect entries state ---
 	let effectEntries = $state<EffectEntry[]>([]);
-	let verticalLayout = $state<VerticalLayout | undefined>(undefined);
 	let selectedEffectId = $state<string | null>(null);
 	let addingEffect = $state(false);
 	let addEffectTwitchId = $state('');
@@ -95,7 +94,6 @@
 	// --- Vertical (9:16) canvas preview ---
 	const VERT_OUT_W = 1080;
 	const VERT_OUT_H = 1920;
-	const VERT_MAX_CAM_H = 700;
 	const VERT_CANVAS_W = 540; // half-res for perf, CSS-scaled
 	const VERT_CANVAS_H = 960;
 	let verticalCanvasEl = $state<HTMLCanvasElement | null>(null);
@@ -113,7 +111,6 @@
 			format = video.format;
 			entries = structuredClone(video.clipEntries);
 			effectEntries = structuredClone(video.effectEntries ?? []);
-			verticalLayout = video.verticalLayout ? structuredClone(video.verticalLayout) : undefined;
 			initialized = true;
 			loaded = true;
 			// Fetch chat message data for all effect entries
@@ -159,7 +156,6 @@
 				description: description.trim() || undefined,
 				clipEntries: entries,
 				effectEntries,
-				verticalLayout,
 				format
 			});
 			lastSavedAt = Date.now();
@@ -177,7 +173,6 @@
 		void format;
 		void JSON.stringify(entries);
 		void JSON.stringify(effectEntries);
-		void JSON.stringify(verticalLayout);
 		if (initialized) scheduleSave();
 	});
 
@@ -334,6 +329,29 @@
 		else if (selectedIndex !== null && selectedIndex > index) selectedIndex--;
 	}
 
+	function splitAtPlayhead() {
+		const t = compositionTime;
+		const cl = clipLayout.find((c) => t > c.startOffset && t < c.startOffset + c.effectiveDuration);
+		if (!cl || !cl.clip) return;
+		const entry = cl.entry;
+		const speed = entry.speed || 1;
+		// Convert timeline offset at split point to source-time offset
+		const sourceOffset = (t - cl.startOffset) * speed;
+		const rawDur = cl.clip.endTime - cl.clip.startTime;
+		const first: ClipEntry = {
+			...entry,
+			trimEnd: rawDur - (entry.trimStart || 0) - sourceOffset
+		};
+		const second: ClipEntry = {
+			...entry,
+			trimStart: (entry.trimStart || 0) + sourceOffset,
+			transition: undefined,
+			transitionDuration: undefined
+		};
+		entries = [...entries.slice(0, cl.index), first, second, ...entries.slice(cl.index + 1)];
+		selectedIndex = cl.index;
+	}
+
 	// --- Clip picker ---
 	let showClipPicker = $state(false);
 	let pickerFilter = $state('');
@@ -413,16 +431,55 @@
 		selectedEffectId = id;
 	}
 
-	function addZoomEffect() {
+	function addViewEffect(preset?: 'full' | 'top-bottom' | 'pip') {
+		const dur = totalDuration || 10;
+		if (preset === 'top-bottom') {
+			// Create two views: top (full frame) and bottom (camera)
+			const topId = nanoid(12);
+			const botId = nanoid(12);
+			const topEntry: EffectEntry = {
+				id: topId, type: 'view', startTime: 0, duration: dur, x: 0, y: 0,
+				viewSourceType: 'full',
+				viewDestX: 0, viewDestY: 0, viewDestW: 1, viewDestH: 0.64, viewZOrder: 0,
+			};
+			const botEntry: EffectEntry = {
+				id: botId, type: 'view', startTime: 0, duration: dur, x: 0, y: 0,
+				viewSourceType: 'camera',
+				viewDestX: 0, viewDestY: 0.64, viewDestW: 1, viewDestH: 0.36, viewZOrder: 0,
+			};
+			effectEntries = [...effectEntries, topEntry, botEntry];
+			selectedEffectId = topId;
+			return;
+		}
+		if (preset === 'pip') {
+			// Create two views: full-frame background + small camera PiP
+			const bgId = nanoid(12);
+			const pipId = nanoid(12);
+			const bgEntry: EffectEntry = {
+				id: bgId, type: 'view', startTime: 0, duration: dur, x: 0, y: 0,
+				viewSourceType: 'full',
+				viewDestX: 0, viewDestY: 0, viewDestW: 1, viewDestH: 1, viewZOrder: 0,
+			};
+			const pipEntry: EffectEntry = {
+				id: pipId, type: 'view', startTime: 0, duration: dur, x: 0, y: 0,
+				viewSourceType: 'camera',
+				viewDestX: 0.72, viewDestY: 0.72, viewDestW: 0.26, viewDestH: 0.26, viewZOrder: 1,
+			};
+			effectEntries = [...effectEntries, bgEntry, pipEntry];
+			selectedEffectId = bgId;
+			return;
+		}
+		// Default: single view, full frame source, full canvas dest
 		const id = nanoid(12);
 		const entry: EffectEntry = {
 			id,
-			type: 'zoom',
+			type: 'view',
 			startTime: compositionTime,
-			duration: 3,
+			duration: dur,
 			x: 0, y: 0,
-			zoomStartX: 0, zoomStartY: 0, zoomStartW: 1,
-			zoomEndX: 0.25, zoomEndY: 0.25, zoomEndW: 0.5
+			viewSourceType: 'full',
+			viewDestX: 0, viewDestY: 0, viewDestW: 1, viewDestH: 1,
+			viewZOrder: 0,
 		};
 		effectEntries = [...effectEntries, entry];
 		selectedEffectId = id;
@@ -1351,9 +1408,10 @@
 		};
 	});
 
-	// --- Vertical preview: resolve camera bounds for current clip ---
+	// --- Resolve camera bounds for current clip (needed by view effects with camera source) ---
 	$effect(() => {
-		if (format !== 'mobile_short') { currentCamBounds = null; return; }
+		const hasCameraView = effectEntries.some((e) => e.type === 'view' && e.viewSourceType === 'camera');
+		if (!hasCameraView && format !== 'mobile_short') { currentCamBounds = null; return; }
 		const clip = currentClipRegion;
 		if (!clip) return;
 		const stream = streamMap.get(clip.streamId);
@@ -1377,7 +1435,7 @@
 		ctx.drawImage(video, cropX, cropY, cropW, cropH, dstX, dstY, dstW, dstH);
 	}
 
-	function drawVerticalFrame() {
+	function drawViewFrame() {
 		const canvas = verticalCanvasEl;
 		const video = previewVideoEl;
 		if (!canvas || !video || !video.videoWidth || !video.videoHeight) return;
@@ -1388,83 +1446,55 @@
 		const vh = video.videoHeight;
 		const cw = VERT_CANVAS_W;
 		const ch = VERT_CANVAS_H;
-		const scaleX = cw / VERT_OUT_W;
-		const scaleY = ch / VERT_OUT_H;
 
-		ctx.clearRect(0, 0, cw, ch);
+		ctx.fillStyle = '#000';
+		ctx.fillRect(0, 0, cw, ch);
 
-		const layout = verticalLayout ?? { top: { type: 'full' as const }, bottom: { type: 'camera' as const } };
-		const bottomSlot = layout.bottom;
-		const topSlot = layout.top;
+		const t = compositionTime;
+		// Get active view effects at current time, sorted by z-order
+		const activeViews = effectEntries
+			.filter((e) => e.type === 'view' && t >= e.startTime && t < e.startTime + e.duration)
+			.sort((a, b) => (a.viewZOrder ?? 0) - (b.viewZOrder ?? 0));
 
-		// Compute bottom slot height (mirroring verticalExporter logic)
-		let bottomH: number;
-		if (bottomSlot.type === 'camera' && currentCamBounds) {
-			const camPxW = currentCamBounds.camW * vw;
-			const camPxH = currentCamBounds.camH * vh;
-			const botAR = camPxW / Math.max(1, camPxH);
-			bottomH = Math.round(VERT_OUT_W / botAR);
-			bottomH = Math.min(bottomH, VERT_MAX_CAM_H) & ~1;
-		} else if (bottomSlot.type === 'custom' && bottomSlot.cropW && bottomSlot.cropH) {
-			const cropPxW = bottomSlot.cropW * vw;
-			const cropPxH = bottomSlot.cropH * vh;
-			const botAR = cropPxW / Math.max(1, cropPxH);
-			bottomH = Math.round(VERT_OUT_W / botAR);
-			bottomH = Math.min(bottomH, VERT_MAX_CAM_H) & ~1;
-		} else {
-			// full frame or missing camera
-			const botAR = vw / Math.max(1, vh);
-			bottomH = Math.round(VERT_OUT_W / botAR);
-			bottomH = Math.min(bottomH, VERT_MAX_CAM_H) & ~1;
-		}
-		const topH = (VERT_OUT_H - bottomH) & ~1;
-
-		// Draw top slot
-		const topDstH = Math.round(topH * scaleY);
-		const topDstW = cw;
-		if (topSlot.type === 'camera' && currentCamBounds) {
-			verticalCoverDraw(ctx, video,
-				currentCamBounds.camX * vw, currentCamBounds.camY * vh,
-				currentCamBounds.camW * vw, currentCamBounds.camH * vh,
-				0, 0, topDstW, topDstH
-			);
-		} else if (topSlot.type === 'custom') {
-			verticalCoverDraw(ctx, video,
-				(topSlot.cropX ?? 0) * vw, (topSlot.cropY ?? 0) * vh,
-				(topSlot.cropW ?? 1) * vw, (topSlot.cropH ?? 1) * vh,
-				0, 0, topDstW, topDstH
-			);
-		} else {
-			// full frame
-			verticalCoverDraw(ctx, video, 0, 0, vw, vh, 0, 0, topDstW, topDstH);
+		if (activeViews.length === 0) {
+			// No views — draw the full source frame (passthrough)
+			verticalCoverDraw(ctx, video, 0, 0, vw, vh, 0, 0, cw, ch);
+			return;
 		}
 
-		// Draw bottom slot
-		const bottomDstH = Math.round(bottomH * scaleY);
-		const bottomDstY = topDstH;
-		if (bottomSlot.type === 'camera' && currentCamBounds) {
-			verticalCoverDraw(ctx, video,
-				currentCamBounds.camX * vw, currentCamBounds.camY * vh,
-				currentCamBounds.camW * vw, currentCamBounds.camH * vh,
-				0, bottomDstY, cw, bottomDstH
-			);
-		} else if (bottomSlot.type === 'custom') {
-			verticalCoverDraw(ctx, video,
-				(bottomSlot.cropX ?? 0) * vw, (bottomSlot.cropY ?? 0) * vh,
-				(bottomSlot.cropW ?? 1) * vw, (bottomSlot.cropH ?? 1) * vh,
-				0, bottomDstY, cw, bottomDstH
-			);
-		} else {
-			verticalCoverDraw(ctx, video, 0, 0, vw, vh, 0, bottomDstY, cw, bottomDstH);
-		}
+		for (const view of activeViews) {
+			const progress = Math.max(0, Math.min(1, (t - view.startTime) / Math.max(0.001, view.duration)));
 
-		// Separator line
-		ctx.fillStyle = '#111';
-		ctx.fillRect(0, topDstH - 1, cw, 2);
+			// Resolve source region
+			let srcX: number, srcY: number, srcW: number, srcH: number;
+			if (view.viewSourceType === 'camera' && currentCamBounds) {
+				srcX = currentCamBounds.camX * vw;
+				srcY = currentCamBounds.camY * vh;
+				srcW = currentCamBounds.camW * vw;
+				srcH = currentCamBounds.camH * vh;
+			} else if (view.viewSourceType === 'full') {
+				srcX = 0; srcY = 0; srcW = vw; srcH = vh;
+			} else {
+				// Custom/animated source
+				const sx = (view.viewSourceStartX ?? 0) + ((view.viewSourceEndX ?? view.viewSourceStartX ?? 0) - (view.viewSourceStartX ?? 0)) * progress;
+				const sy = (view.viewSourceStartY ?? 0) + ((view.viewSourceEndY ?? view.viewSourceStartY ?? 0) - (view.viewSourceStartY ?? 0)) * progress;
+				const sw = (view.viewSourceStartW ?? 1) + ((view.viewSourceEndW ?? view.viewSourceStartW ?? 1) - (view.viewSourceStartW ?? 1)) * progress;
+				const sh = (view.viewSourceStartH ?? 1) + ((view.viewSourceEndH ?? view.viewSourceStartH ?? 1) - (view.viewSourceStartH ?? 1)) * progress;
+				srcX = sx * vw; srcY = sy * vh; srcW = sw * vw; srcH = sh * vh;
+			}
+
+			// Resolve dest rect (scaled to canvas)
+			const dstX = (view.viewDestX ?? 0) * cw;
+			const dstY = (view.viewDestY ?? 0) * ch;
+			const dstW = (view.viewDestW ?? 1) * cw;
+			const dstH = (view.viewDestH ?? 1) * ch;
+
+			verticalCoverDraw(ctx, video, srcX, srcY, srcW, srcH, dstX, dstY, dstW, dstH);
+		}
 	}
 
 	function verticalRenderLoop() {
-		drawVerticalFrame();
+		drawViewFrame();
 		verticalRafId = requestAnimationFrame(verticalRenderLoop);
 	}
 
@@ -1703,6 +1733,9 @@
 			selectedEffectId = null;
 			showClipPicker = false;
 			addingEffect = false;
+		} else if ((e.key === 's' || e.key === 'S') && !e.repeat) {
+			e.preventDefault();
+			splitAtPlayhead();
 		} else if (e.key === 'ArrowUp') {
 			e.preventDefault();
 			setPreviewRate(previewPlaybackRate + 0.25);
@@ -1800,18 +1833,20 @@
 										{/if}
 									</div>
 								</div>
-							{:else if entry.type === 'zoom'}
+							{:else if entry.type === 'view' && !entry.viewSourceType}
 								{@const progress = Math.max(0, Math.min(1, (compositionTime - entry.startTime) / Math.max(0.001, entry.duration)))}
-								{@const sx = entry.zoomStartX ?? 0}
-								{@const sy = entry.zoomStartY ?? 0}
-								{@const sw = entry.zoomStartW ?? 1}
-								{@const ex = entry.zoomEndX ?? 0}
-								{@const ey = entry.zoomEndY ?? 0}
-								{@const ew = entry.zoomEndW ?? 1}
+								{@const sx = entry.viewSourceStartX ?? 0}
+								{@const sy = entry.viewSourceStartY ?? 0}
+								{@const sw = entry.viewSourceStartW ?? 1}
+								{@const sh = entry.viewSourceStartH ?? 1}
+								{@const ex = entry.viewSourceEndX ?? sx}
+								{@const ey = entry.viewSourceEndY ?? sy}
+								{@const ew = entry.viewSourceEndW ?? sw}
+								{@const eh = entry.viewSourceEndH ?? sh}
 								{@const cx = sx + (ex - sx) * progress}
 								{@const cy = sy + (ey - sy) * progress}
 								{@const cw = sw + (ew - sw) * progress}
-								{@const ch = cw}
+								{@const ch2 = sh + (eh - sh) * progress}
 								<!-- svelte-ignore a11y_no_static_element_interactions -->
 								<div
 									class="zoom-overlay"
@@ -1819,10 +1854,10 @@
 									onclick={() => selectedEffectId = entry.id}
 								>
 									<div class="zoom-dim zoom-dim-top" style="height: {cy * 100}%"></div>
-									<div class="zoom-dim zoom-dim-bottom" style="height: {Math.max(0, (1 - cy - ch)) * 100}%"></div>
-									<div class="zoom-dim zoom-dim-left" style="top: {cy * 100}%; height: {ch * 100}%; width: {cx * 100}%"></div>
-									<div class="zoom-dim zoom-dim-right" style="top: {cy * 100}%; height: {ch * 100}%; width: {Math.max(0, (1 - cx - cw)) * 100}%"></div>
-									<div class="zoom-region" style="left: {cx * 100}%; top: {cy * 100}%; width: {cw * 100}%; height: {ch * 100}%"></div>
+									<div class="zoom-dim zoom-dim-bottom" style="height: {Math.max(0, (1 - cy - ch2)) * 100}%"></div>
+									<div class="zoom-dim zoom-dim-left" style="top: {cy * 100}%; height: {ch2 * 100}%; width: {cx * 100}%"></div>
+									<div class="zoom-dim zoom-dim-right" style="top: {cy * 100}%; height: {ch2 * 100}%; width: {Math.max(0, (1 - cx - cw)) * 100}%"></div>
+									<div class="zoom-region" style="left: {cx * 100}%; top: {cy * 100}%; width: {cw * 100}%; height: {ch2 * 100}%"></div>
 								</div>
 							{:else if entry.type === 'image'}
 								<!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -1894,7 +1929,7 @@
 					{#if selEffect}
 						{@const msg = selEffect.twitchId ? chatMessageCache.get(selEffect.twitchId) : undefined}
 						{@const isChatPanel = selEffect.type === 'twitch-chat'}
-						{@const isZoom = selEffect.type === 'zoom'}
+						{@const isView = selEffect.type === 'view'}
 						{@const isSubtitle = selEffect.type === 'subtitle'}
 						{@const isImage = selEffect.type === 'image'}
 						{@const isAudio = selEffect.type === 'audio'}
@@ -1906,7 +1941,7 @@
 						<div class="props-info">
 							<div class="props-row">
 								<span class="props-label">Type</span>
-								<span class="props-value">{isZoom ? 'Zoom & Pan' : isChatPanel ? 'Chat Panel' : isSubtitle ? 'Subtitle' : isImage ? 'Image' : isAudio ? 'Audio' : 'Chat Message'}</span>
+								<span class="props-value">{isView ? 'View' : isChatPanel ? 'Chat Panel' : isSubtitle ? 'Subtitle' : isImage ? 'Image' : isAudio ? 'Audio' : 'Chat Message'}</span>
 							</div>
 							{#if selEffect.type === 'chat-message'}
 								<div class="props-row">
@@ -1950,7 +1985,7 @@
 									onchange={(e) => updateEffectEntry(selEffect.id, { duration: +(e.target as HTMLInputElement).value })}
 								/>
 							</div>
-							{#if !isZoom && !isAudio}
+							{#if !isView && !isAudio}
 							<div class="prop-field">
 								<label class="prop-label">X Position (0-1)</label>
 								<input
@@ -1976,53 +2011,131 @@
 								/>
 							</div>
 							{/if}
-							{#if isZoom}
+							{#if isView}
 								<div class="prop-field">
-									<label class="prop-label" style="font-weight:600;color:#fbbf24">Start Region</label>
+									<label class="prop-label">Source Type</label>
+									<select class="prop-input"
+										value={selEffect.viewSourceType ?? 'custom'}
+										onchange={(e) => {
+											const val = (e.target as HTMLSelectElement).value;
+											if (val === 'custom') updateEffectEntry(selEffect.id, { viewSourceType: undefined });
+											else updateEffectEntry(selEffect.id, { viewSourceType: val as 'full' | 'camera' });
+										}}
+									>
+										<option value="custom">Custom</option>
+										<option value="full">Full Frame</option>
+										<option value="camera">Camera</option>
+									</select>
+								</div>
+								{#if !selEffect.viewSourceType}
+									<div class="prop-field">
+										<label class="prop-label" style="font-weight:600;color:#63b3ed">Source Start</label>
+									</div>
+									<div class="prop-field">
+										<label class="prop-label">X</label>
+										<input type="number" class="prop-input" min="0" max="1" step="0.01"
+											value={selEffect.viewSourceStartX ?? 0}
+											onchange={(e) => updateEffectEntry(selEffect.id, { viewSourceStartX: +(e.target as HTMLInputElement).value })}
+										/>
+									</div>
+									<div class="prop-field">
+										<label class="prop-label">Y</label>
+										<input type="number" class="prop-input" min="0" max="1" step="0.01"
+											value={selEffect.viewSourceStartY ?? 0}
+											onchange={(e) => updateEffectEntry(selEffect.id, { viewSourceStartY: +(e.target as HTMLInputElement).value })}
+										/>
+									</div>
+									<div class="prop-field">
+										<label class="prop-label">W</label>
+										<input type="number" class="prop-input" min="0.05" max="1" step="0.01"
+											value={selEffect.viewSourceStartW ?? 1}
+											onchange={(e) => updateEffectEntry(selEffect.id, { viewSourceStartW: +(e.target as HTMLInputElement).value })}
+										/>
+									</div>
+									<div class="prop-field">
+										<label class="prop-label">H</label>
+										<input type="number" class="prop-input" min="0.05" max="1" step="0.01"
+											value={selEffect.viewSourceStartH ?? 1}
+											onchange={(e) => updateEffectEntry(selEffect.id, { viewSourceStartH: +(e.target as HTMLInputElement).value })}
+										/>
+									</div>
+									<div class="prop-field">
+										<label class="prop-label" style="font-weight:600;color:#63b3ed;margin-top:4px">Source End</label>
+									</div>
+									<div class="prop-field">
+										<label class="prop-label">X</label>
+										<input type="number" class="prop-input" min="0" max="1" step="0.01"
+											value={selEffect.viewSourceEndX ?? 0}
+											onchange={(e) => updateEffectEntry(selEffect.id, { viewSourceEndX: +(e.target as HTMLInputElement).value })}
+										/>
+									</div>
+									<div class="prop-field">
+										<label class="prop-label">Y</label>
+										<input type="number" class="prop-input" min="0" max="1" step="0.01"
+											value={selEffect.viewSourceEndY ?? 0}
+											onchange={(e) => updateEffectEntry(selEffect.id, { viewSourceEndY: +(e.target as HTMLInputElement).value })}
+										/>
+									</div>
+									<div class="prop-field">
+										<label class="prop-label">W</label>
+										<input type="number" class="prop-input" min="0.05" max="1" step="0.01"
+											value={selEffect.viewSourceEndW ?? 1}
+											onchange={(e) => updateEffectEntry(selEffect.id, { viewSourceEndW: +(e.target as HTMLInputElement).value })}
+										/>
+									</div>
+									<div class="prop-field">
+										<label class="prop-label">H</label>
+										<input type="number" class="prop-input" min="0.05" max="1" step="0.01"
+											value={selEffect.viewSourceEndH ?? 1}
+											onchange={(e) => updateEffectEntry(selEffect.id, { viewSourceEndH: +(e.target as HTMLInputElement).value })}
+										/>
+									</div>
+								{/if}
+								<div class="prop-field">
+									<label class="prop-label" style="font-weight:600;color:#63b3ed;margin-top:4px">Destination</label>
 								</div>
 								<div class="prop-field">
 									<label class="prop-label">X</label>
 									<input type="number" class="prop-input" min="0" max="1" step="0.01"
-										value={selEffect.zoomStartX ?? 0}
-										onchange={(e) => updateEffectEntry(selEffect.id, { zoomStartX: +(e.target as HTMLInputElement).value })}
+										value={selEffect.viewDestX ?? 0}
+										onchange={(e) => updateEffectEntry(selEffect.id, { viewDestX: +(e.target as HTMLInputElement).value })}
 									/>
 								</div>
 								<div class="prop-field">
 									<label class="prop-label">Y</label>
 									<input type="number" class="prop-input" min="0" max="1" step="0.01"
-										value={selEffect.zoomStartY ?? 0}
-										onchange={(e) => updateEffectEntry(selEffect.id, { zoomStartY: +(e.target as HTMLInputElement).value })}
+										value={selEffect.viewDestY ?? 0}
+										onchange={(e) => updateEffectEntry(selEffect.id, { viewDestY: +(e.target as HTMLInputElement).value })}
 									/>
 								</div>
 								<div class="prop-field">
-									<label class="prop-label">Width</label>
+									<label class="prop-label">W</label>
 									<input type="number" class="prop-input" min="0.05" max="1" step="0.01"
-										value={selEffect.zoomStartW ?? 1}
-										onchange={(e) => updateEffectEntry(selEffect.id, { zoomStartW: +(e.target as HTMLInputElement).value })}
+										value={selEffect.viewDestW ?? 1}
+										onchange={(e) => updateEffectEntry(selEffect.id, { viewDestW: +(e.target as HTMLInputElement).value })}
 									/>
 								</div>
 								<div class="prop-field">
-									<label class="prop-label" style="font-weight:600;color:#fbbf24;margin-top:4px">End Region</label>
-								</div>
-								<div class="prop-field">
-									<label class="prop-label">X</label>
-									<input type="number" class="prop-input" min="0" max="1" step="0.01"
-										value={selEffect.zoomEndX ?? 0}
-										onchange={(e) => updateEffectEntry(selEffect.id, { zoomEndX: +(e.target as HTMLInputElement).value })}
-									/>
-								</div>
-								<div class="prop-field">
-									<label class="prop-label">Y</label>
-									<input type="number" class="prop-input" min="0" max="1" step="0.01"
-										value={selEffect.zoomEndY ?? 0}
-										onchange={(e) => updateEffectEntry(selEffect.id, { zoomEndY: +(e.target as HTMLInputElement).value })}
-									/>
-								</div>
-								<div class="prop-field">
-									<label class="prop-label">Width</label>
+									<label class="prop-label">H</label>
 									<input type="number" class="prop-input" min="0.05" max="1" step="0.01"
-										value={selEffect.zoomEndW ?? 1}
-										onchange={(e) => updateEffectEntry(selEffect.id, { zoomEndW: +(e.target as HTMLInputElement).value })}
+										value={selEffect.viewDestH ?? 1}
+										onchange={(e) => updateEffectEntry(selEffect.id, { viewDestH: +(e.target as HTMLInputElement).value })}
+									/>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Dest Presets</label>
+									<div style="display:flex;gap:3px;flex-wrap:wrap">
+										<button class="btn-tl btn-tl-sm" onclick={() => updateEffectEntry(selEffect.id, { viewDestX: 0, viewDestY: 0, viewDestW: 1, viewDestH: 1 })}>Full</button>
+										<button class="btn-tl btn-tl-sm" onclick={() => updateEffectEntry(selEffect.id, { viewDestX: 0, viewDestY: 0, viewDestW: 1, viewDestH: 0.64 })}>Top</button>
+										<button class="btn-tl btn-tl-sm" onclick={() => updateEffectEntry(selEffect.id, { viewDestX: 0, viewDestY: 0.64, viewDestW: 1, viewDestH: 0.36 })}>Bottom</button>
+										<button class="btn-tl btn-tl-sm" onclick={() => updateEffectEntry(selEffect.id, { viewDestX: 0.72, viewDestY: 0.72, viewDestW: 0.26, viewDestH: 0.26 })}>PiP</button>
+									</div>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Z-Order</label>
+									<input type="number" class="prop-input" min="0" step="1"
+										value={selEffect.viewZOrder ?? 0}
+										onchange={(e) => updateEffectEntry(selEffect.id, { viewZOrder: +(e.target as HTMLInputElement).value })}
 									/>
 								</div>
 							{:else if isChatPanel}
@@ -2263,7 +2376,7 @@
 							{/if}
 						</div>
 
-						{#if !isZoom && !isAudio}
+						{#if !isAudio}
 						<div class="props-section">
 							<div class="prop-field" style="margin-top: 4px">
 								<label class="prop-label" style="font-weight:600;color:#94a3b8">Animation</label>
@@ -2349,7 +2462,6 @@
 						</div>
 						{/if}
 
-						{#if !isZoom}
 						<div class="props-section">
 							<div class="prop-field" style="margin-top: 4px">
 								<label class="prop-label" style="font-weight:600;color:#94a3b8">Shadow</label>
@@ -2443,22 +2555,7 @@
 							{/if}
 						</div>
 
-						<div class="props-section">
-							<div class="prop-field">
-								<label class="prop-label">
-									<input
-										type="checkbox"
-										checked={!!selEffect.ignoreZoom}
-										onchange={() => updateEffectEntry(selEffect.id, { ignoreZoom: !selEffect.ignoreZoom })}
-									/>
-									Ignore Zoom
-								</label>
-								<span style="font-size: 0.55rem; color: #64748b; display: block; margin-top: 2px">Stay fixed in screen space during zoom effects</span>
-							</div>
-						</div>
-						{/if}
-
-						{#if !isChatPanel && !isZoom && !isSubtitle && !isImage && msg}
+						{#if !isChatPanel && !isView && !isSubtitle && !isImage && msg}
 							<div class="props-section">
 								<label class="prop-label">Message Preview</label>
 								<div class="effect-msg-preview">
@@ -2555,28 +2652,12 @@
 						</div>
 						{#if format === 'mobile_short'}
 							<div class="prop-field">
-								<label class="prop-label" for="v-slot-top">Top Slot</label>
-								<select id="v-slot-top" class="prop-select" value={verticalLayout?.top.type ?? 'full'}
-									onchange={(e) => {
-										const val = (e.target as HTMLSelectElement).value as 'full' | 'camera' | 'custom';
-										verticalLayout = { top: { type: val }, bottom: verticalLayout?.bottom ?? { type: 'camera' } };
-									}}>
-									<option value="full">Full Frame</option>
-									<option value="camera">Camera</option>
-									<option value="custom">Custom Region</option>
-								</select>
-							</div>
-							<div class="prop-field">
-								<label class="prop-label" for="v-slot-bot">Bottom Slot</label>
-								<select id="v-slot-bot" class="prop-select" value={verticalLayout?.bottom.type ?? 'camera'}
-									onchange={(e) => {
-										const val = (e.target as HTMLSelectElement).value as 'full' | 'camera' | 'custom';
-										verticalLayout = { top: verticalLayout?.top ?? { type: 'full' }, bottom: { type: val } };
-									}}>
-									<option value="full">Full Frame</option>
-									<option value="camera">Camera</option>
-									<option value="custom">Custom Region</option>
-								</select>
+								<label class="prop-label">Layout Presets</label>
+								<div style="display:flex;gap:4px;flex-wrap:wrap">
+									<button class="btn-tl btn-tl-sm" onclick={() => addViewEffect('top-bottom')} title="Gameplay top, camera bottom">Top/Bottom</button>
+									<button class="btn-tl btn-tl-sm" onclick={() => addViewEffect('pip')} title="Full frame + camera PiP">PiP</button>
+									<button class="btn-tl btn-tl-sm" onclick={() => addViewEffect('full')} title="Single full-frame view">Full</button>
+								</div>
 							</div>
 						{/if}
 					</div>
@@ -2675,8 +2756,8 @@
 					<button class="btn-tl btn-tl-sm btn-fx-chat" onclick={addTwitchChatEffect} title="Add scrolling chat panel effect">
 						+ Chat Panel
 					</button>
-					<button class="btn-tl btn-tl-sm btn-fx-zoom" onclick={addZoomEffect} title="Add zoom & pan effect">
-						+ Zoom & Pan
+					<button class="btn-tl btn-tl-sm btn-fx-zoom" onclick={() => addViewEffect()} title="Add view effect">
+						+ View
 					</button>
 					<button class="btn-tl btn-tl-sm btn-fx-subtitle" onclick={addSubtitleEffect} title="Add subtitle text overlay">
 						+ Subtitle
@@ -2788,7 +2869,7 @@
 												class="effect-block"
 												class:selected={isSelected}
 												class:effect-chat-panel={isChatPanel}
-												class:effect-zoom={entry.type === 'zoom'}
+												class:effect-view={entry.type === 'view'}
 												class:effect-subtitle={entry.type === 'subtitle'}
 												class:effect-image={entry.type === 'image'}
 												class:effect-audio={entry.type === 'audio'}
@@ -2799,8 +2880,8 @@
 												<!-- svelte-ignore a11y_no_static_element_interactions -->
 												<div class="trim-handle trim-handle-start" onmousedown={(e) => handleEffectTrimStart(e, entry.id)}></div>
 												<span class="clip-label" style="font-size: 0.55rem">
-													{#if entry.type === 'zoom'}
-														Zoom & Pan
+													{#if entry.type === 'view'}
+														View{entry.viewSourceType ? ` (${entry.viewSourceType})` : ''}
 													{:else if isChatPanel}
 														Chat Panel
 													{:else if entry.type === 'subtitle'}
@@ -3889,9 +3970,9 @@
 		color: #6ee7b7;
 	}
 
-	.effect-zoom {
-		background: rgba(251, 191, 36, 0.3);
-		border-color: rgba(251, 191, 36, 0.4);
+	.effect-view {
+		background: rgba(99, 179, 237, 0.3);
+		border-color: rgba(99, 179, 237, 0.4);
 	}
 
 	.effect-subtitle {

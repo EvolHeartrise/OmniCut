@@ -71,9 +71,9 @@ export async function exportVideo(
 			const clipCompStart = compOffsets?.[i] ?? 0;
 			const clipCompEnd = clipCompStart + clipDur;
 
-			// Resolve zoom effects first so we know if we need to supersample overlays
-			const clipZooms = resolveZoomEffects(effectEntries, clipCompStart, clipCompEnd, clipDur);
-			const hasZoom = clipZooms.length > 0;
+			// Resolve view effects
+			const clipViews = resolveViewEffects(effectEntries, clipCompStart, clipCompEnd, clipDur);
+			const hasViews = clipViews.length > 0;
 
 			const clipCtx: ClipContext | undefined = channelMap?.get(clips[i].streamId) ? {
 				streamId: clips[i].streamId,
@@ -82,55 +82,39 @@ export async function exportVideo(
 				streamLocalEnd: clipLocalEnd
 			} : undefined;
 
-			// Split effects into pre-zoom (affected by zoom) and post-zoom (ignoreZoom).
-			// When no zoom is present, all effects go through the normal (pre-zoom) path.
-			const preZoomEntries = hasZoom
-				? (effectEntries ?? []).filter(e => !e.ignoreZoom)
-				: effectEntries;
-			const postZoomEntries = hasZoom
-				? (effectEntries ?? []).filter(e => e.type !== 'zoom' && e.ignoreZoom)
-				: [];
-
-			const preZoomEffects = await resolveOverlappingEffects(
-				preZoomEntries, clipCompStart, clipCompEnd, clipDur, tempDir, i,
-				srcW, srcH, clipCtx,
-				hasZoom ? ZOOM_SUPERSAMPLE : 1
+			// All overlay effects are composited after views — no pre/post-zoom split
+			const overlayEffects = await resolveOverlappingEffects(
+				effectEntries, clipCompStart, clipCompEnd, clipDur, tempDir, i,
+				srcW, srcH, clipCtx
 			);
-			const postZoomEffects = postZoomEntries.length > 0 ? await resolveOverlappingEffects(
-				postZoomEntries, clipCompStart, clipCompEnd, clipDur, tempDir, i,
-				srcW, srcH, clipCtx, 1, 'pz_'
-			) : [];
 
-			// Combine for FFmpeg input ordering: pre-zoom first, then post-zoom
-			const allEffects = [...preZoomEffects, ...postZoomEffects];
+			const allEffects = overlayEffects;
 
 			// Resolve audio overlays for this clip
 			const audioOverlays = resolveAudioOverlays(effectEntries, clipCompStart, clipCompEnd);
 
 			const audioArgs = buildAudioArgs(speed);
 
-			// Build ffmpeg args — use filter_complex when effects or zooms present
+			// Build ffmpeg args — use filter_complex when effects or views present
 			const extraInputs: string[] = [];
 			let videoFilterArgs: string[];
 			const hasOverlays = allEffects.length > 0;
 			let pipeEffect: ResolvedEffect | null = null;
 
-			if (hasOverlays || hasZoom) {
+			if (hasOverlays || hasViews) {
 				if (allEffects.length > 0) {
-					console.log(`[export] Clip ${i}: ${preZoomEffects.length} pre-zoom + ${postZoomEffects.length} post-zoom overlay(s), ss=${trimStart.toFixed(3)} t=${dur.toFixed(3)} speed=${speed}`);
+					console.log(`[export] Clip ${i}: ${allEffects.length} overlay(s), ${clipViews.length} views, ss=${trimStart.toFixed(3)} t=${dur.toFixed(3)} speed=${speed}`);
 					for (const eff of allEffects) {
-						console.log(`[export]   overlay: pos=(${eff.x},${eff.y}) local=[${eff.localStart.toFixed(3)},${eff.localEnd.toFixed(3)}] raw=${!!eff.rawVideo} piped=${!!eff.deferredRender} ignoreZoom=${!!eff.ignoreZoom}`);
+						console.log(`[export]   overlay: pos=(${eff.x},${eff.y}) local=[${eff.localStart.toFixed(3)},${eff.localEnd.toFixed(3)}] raw=${!!eff.rawVideo} piped=${!!eff.deferredRender}`);
 					}
 				}
 
 				// Pick at most ONE deferred-render effect to pipe via stdin.
-				// Any additional deferred effects must fall back to file-based rendering.
 				for (const eff of allEffects) {
 					if (eff.rawVideo && eff.deferredRender) {
 						if (!pipeEffect) {
 							pipeEffect = eff;
 						} else {
-							// Fallback: render to file
 							const rawPath = path.join(tempDir, `chatfx_fallback_${i}_${allEffects.indexOf(eff)}.rgba`);
 							const fd = fs.openSync(rawPath, 'w');
 							try {
@@ -156,7 +140,6 @@ export async function exportVideo(
 							'-i', eff.deferredRender ? 'pipe:0' : eff.videoPath!
 						);
 					} else if (eff.animation) {
-						// Animated overlay: loop the PNG as a 30fps video so fade filters work
 						extraInputs.push(
 							...itsoffset,
 							'-loop', '1', '-framerate', '30',
@@ -167,38 +150,36 @@ export async function exportVideo(
 					}
 				}
 
-				// When zoom effects are present, composite at supersample resolution.
-				// This way overlays (chat panels, text) are rendered at 2x and composited
-				// at 2x, so the zoompan filter has native-resolution pixels to crop from
-				// instead of bilinear-upscaling already-rasterized overlays.
-				const ss = hasZoom ? ZOOM_SUPERSAMPLE : 1;
-
 				const speedFilter = speed !== 1 ? `setpts=PTS/${speed},` : '';
-				const scaleUp = hasZoom ? `,scale=${srcW * ss}:${srcH * ss}` : '';
-				let filterGraph = `[0:v]${speedFilter}format=yuv420p${scaleUp}[base]`;
+				let filterGraph = `[0:v]${speedFilter}format=yuv420p[base]`;
 				let prevLabel = 'base';
 
-				// 1. Pre-zoom overlay chain (composited at ss resolution when zoom is present)
-				for (let ei = 0; ei < preZoomEffects.length; ei++) {
-					const eff = preZoomEffects[ei];
-					const inputIdx = ei + 1;  // offset by 1 for concat input [0]
-					const isLastBeforeZoom = ei === preZoomEffects.length - 1;
-					const nextLabel = isLastBeforeZoom && !hasZoom && postZoomEffects.length === 0 ? 'outv' : `v${ei}`;
+				// 1. View composition (replaces old zoom chain)
+				const viewFps = probe.fps > 0 ? probe.fps : 30;
+				if (hasViews) {
+					const viewFilter = buildViewFilter(
+						'base', 'viewed', clipViews, trimStart, srcW, srcH, srcW, srcH, viewFps
+					);
+					filterGraph += viewFilter;
+					prevLabel = 'viewed';
+				}
+
+				// 2. Overlay chain (all overlays composited after views, at output resolution)
+				for (let ei = 0; ei < allEffects.length; ei++) {
+					const eff = allEffects[ei];
+					const inputIdx = ei + 1;
+					const isLast = ei === allEffects.length - 1;
+					const nextLabel = isLast ? 'outv' : `v${ei}`;
 					const enableStart = (trimStart + eff.localStart).toFixed(3);
 					const enableEnd = (trimStart + eff.localEnd).toFixed(3);
 					const alphaFmt = 'format=yuva420p';
-					// Adjust overlay position for supersample resolution
-					const ox = eff.x * ss;
-					const oy = eff.y * ss;
+					const ox = eff.x;
+					const oy = eff.y;
 					let overlayInput: string;
 					const effScale = (eff.scale && eff.scale !== 1) ? eff.scale : 1;
-					// Raw video overlays (twitch-chat) are already rendered at ss via chatScaleBoost.
-					// Non-raw overlays (PNGs) need FFmpeg scaling to match the ss composite.
-					const pngSsScale = !eff.rawVideo && ss > 1 ? ss : 1;
-					const totalScale = effScale * pngSsScale;
-					if (totalScale !== 1) {
+					if (effScale !== 1) {
 						const scaledLabel = `s${ei}`;
-						filterGraph += `;[${inputIdx}:v]scale=iw*${totalScale}:ih*${totalScale},${alphaFmt}[${scaledLabel}]`;
+						filterGraph += `;[${inputIdx}:v]scale=iw*${effScale}:ih*${effScale},${alphaFmt}[${scaledLabel}]`;
 						overlayInput = scaledLabel;
 					} else {
 						const prepLabel = `p${ei}`;
@@ -206,13 +187,11 @@ export async function exportVideo(
 						overlayInput = prepLabel;
 					}
 
-					// Build overlay filter — use animated expressions for subtitle effects
 					if (eff.animation) {
-						const anim = eff.animation;
 						const overlayExpr = buildAnimatedOverlay(
 							overlayInput, prevLabel, nextLabel,
 							ox, oy, parseFloat(enableStart), parseFloat(enableEnd),
-							anim, ss
+							eff.animation, 1
 						);
 						filterGraph += overlayExpr;
 					} else {
@@ -221,58 +200,12 @@ export async function exportVideo(
 					prevLabel = nextLabel;
 				}
 
-				// 2. Zoom chain (after pre-zoom overlays — zooms the composited frame)
-				const zoomFps = probe.fps > 0 ? probe.fps : 30;
-				for (let zi = 0; zi < clipZooms.length; zi++) {
-					const isLast = zi === clipZooms.length - 1;
-					const nextLabel = isLast && postZoomEffects.length === 0 ? 'outv' : `zm${zi}`;
-					filterGraph += buildZoomFilter(prevLabel, nextLabel, clipZooms[zi], trimStart, srcW, srcH, zoomFps);
-					prevLabel = nextLabel;
+				// If nothing produced outv, rename
+				if (prevLabel === 'base' || prevLabel === 'viewed') {
+					filterGraph = filterGraph.replace(`[${prevLabel}]`, '[outv]');
 				}
 
-				// 3. Post-zoom overlay chain (ignoreZoom effects — at output resolution, no supersample)
-				for (let ei = 0; ei < postZoomEffects.length; ei++) {
-					const eff = postZoomEffects[ei];
-					const inputIdx = preZoomEffects.length + ei + 1;  // offset past pre-zoom inputs + concat
-					const isLast = ei === postZoomEffects.length - 1;
-					const nextLabel = isLast ? 'outv' : `pz${ei}`;
-					const enableStart = (trimStart + eff.localStart).toFixed(3);
-					const enableEnd = (trimStart + eff.localEnd).toFixed(3);
-					const alphaFmt = 'format=yuva420p';
-					// Post-zoom overlays at output resolution — no supersample scaling
-					const ox = eff.x;
-					const oy = eff.y;
-					let overlayInput: string;
-					const effScale = (eff.scale && eff.scale !== 1) ? eff.scale : 1;
-					if (effScale !== 1) {
-						const scaledLabel = `ps${ei}`;
-						filterGraph += `;[${inputIdx}:v]scale=iw*${effScale}:ih*${effScale},${alphaFmt}[${scaledLabel}]`;
-						overlayInput = scaledLabel;
-					} else {
-						const prepLabel = `pp${ei}`;
-						filterGraph += `;[${inputIdx}:v]${alphaFmt}[${prepLabel}]`;
-						overlayInput = prepLabel;
-					}
-
-					if (eff.animation) {
-						const overlayExpr = buildAnimatedOverlay(
-							overlayInput, prevLabel, nextLabel,
-							ox, oy, parseFloat(enableStart), parseFloat(enableEnd),
-							eff.animation, 1  // ss=1 for post-zoom
-						);
-						filterGraph += overlayExpr;
-					} else {
-						filterGraph += `;[${prevLabel}][${overlayInput}]overlay=${ox}:${oy}:enable='between(t,${enableStart},${enableEnd})'[${nextLabel}]`;
-					}
-					prevLabel = nextLabel;
-				}
-
-				// If no overlays and no zooms produced outv (shouldn't happen), rename
-				if (prevLabel === 'base') {
-					filterGraph = filterGraph.replace('[base]', '[outv]');
-				}
-
-				if (allEffects.length > 0) {
+				if (allEffects.length > 0 || hasViews) {
 					console.log(`[export]   filter_complex: ${filterGraph}`);
 				}
 
@@ -455,8 +388,6 @@ export interface ResolvedEffect {
 		width: number;   // rendered overlay width (for slide calculations)
 		height: number;  // rendered overlay height
 	};
-	/** When true, composited after zoom — stays fixed in screen space. */
-	ignoreZoom?: boolean;
 	/** Deferred frame renderer — streams raw RGBA to a pipe instead of reading from a file. */
 	deferredRender?: (sink: FrameSink) => Promise<void>;
 }
@@ -497,7 +428,6 @@ export async function resolveOverlappingEffects(
 	const results: ResolvedEffect[] = [];
 	for (let ei = 0; ei < sorted.length; ei++) {
 		const effect = sorted[ei];
-		if (effect.type === 'zoom') continue; // Zoom handled separately after all overlays
 		const effectEnd = effect.startTime + effect.duration;
 		// Check overlap
 		if (effect.startTime >= clipCompEnd || effectEnd <= clipCompStart) continue;
@@ -660,40 +590,40 @@ export async function resolveOverlappingEffects(
 				width: resolved.overlayWidth, height: resolved.overlayHeight };
 		}
 
-		if (effect.ignoreZoom) resolved.ignoreZoom = true;
-
 		results.push(resolved);
 	}
 	return results;
 }
 
-// --- Zoom effect helpers ---
+// --- View effect helpers ---
 
-export interface ResolvedZoom {
+export interface ResolvedView {
 	localStart: number;
 	localEnd: number;
-	startW: number; // visible width fraction (0-1, 1 = full frame = no zoom)
-	endW: number;
-	startX: number; // normalized 0-1
-	startY: number;
-	endX: number;
-	endY: number;
+	/** Source type: 'full', 'camera', or undefined for custom/animated */
+	sourceType?: 'full' | 'camera';
+	/** Animated source crop (normalized 0-1) */
+	srcStartX: number; srcStartY: number; srcStartW: number; srcStartH: number;
+	srcEndX: number; srcEndY: number; srcEndW: number; srcEndH: number;
+	/** Destination rect on output canvas (normalized 0-1) */
+	destX: number; destY: number; destW: number; destH: number;
+	/** Z-order for layering */
+	zOrder: number;
 }
 
 /**
- * Find zoom effects that overlap a clip's composition window.
- * Returns normalized zoom parameters for each zoom.
+ * Find view effects that overlap a clip's composition window.
  */
-export function resolveZoomEffects(
+export function resolveViewEffects(
 	effectEntries: EffectEntry[] | undefined,
 	clipCompStart: number,
 	clipCompEnd: number,
 	clipDur: number
-): ResolvedZoom[] {
+): ResolvedView[] {
 	if (!effectEntries) return [];
-	const results: ResolvedZoom[] = [];
+	const results: ResolvedView[] = [];
 	for (const effect of effectEntries) {
-		if (effect.type !== 'zoom') continue;
+		if (effect.type !== 'view') continue;
 		const effectEnd = effect.startTime + effect.duration;
 		if (effect.startTime >= clipCompEnd || effectEnd <= clipCompStart) continue;
 
@@ -701,55 +631,143 @@ export function resolveZoomEffects(
 		const localEnd = Math.min(clipDur, effectEnd - clipCompStart);
 		results.push({
 			localStart, localEnd,
-			startW: Math.max(0.1, effect.zoomStartW ?? 1),
-			endW: Math.max(0.1, effect.zoomEndW ?? 1),
-			startX: effect.zoomStartX ?? 0,
-			startY: effect.zoomStartY ?? 0,
-			endX: effect.zoomEndX ?? 0,
-			endY: effect.zoomEndY ?? 0,
+			sourceType: effect.viewSourceType,
+			srcStartX: effect.viewSourceStartX ?? 0,
+			srcStartY: effect.viewSourceStartY ?? 0,
+			srcStartW: effect.viewSourceStartW ?? 1,
+			srcStartH: effect.viewSourceStartH ?? 1,
+			srcEndX: effect.viewSourceEndX ?? effect.viewSourceStartX ?? 0,
+			srcEndY: effect.viewSourceEndY ?? effect.viewSourceStartY ?? 0,
+			srcEndW: effect.viewSourceEndW ?? effect.viewSourceStartW ?? 1,
+			srcEndH: effect.viewSourceEndH ?? effect.viewSourceStartH ?? 1,
+			destX: effect.viewDestX ?? 0,
+			destY: effect.viewDestY ?? 0,
+			destW: effect.viewDestW ?? 1,
+			destH: effect.viewDestH ?? 1,
+			zOrder: effect.viewZOrder ?? 0,
 		});
 	}
-	return results;
+	return results.sort((a, b) => a.zOrder - b.zOrder);
 }
 
 /**
- * Build an FFmpeg zoompan filter for an animated zoom.
- * Uses zoompan instead of crop+scale because crop locks output dimensions at init.
- * Scales input up by SUPERSAMPLE before zoompan so integer x/y rounding gives
- * sub-pixel precision, eliminating pan jitter.
+ * Build FFmpeg filter chain for view effects.
+ * Uses canvas composition: black background with views overlaid.
+ * Single full-canvas view: simplified to crop+scale (no canvas needed).
  */
-export const ZOOM_SUPERSAMPLE = 2;
-
-export function buildZoomFilter(
+export function buildViewFilter(
 	inputLabel: string,
 	outputLabel: string,
-	zoom: ResolvedZoom,
+	views: ResolvedView[],
 	trimStart: number,
-	videoW: number,
-	videoH: number,
-	fps: number
+	srcW: number,
+	srcH: number,
+	outW: number,
+	outH: number,
+	fps: number,
+	camBounds?: { camX: number; camY: number; camW: number; camH: number } | null
 ): string {
-	const T0 = (trimStart + zoom.localStart).toFixed(3);
-	const T1 = (trimStart + zoom.localEnd).toFixed(3);
-	const durExpr = `(${T1}-${T0}+0.001)`; // +epsilon avoids division by zero
+	if (views.length === 0) return '';
 
-	function lerp(start: number, end: number, fallback: string) {
-		const frac = `clip((in_time-${T0})/${durExpr},0,1)`;
-		return `if(between(in_time,${T0},${T1}),${start}+(${end - start})*${frac},${fallback})`;
+	// Optimization: single full-canvas view — skip canvas composition
+	if (views.length === 1) {
+		const v = views[0];
+		const isFullDest = v.destX === 0 && v.destY === 0 && v.destW === 1 && v.destH === 1;
+		if (isFullDest) {
+			return buildViewCropScale(inputLabel, outputLabel, v, trimStart, srcW, srcH, outW, outH, camBounds);
+		}
 	}
 
-	// Linearly interpolate the visible width fraction, then derive z = 1/w.
-	// This keeps zoom and pan visually in sync (both linear in screen space).
-	const wExpr = lerp(zoom.startW, zoom.endW, '1');
-	const zExpr = `1/(${wExpr})`;
-	const xExpr = lerp(zoom.startX, zoom.endX, '0');
-	const yExpr = lerp(zoom.startY, zoom.endY, '0');
+	// General case: canvas composition
+	let filter = '';
+	const canvasLabel = `vcanvas`;
+	filter += `;color=black:s=${outW}x${outH}:d=999:r=${fps}[${canvasLabel}]`;
+	let prevLabel = canvasLabel;
 
-	// Scale up by SUPERSAMPLE → zoompan in high-res space (sub-pixel precision) → output at original size
-	const ssW = videoW * ZOOM_SUPERSAMPLE;
-	const ssH = videoH * ZOOM_SUPERSAMPLE;
+	for (let vi = 0; vi < views.length; vi++) {
+		const v = views[vi];
+		const nextLabel = vi === views.length - 1 ? outputLabel : `vw${vi}`;
+		const T0 = (trimStart + v.localStart).toFixed(3);
+		const T1 = (trimStart + v.localEnd).toFixed(3);
 
-	return `;[${inputLabel}]scale=${ssW}:${ssH}:flags=bilinear,zoompan=z='${zExpr}':x='(${xExpr})*iw':y='(${yExpr})*ih':d=1:s=${videoW}x${videoH}:fps=${fps}[${outputLabel}]`;
+		const destPxW = Math.round(v.destW * outW);
+		const destPxH = Math.round(v.destH * outH);
+		const slotLabel = `vslot${vi}`;
+
+		// Build crop + cover-fit scale for this view's source
+		filter += buildViewCropScale(inputLabel, slotLabel, v, trimStart, srcW, srcH, destPxW, destPxH, camBounds);
+
+		const ox = Math.round(v.destX * outW);
+		const oy = Math.round(v.destY * outH);
+		filter += `;[${prevLabel}][${slotLabel}]overlay=${ox}:${oy}:enable='between(t,${T0},${T1})'[${nextLabel}]`;
+		prevLabel = nextLabel;
+	}
+
+	return filter;
+}
+
+/**
+ * Build a crop + cover-fit scale filter for a single view.
+ * Handles all source types: full, camera, and custom/animated.
+ * Produces output at exactly outW x outH with cover-fit (center-cropped).
+ */
+function buildViewCropScale(
+	inputLabel: string,
+	outputLabel: string,
+	view: ResolvedView,
+	trimStart: number,
+	srcW: number,
+	srcH: number,
+	outW: number,
+	outH: number,
+	camBounds?: { camX: number; camY: number; camW: number; camH: number } | null
+): string {
+	const coverFit = `scale=${outW}:${outH}:force_original_aspect_ratio=increase,crop=${outW}:${outH}`;
+
+	if (view.sourceType === 'camera' && camBounds) {
+		const cx = Math.round(camBounds.camX * srcW);
+		const cy = Math.round(camBounds.camY * srcH);
+		const cw = Math.round(camBounds.camW * srcW);
+		const ch = Math.round(camBounds.camH * srcH);
+		return `;[${inputLabel}]crop=${cw}:${ch}:${cx}:${cy},${coverFit}[${outputLabel}]`;
+	}
+
+	if (view.sourceType === 'full') {
+		return `;[${inputLabel}]${coverFit}[${outputLabel}]`;
+	}
+
+	// Custom/animated source crop — use animated crop expressions
+	const isStatic = view.srcStartW === view.srcEndW && view.srcStartH === view.srcEndH
+		&& view.srcStartX === view.srcEndX && view.srcStartY === view.srcEndY;
+
+	if (isStatic) {
+		// Static crop — simple integer crop
+		const cw = Math.max(2, Math.round(view.srcStartW * srcW));
+		const ch = Math.max(2, Math.round(view.srcStartH * srcH));
+		const cx = Math.round(view.srcStartX * srcW);
+		const cy = Math.round(view.srcStartY * srcH);
+		return `;[${inputLabel}]crop=${cw}:${ch}:${cx}:${cy},${coverFit}[${outputLabel}]`;
+	}
+
+	// Animated crop — use FFmpeg expressions with time-based interpolation
+	const T0 = (trimStart + view.localStart).toFixed(3);
+	const T1 = (trimStart + view.localEnd).toFixed(3);
+	const durExpr = `(${T1}-${T0}+0.001)`;
+
+	function lerp(start: number, end: number, dim: number, fallback: number) {
+		if (start === end) return `${Math.round(start * dim)}`;
+		const frac = `clip((t-${T0})/${durExpr},0,1)`;
+		const s = start * dim;
+		const e = end * dim;
+		return `if(between(t,${T0},${T1}),${s.toFixed(1)}+(${(e - s).toFixed(1)})*${frac},${(fallback * dim).toFixed(1)})`;
+	}
+
+	const wExpr = lerp(view.srcStartW, view.srcEndW, srcW, view.srcEndW);
+	const hExpr = lerp(view.srcStartH, view.srcEndH, srcH, view.srcEndH);
+	const xExpr = lerp(view.srcStartX, view.srcEndX, srcW, view.srcEndX);
+	const yExpr = lerp(view.srcStartY, view.srcEndY, srcH, view.srcEndY);
+
+	return `;[${inputLabel}]crop=w='${wExpr}':h='${hExpr}':x='${xExpr}':y='${yExpr}':exact=1,${coverFit}[${outputLabel}]`;
 }
 
 // --- Subtitle animation helpers ---

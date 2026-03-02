@@ -54,7 +54,10 @@ export function computeTickInterval(pixelsPerSecond: number, minPixelGap: number
 }
 
 /**
- * Handle Ctrl+Wheel zoom and Shift+Wheel horizontal pan on a scrollable timeline.
+ * Handle wheel events on the timeline:
+ *   - Plain wheel: zoom in/out (cursor-stable)
+ *   - Shift+Wheel: horizontal pan
+ *   - Ctrl+Wheel: pass through for vertical track scrolling
  * Returns the new pixelsPerSecond if a zoom occurred, or null if the event was a pan/noop.
  */
 export function handleTimelineWheel(
@@ -66,25 +69,28 @@ export function handleTimelineWheel(
 	maxPps: number,
 	setIgnoreScroll: () => void
 ): number | null {
-	if (e.ctrlKey) {
-		e.preventDefault();
-		if (!scrollAreaEl) return null;
-		const { newPps, scheduleScrollRestore } = applyTimelineZoom(
-			e,
-			scrollAreaEl,
-			pixelsPerSecond,
-			timelineStart,
-			minPps,
-			maxPps
-		);
-		scheduleScrollRestore(setIgnoreScroll);
-		return newPps;
-	} else if (e.shiftKey) {
+	if (e.shiftKey) {
 		e.preventDefault();
 		if (!scrollAreaEl) return null;
 		scrollAreaEl.scrollLeft += e.deltaY !== 0 ? e.deltaY : e.deltaX;
+		return null;
+	} else if (e.ctrlKey) {
+		// Let Ctrl+Wheel pass through for vertical track scrolling
+		return null;
 	}
-	return null;
+	// Plain wheel: zoom
+	e.preventDefault();
+	if (!scrollAreaEl) return null;
+	const { newPps, scheduleScrollRestore } = applyTimelineZoom(
+		e,
+		scrollAreaEl,
+		pixelsPerSecond,
+		timelineStart,
+		minPps,
+		maxPps
+	);
+	scheduleScrollRestore(setIgnoreScroll);
+	return newPps;
 }
 
 /**

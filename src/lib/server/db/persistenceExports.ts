@@ -1,4 +1,4 @@
-import type { ClipEntry, EffectEntry, VerticalLayout } from '../../types.js';
+import type { ClipEntry, EffectEntry } from '../../types.js';
 import { getDb } from './persistenceBase.js';
 
 interface ExportRow {
@@ -25,7 +25,6 @@ export interface ExportRecord {
 	clipIds: string[];
 	clipEntries?: ClipEntry[];
 	effectEntries?: EffectEntry[];
-	verticalLayout?: VerticalLayout;
 	status: 'pending' | 'exporting' | 'ready' | 'error';
 	outputPath?: string;
 	error?: string;
@@ -51,10 +50,6 @@ function mapExportRow(r: ExportRow): ExportRecord {
 	if (r.effect_entries) {
 		try { effectEntries = JSON.parse(r.effect_entries) as EffectEntry[]; } catch { /* ignore */ }
 	}
-	let verticalLayout: VerticalLayout | undefined;
-	if (r.vertical_layout) {
-		try { verticalLayout = JSON.parse(r.vertical_layout) as VerticalLayout; } catch { /* ignore */ }
-	}
 	return {
 		id: r.id,
 		title: r.title,
@@ -62,7 +57,6 @@ function mapExportRow(r: ExportRow): ExportRecord {
 		clipIds,
 		...(clipEntries && { clipEntries }),
 		...(effectEntries && { effectEntries }),
-		...(verticalLayout && { verticalLayout }),
 		status: r.status as ExportRecord['status'],
 		...(r.output_path && { outputPath: r.output_path }),
 		...(r.error && { error: r.error }),
@@ -85,7 +79,7 @@ export function saveExport(record: ExportRecord): void {
 			JSON.stringify(record.clipIds),
 			record.clipEntries ? JSON.stringify(record.clipEntries) : null,
 			record.effectEntries ? JSON.stringify(record.effectEntries) : null,
-			record.verticalLayout ? JSON.stringify(record.verticalLayout) : null,
+			null,
 			record.status,
 			record.outputPath ?? null,
 			record.error ?? null,

@@ -59,7 +59,7 @@ import {
 	type BrowseStreamEdge,
 	type VideoEdge
 } from '$lib/server/twitchApi.js';
-import type { ChannelInfo, VodInfo, CameraBoundsEntry, ClipEntry, EffectEntry, VerticalLayout, VideoRecord } from '$lib/types.js';
+import type { ChannelInfo, VodInfo, CameraBoundsEntry, ClipEntry, EffectEntry, VideoRecord } from '$lib/types.js';
 
 // ---------------------------------------------------------------------------
 // Queries — Stream & Media Data
@@ -501,15 +501,13 @@ export const updateVideoCmd = command('unchecked', async (args: {
 	description?: string;
 	clipEntries?: ClipEntry[];
 	effectEntries?: EffectEntry[];
-	verticalLayout?: VerticalLayout;
 	format?: 'standard' | 'mobile_short';
 }): Promise<VideoRecord> => {
-	const updates: Partial<Pick<VideoRecord, 'title' | 'description' | 'clipEntries' | 'effectEntries' | 'verticalLayout' | 'format'>> = {};
+	const updates: Partial<Pick<VideoRecord, 'title' | 'description' | 'clipEntries' | 'effectEntries' | 'format'>> = {};
 	if (args.title !== undefined) updates.title = args.title;
 	if (args.description !== undefined) updates.description = args.description;
 	if (args.clipEntries !== undefined) updates.clipEntries = args.clipEntries;
 	if (args.effectEntries !== undefined) updates.effectEntries = args.effectEntries;
-	if (args.verticalLayout !== undefined) updates.verticalLayout = args.verticalLayout;
 	if (args.format !== undefined) updates.format = args.format;
 	return smUpdateVideo(args.id, updates);
 });

@@ -1,4 +1,4 @@
-import type { ClipEntry, EffectEntry, VerticalLayout, VideoRecord } from '../../types.js';
+import type { ClipEntry, EffectEntry, VideoRecord } from '../../types.js';
 import type { ThumbnailRecord } from './persistenceThumbnails.js';
 import { getDb } from './persistenceBase.js';
 
@@ -31,21 +31,12 @@ function mapVideoRow(r: VideoRow): VideoRecord {
 			effectEntries = [];
 		}
 	}
-	let verticalLayout: VerticalLayout | undefined;
-	if (r.vertical_layout) {
-		try {
-			verticalLayout = JSON.parse(r.vertical_layout) as VerticalLayout;
-		} catch {
-			console.error(`[persistence] Corrupt vertical_layout JSON for video ${r.id}, ignoring`);
-		}
-	}
 	return {
 		id: r.id,
 		title: r.title,
 		...(r.description && { description: r.description }),
 		clipEntries,
 		...(effectEntries && effectEntries.length > 0 && { effectEntries }),
-		...(verticalLayout && { verticalLayout }),
 		format: (r.format || 'standard') as VideoRecord['format'],
 		createdAt: r.created_at,
 		updatedAt: r.updated_at
@@ -71,7 +62,7 @@ export function saveVideo(record: VideoRecord): void {
 			record.description ?? null,
 			JSON.stringify(record.clipEntries),
 			record.effectEntries ? JSON.stringify(record.effectEntries) : null,
-			record.verticalLayout ? JSON.stringify(record.verticalLayout) : null,
+			null,
 			record.format,
 			record.createdAt,
 			record.updatedAt
@@ -81,7 +72,7 @@ export function saveVideo(record: VideoRecord): void {
 
 export function updateVideoRecord(
 	id: string,
-	updates: Partial<Pick<VideoRecord, 'title' | 'description' | 'clipEntries' | 'effectEntries' | 'verticalLayout' | 'format'>>
+	updates: Partial<Pick<VideoRecord, 'title' | 'description' | 'clipEntries' | 'effectEntries' | 'format'>>
 ): void {
 	const d = getDb();
 	const sets: string[] = ['updated_at = unixepoch()'];
@@ -90,7 +81,6 @@ export function updateVideoRecord(
 	if (updates.description !== undefined) { sets.push('description = ?'); params.push(updates.description); }
 	if (updates.clipEntries !== undefined) { sets.push('clip_entries = ?'); params.push(JSON.stringify(updates.clipEntries)); }
 	if (updates.effectEntries !== undefined) { sets.push('effect_entries = ?'); params.push(JSON.stringify(updates.effectEntries)); }
-	if (updates.verticalLayout !== undefined) { sets.push('vertical_layout = ?'); params.push(updates.verticalLayout ? JSON.stringify(updates.verticalLayout) : null); }
 	if (updates.format !== undefined) { sets.push('format = ?'); params.push(updates.format); }
 	if (sets.length === 1) return; // only updated_at, nothing to do
 	params.push(id);

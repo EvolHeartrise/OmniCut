@@ -535,7 +535,7 @@
 		});
 	}
 
-	// --- Zoom (Ctrl+Wheel) / Pan (bare scroll) ---
+	// --- Zoom (Wheel) / Pan (Shift+Wheel) ---
 	function handleWheel(e: WheelEvent) {
 		const newPps = handleTimelineWheel(
 			e,

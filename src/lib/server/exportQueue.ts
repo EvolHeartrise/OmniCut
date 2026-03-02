@@ -5,7 +5,7 @@
  */
 
 import { newExportId } from '../ids.js';
-import type { ClipEntry, EffectEntry, VerticalLayout } from '../types.js';
+import type { ClipEntry, EffectEntry } from '../types.js';
 import { getClipRegion } from './clipManager.js';
 import { validateClipIds } from './clipValidation.js';
 import { getVideo } from './videoManager.js';
@@ -67,7 +67,6 @@ export function createAndQueueExportFromVideo(videoId: string): ExportRecord {
 		clipIds,
 		clipEntries: video.clipEntries,
 		...(video.effectEntries && video.effectEntries.length > 0 && { effectEntries: video.effectEntries }),
-		...(video.verticalLayout && { verticalLayout: video.verticalLayout }),
 		status: 'pending',
 		createdAt: Math.floor(Date.now() / 1000),
 		format: video.format,
@@ -210,8 +209,10 @@ async function runExport(exportId: string): Promise<void> {
 
 		let outputPath: string;
 		if (record.format === 'mobile_short') {
-			const layout: VerticalLayout = record.verticalLayout ?? { top: { type: 'full' }, bottom: { type: 'camera' } };
-			const needsCamera = layout.top.type === 'camera' || layout.bottom.type === 'camera';
+			// Check if any view effects use camera source — if so, we need camera bounds
+			const needsCamera = (record.effectEntries ?? []).some(
+				(e) => e.type === 'view' && e.viewSourceType === 'camera'
+			);
 
 			// Resolve camera bounds from channel table for each clip
 			const verticalClips: VerticalClip[] = [];
@@ -237,7 +238,7 @@ async function runExport(exportId: string): Promise<void> {
 					? 'No clips have camera bounds set — cannot create vertical export'
 					: 'No valid clips for vertical export');
 			}
-			({ outputPath } = await exportVerticalVideo(verticalClips, streamMap, exportId, () => {}, record.effectEntries, compOffsets, channelMap, layout));
+			({ outputPath } = await exportVerticalVideo(verticalClips, streamMap, exportId, () => {}, record.effectEntries, compOffsets, channelMap));
 		} else {
 			({ outputPath } = await exportVideo(clips, streamMap, exportId, () => {}, clipEntries, record.effectEntries, compOffsets, channelMap));
 		}

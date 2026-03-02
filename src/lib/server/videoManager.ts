@@ -3,7 +3,7 @@
  * In-memory store of video compositions backed by SQLite persistence.
  */
 
-import type { VideoRecord, ClipEntry, EffectEntry, VerticalLayout } from '../types.js';
+import type { VideoRecord, ClipEntry, EffectEntry } from '../types.js';
 import { newVideoId } from '../ids.js';
 import * as db from './db/index.js';
 import { broadcastVideoCreate, broadcastVideoUpdate, broadcastVideoDelete } from './sseBroadcaster.js';
@@ -32,7 +32,6 @@ export function createVideo(data: {
 	clipEntries: ClipEntry[];
 	effectEntries?: EffectEntry[];
 	format?: VideoRecord['format'];
-	verticalLayout?: VerticalLayout;
 }): VideoRecord {
 	validateClipIds(data.clipEntries.map((e) => e.clipId));
 
@@ -43,7 +42,6 @@ export function createVideo(data: {
 		...(data.description && { description: data.description }),
 		clipEntries: data.clipEntries,
 		...(data.effectEntries && data.effectEntries.length > 0 && { effectEntries: data.effectEntries }),
-		...(data.verticalLayout && { verticalLayout: data.verticalLayout }),
 		format: data.format ?? 'standard',
 		createdAt: now,
 		updatedAt: now
@@ -61,7 +59,7 @@ export function createVideo(data: {
  */
 export function updateVideo(
 	id: string,
-	updates: Partial<Pick<VideoRecord, 'title' | 'description' | 'clipEntries' | 'effectEntries' | 'verticalLayout' | 'format'>>
+	updates: Partial<Pick<VideoRecord, 'title' | 'description' | 'clipEntries' | 'effectEntries' | 'format'>>
 ): VideoRecord {
 	const existing = videosStore.get(id);
 	if (!existing) {
