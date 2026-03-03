@@ -77,8 +77,6 @@ export function startCapture(
 	const playlistPath = path.join(recordingDir, 'playlist.m3u8');
 	const segmentPattern = path.join(recordingDir, 'seg%06d.ts');
 
-	const isVod = !!vodUrl;
-
 	const info: StreamInfo = {
 		id,
 		channel,
@@ -91,7 +89,7 @@ export function startCapture(
 		gameName: null,
 		recordingDir,
 		offset: 0,
-		sourceType: isVod ? 'vod' : 'live',
+		sourceType: 'vod',
 		parentStreamId: null,
 		platform: 'twitch',
 		sourceUrl: vodUrl || null,
@@ -138,32 +136,8 @@ export function startCapture(
 		}
 	}, 1000);
 
-	let streamMetaInterval: ReturnType<typeof setInterval> | null = null;
-	if (!isVod) {
-		streamMetaInterval = setInterval(async () => {
-			if (info.status === 'capturing') {
-				try {
-					const meta = await fetchStreamMeta(channel);
-					info.viewerCount = meta.viewerCount;
-					info.streamTitle = meta.title;
-					info.gameName = meta.gameName;
-				} catch {
-					/* network error — will retry next interval */
-				}
-			}
-		}, 30000);
-		fetchStreamMeta(channel).then((meta) => {
-			info.viewerCount = meta.viewerCount;
-			info.streamTitle = meta.title;
-			info.gameName = meta.gameName;
-		}).catch(() => {
-			/* will be retried by the interval above */
-		});
-	}
-
 	function clearPolling() {
 		if (segmentWatchInterval) clearInterval(segmentWatchInterval);
-		if (streamMetaInterval) clearInterval(streamMetaInterval);
 	}
 
 	const kill = () => {

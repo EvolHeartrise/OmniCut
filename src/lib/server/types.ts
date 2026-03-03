@@ -11,7 +11,7 @@ export interface StreamInfo {
 	gameName: string | null;
 	recordingDir: string;
 	offset: number;
-	sourceType: 'live' | 'vod';
+	sourceType: 'vod';
 	parentStreamId: string | null;
 	platform: 'twitch';
 	sourceUrl: string | null;

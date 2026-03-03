@@ -33,7 +33,7 @@ export interface StreamState {
 	streamTitle: string | null;
 	gameName: string | null;
 	offset: number;
-	sourceType: 'live' | 'vod';
+	sourceType: 'vod';
 	parentStreamId: string | null;
 	platform: 'twitch';
 	sourceUrl?: string | null;
@@ -187,7 +187,7 @@ export async function refreshStreams() {
 }
 
 /**
- * Add a new stream by channel name.
+ * Add a new VOD stream by channel name or URL.
  */
 export async function addStream(
 	channel: string,
@@ -197,7 +197,7 @@ export async function addStream(
 		await addStreamCmd({
 			channel,
 			language: opts?.language,
-			vod: opts?.vod,
+			vod: opts?.vod ?? true,
 			vodUrl: opts?.vodUrl
 		});
 		await refreshStreams();

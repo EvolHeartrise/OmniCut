@@ -3,7 +3,6 @@ import { normalizeChannel } from '$lib/utils.js';
 import {
 	listStreams,
 	getAllClipRegions,
-	addStream as smAddStream,
 	addVodStream,
 	addVodByUrl,
 	stopStream as smStopStream,
@@ -187,7 +186,7 @@ export const getCensorTerms = query(async () => {
 // Commands — Stream Management
 // ---------------------------------------------------------------------------
 
-/** Add a stream (live or VOD). */
+/** Add a VOD stream. */
 export const addStreamCmd = command(
 	'unchecked',
 	async (args: {
@@ -206,9 +205,9 @@ export const addStreamCmd = command(
 
 		if (!cleanChannel) throw new Error('Invalid channel name');
 
-		const info = args.vod
-			? await addVodStream(cleanChannel, args.language ?? null)
-			: await smAddStream(cleanChannel, args.language ?? null);
+		if (!args.vod) throw new Error('Live capture is not supported — use VOD mode');
+
+		const info = await addVodStream(cleanChannel, args.language ?? null);
 
 		await getStreams().refresh();
 		return info;

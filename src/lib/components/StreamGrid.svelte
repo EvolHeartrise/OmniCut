@@ -57,10 +57,6 @@
 	let onePerTrack = $derived.by(() => {
 		const best = new Map<string, (typeof visibleStreams)[number]>();
 		for (const s of visibleStreams) {
-			if (s.sourceType === 'live') {
-				best.set(s.id, s);
-				continue;
-			}
 			const trackKey = `vod:${s.platform}:${s.channel}`;
 			const existing = best.get(trackKey);
 			if (!existing) {
@@ -81,10 +77,9 @@
 			}
 		}
 
-		// Remove VOD entries where the selected stream doesn't actually contain the playhead
+		// Remove entries where the selected stream doesn't actually contain the playhead
 		// and has a known duration (i.e. we know for sure the playhead is in a gap).
 		for (const [key, s] of best) {
-			if (s.sourceType === 'live') continue;
 			const dur = getDuration(s);
 			if (dur > 0 && !containsPlayhead(s, dur)) best.delete(key);
 		}

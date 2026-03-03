@@ -199,7 +199,6 @@
 				return {
 					streamId: stream.id,
 					channel: stream.channel,
-					sourceType: stream.sourceType,
 					offset,
 					anchor: (stream.startedAt || Date.now()) / 1000,
 					duration: streamDurations[stream.id] || 0
@@ -211,7 +210,7 @@
 				color: COLORS[i % COLORS.length],
 				streamIds: trackStreams.map((s) => s.id),
 				bars,
-				isGrouped: trackStreams.length > 1 && trackStreams[0]?.sourceType === 'vod'
+				isGrouped: trackStreams.length > 1
 			};
 		})
 	);
@@ -921,7 +920,7 @@
 							{track.channel}
 							{#if track.isGrouped}
 								<span class="vod-suffix">({track.bars.length} VODs)</span>
-							{:else if track.bars[0]?.sourceType === 'vod'}
+							{:else}
 								<span class="vod-suffix">(VOD)</span>
 							{/if}
 						</span>
@@ -977,7 +976,7 @@
 											onmousedown={(e) => handleTrackMouseDown(e, bar.streamId)}
 										>
 											<div class="bar-progress" style="width: {(barProgress[bar.streamId] ?? 0).toFixed(1)}%"></div>
-											<span class="bar-label">{bar.channel}{bar.sourceType === 'vod' ? ' (VOD)' : ''}</span>
+											<span class="bar-label">{bar.channel} (VOD)</span>
 										</div>
 									{/if}
 								{/each}

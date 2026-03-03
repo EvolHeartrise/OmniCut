@@ -80,9 +80,8 @@ export function usernameColor(name: string): string {
 	return USERNAME_COLORS[Math.abs(hash) % USERNAME_COLORS.length];
 }
 
-/** Generate a stable track key: live streams get their ID, VODs from same channel share a key. */
+/** Generate a stable track key: VODs from same channel share a key. */
 export function trackKeyFor(s: { id: string; sourceType: string; platform: string; channel: string }): string {
-	if (s.sourceType === 'live') return s.id;
 	return `vod:${s.platform}:${s.channel}`;
 }
 

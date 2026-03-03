@@ -61,15 +61,9 @@
 	let settingsModalLogin = $state<string | null>(null);
 	let settingsLanguage = $state('');
 
-	// Set of channel logins currently being captured (live and vod separately)
-	let capturingLogins = $derived(
-		new Set(
-			$streams.filter((s) => s.sourceType === 'live' && s.status !== 'stopped').map((s) => s.channel.toLowerCase())
-		)
-	);
 	let capturingVodLogins = $derived(
 		new Set(
-			$streams.filter((s) => s.sourceType === 'vod' && s.status !== 'stopped').map((s) => s.channel.toLowerCase())
+			$streams.filter((s) => s.status !== 'stopped').map((s) => s.channel.toLowerCase())
 		)
 	);
 
@@ -84,7 +78,7 @@
 	let addedVodIds = $derived(
 		new Set(
 			$streams
-				.filter((s) => s.sourceType === 'vod' && s.sourceUrl)
+				.filter((s) => s.sourceUrl)
 				.map((s) => {
 					const m = s.sourceUrl!.match(/videos\/(\d+)/);
 					return m?.[1];
@@ -93,7 +87,7 @@
 		)
 	);
 
-	// Sorted channel list: live+capturing first, then live+available, then offline
+	// Sorted channel list: live first, then offline
 	let sortedChannels = $derived.by(() => {
 		const live: ChannelInfo[] = [];
 		const offline: ChannelInfo[] = [];
@@ -101,12 +95,6 @@
 			if (ch.isLive) live.push(ch);
 			else offline.push(ch);
 		}
-		// Within live, put capturing ones first
-		live.sort((a, b) => {
-			const aCap = capturingLogins.has(a.login.toLowerCase()) ? 0 : 1;
-			const bCap = capturingLogins.has(b.login.toLowerCase()) ? 0 : 1;
-			return aCap - bCap;
-		});
 		return [...live, ...offline];
 	});
 
@@ -201,20 +189,6 @@
 		if (!lang) return '';
 		const opt = LANGUAGE_OPTIONS.find((o) => o.code === lang);
 		return opt?.badge || lang.toUpperCase();
-	}
-
-	async function handleAddStream(channel: ChannelInfo) {
-		if (!channel.isLive || capturingLogins.has(channel.login.toLowerCase())) return;
-		loading = true;
-		error = '';
-		try {
-			const lang = channelSettings.get(channel.login) || undefined;
-			await addStream(channel.login, { language: lang });
-		} catch (err) {
-			error = err instanceof Error ? err.message : 'Failed to start capture';
-		} finally {
-			loading = false;
-		}
 	}
 
 	async function handleAddVod(channel: ChannelInfo) {
@@ -403,27 +377,20 @@
 	{#if sortedChannels.length > 0}
 		<div class="channel-list">
 			{#each sortedChannels as channel (channel.login)}
-				{@const isCapturing = capturingLogins.has(channel.login.toLowerCase())}
-				{@const isVodCapturing = capturingVodLogins.has(channel.login.toLowerCase())}
+					{@const isVodCapturing = capturingVodLogins.has(channel.login.toLowerCase())}
 				{@const langBadge = getLanguageBadge(channel.login)}
-				<div class="channel-row" class:offline={!channel.isLive} class:capturing={isCapturing}>
+				<div class="channel-row" class:offline={!channel.isLive}>
 					<div class="channel-pfp">
 						{#if channel.profileImageUrl}
 							<img src={channel.profileImageUrl} alt="" class="pfp-img" />
 						{:else}
 							<div class="pfp-placeholder"></div>
 						{/if}
-						{#if isCapturing}
-							<span class="rec-dot"></span>
-						{/if}
 					</div>
 
 					<div class="channel-info">
 						<div class="channel-name-row">
 							<span class="channel-name">{channel.displayName || channel.login}</span>
-							{#if isCapturing}
-								<span class="rec-badge">REC</span>
-							{/if}
 							{#if isVodCapturing}
 								<span class="vod-rec-badge">VOD</span>
 							{/if}
@@ -449,18 +416,13 @@
 							{/if}
 						</div>
 
-						<div class="capture-actions">
-							<button class="capture-btn" disabled={isCapturing || loading} onclick={() => handleAddStream(channel)}
-								>Stream</button
+						{#if channel.hasVod}
+							<button
+								class="capture-btn vod"
+								disabled={isVodCapturing || loading}
+								onclick={() => handleAddVod(channel)}>VOD</button
 							>
-							{#if channel.hasVod}
-								<button
-									class="capture-btn vod"
-									disabled={isVodCapturing || loading}
-									onclick={() => handleAddVod(channel)}>VOD</button
-								>
-							{/if}
-						</div>
+						{/if}
 					{/if}
 
 					<button
@@ -669,10 +631,6 @@
 		cursor: default;
 	}
 
-	.channel-row.capturing {
-		border-left: 3px solid #ef4444;
-	}
-
 	.channel-pfp {
 		position: relative;
 		flex-shrink: 0;
@@ -694,17 +652,6 @@
 		background: #2a2a4a;
 	}
 
-	.rec-dot {
-		position: absolute;
-		top: -2px;
-		right: -2px;
-		width: 10px;
-		height: 10px;
-		background: #ef4444;
-		border-radius: 50%;
-		border: 2px solid #12122a;
-	}
-
 	.channel-info {
 		flex: 1;
 		min-width: 0;
@@ -723,16 +670,6 @@
 		font-size: 0.85rem;
 		font-weight: 600;
 		color: #e0e0ff;
-	}
-
-	.rec-badge {
-		font-size: 0.55rem;
-		font-weight: 700;
-		color: #ef4444;
-		background: rgba(239, 68, 68, 0.15);
-		padding: 1px 5px;
-		border-radius: 3px;
-		letter-spacing: 0.5px;
 	}
 
 	.vod-rec-badge {
@@ -794,12 +731,6 @@
 		font-size: 0.65rem;
 		color: #666;
 		font-family: monospace;
-	}
-
-	.capture-actions {
-		display: flex;
-		gap: 4px;
-		flex-shrink: 0;
 	}
 
 	.capture-btn {

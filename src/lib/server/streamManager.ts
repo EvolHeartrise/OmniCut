@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as crypto from 'node:crypto';
 import { startCapture, fetchStreamMeta, fetchVodMeta, type CaptureHandle } from './captureProcess.js';
 import { startTranscription, stopTranscription, transcribeFullRecording, shutdownTranscriber } from './transcriber.js';
-import { startChatCollection } from './chatCollector.js';
+
 import { startVodChatFetch, extractVideoId } from './vodChatFetcher.js';
 import type { StreamInfo, ChatMessage } from './types.js';
 import * as db from './db/index.js';
@@ -58,8 +58,6 @@ interface CaptureCallbackOpts {
 	getHandle: () => CaptureHandle;
 	id: string;
 	language: string | null;
-	/** Live chat: provide channel to start IRC collection. */
-	liveChat?: { channel: string };
 	/** VOD chat: provide videoId to start VOD chat download. */
 	vodChat?: { videoId: string };
 	/** If true, run full-file transcription when status transitions to 'stopped'. */
@@ -86,14 +84,6 @@ function createStatusCallback(opts: CaptureCallbackOpts): (info: StreamInfo) => 
 				},
 				opts.language
 			);
-		}
-
-		// Start live chat collection (Twitch IRC) — guarded, only once per capture
-		if (info.status === 'capturing' && opts.liveChat && !handle.chatStarted) {
-			handle.chatStarted = true;
-			handle.stopChat = startChatCollection(opts.id, opts.liveChat.channel, info.startedAt, (_sid, msg) => {
-				persistChatMessage(opts.id, msg);
-			});
 		}
 
 		// Start VOD chat download — guarded, only once per capture
@@ -162,7 +152,7 @@ export async function initStreamManager(): Promise<void> {
 		info.status = 'stopped';
 
 		// Backfill VOD duration from HLS playlist if not stored yet
-		if (info.sourceType === 'vod' && info.durationSeconds == null) {
+		if (info.durationSeconds == null) {
 			const playlistPath = path.join(info.recordingDir, 'playlist.m3u8');
 			const dur = parsePlaylistDuration(playlistPath);
 			if (dur > 0) {
@@ -241,17 +231,16 @@ function channelMatches(a: string, b: string): boolean {
 }
 
 function isTwitchVod(handle: CaptureHandle): boolean {
-	return handle.info.sourceType === 'vod' && handle.info.platform === 'twitch' && !!handle.info.sourceUrl;
+	return handle.info.platform === 'twitch' && !!handle.info.sourceUrl;
 }
 
 // --- Duplicate capture guards ---
 
-function findActiveCapture(channel: string, platform: string, sourceType: 'live' | 'vod'): CaptureHandle | undefined {
+function findActiveCapture(channel: string, platform: string): CaptureHandle | undefined {
 	for (const [, handle] of captures) {
 		if (
 			channelMatches(handle.info.channel, channel) &&
 			handle.info.platform === platform &&
-			handle.info.sourceType === sourceType &&
 			handle.info.status !== 'stopped'
 		) {
 			return handle;
@@ -270,38 +259,6 @@ function findCaptureBySourceUrl(url: string): CaptureHandle | undefined {
 // --- Stream management ---
 
 /**
- * Start capturing a Twitch channel.
- * Returns the stream info with an assigned ID.
- * Automatically spawns a VOD capture if the streamer has an ongoing archive.
- */
-export async function addStream(
-	channel: string,
-	language?: string | null
-): Promise<StreamInfo> {
-	if (findActiveCapture(channel, 'twitch', 'live')) {
-		throw new Error(`Already capturing channel: ${channel}`);
-	}
-
-	const transcriptionLanguage = language ?? db.getChannelSettings(channel)?.language ?? null;
-	const id = crypto.randomUUID();
-
-	let handle!: CaptureHandle;
-	const onStatus = createStatusCallback({
-		getHandle: () => handle,
-		id,
-		language: transcriptionLanguage,
-		streamTranscribeOnCapturing: true,
-		liveChat: { channel }
-	});
-
-	handle = startCapture(channel, id, RECORDINGS_DIR, onStatus);
-	captures.set(id, handle);
-	db.saveStream(handle.info);
-
-	return handle.info;
-}
-
-/**
  * Start capturing the VOD archive for a currently-live Twitch channel.
  * Fetches stream metadata to find the VOD ID, then starts a VOD capture.
  */
@@ -318,7 +275,7 @@ export async function addVodStream(channel: string, language?: string | null): P
 	if (findCaptureBySourceUrl(vodUrl)) {
 		throw new Error(`VOD already added: ${vodUrl}`);
 	}
-	if (findActiveCapture(channel, 'twitch', 'vod')) {
+	if (findActiveCapture(channel, 'twitch')) {
 		throw new Error(`Already capturing VOD for channel: ${channel}`);
 	}
 
@@ -336,14 +293,6 @@ export async function addVodStream(channel: string, language?: string | null): P
 
 	vodHandle = startCapture(channel, vodId, RECORDINGS_DIR, onStatus, vodUrl);
 	vodHandle.info.startedAt = Date.parse(meta.createdAt);
-
-	// Link to the live capture if one exists
-	for (const [id, handle] of captures) {
-		if (channelMatches(handle.info.channel, channel) && handle.info.sourceType === 'live') {
-			vodHandle.info.parentStreamId = id;
-			break;
-		}
-	}
 
 	captures.set(vodId, vodHandle);
 	db.saveStream(vodHandle.info);

@@ -23,10 +23,8 @@
 	// --- Filters ---
 	let filterChannel = $state('');
 	let filterStatus = $state<'' | 'capturing' | 'stopped' | 'error'>('');
-	let filterType = $state<'' | 'live' | 'vod'>('');
-
 	// --- Sorting ---
-	type SortKey = 'channel' | 'type' | 'status' | 'date' | 'size' | 'chat' | 'transcripts' | 'clips';
+	type SortKey = 'channel' | 'status' | 'date' | 'size' | 'chat' | 'transcripts' | 'clips';
 	let sortKey = $state<SortKey>('date');
 	let sortAsc = $state(false);
 
@@ -38,16 +36,12 @@
 		let list = [...$streams];
 		if (filterChannel) list = list.filter((s) => s.channel === filterChannel);
 		if (filterStatus) list = list.filter((s) => s.status === filterStatus);
-		if (filterType) list = list.filter((s) => s.sourceType === filterType);
 
 		list.sort((a, b) => {
 			let cmp = 0;
 			switch (sortKey) {
 				case 'channel':
 					cmp = a.channel.localeCompare(b.channel);
-					break;
-				case 'type':
-					cmp = a.sourceType.localeCompare(b.sourceType);
 					break;
 				case 'status':
 					cmp = a.status.localeCompare(b.status);
@@ -150,15 +144,6 @@
 				<option value="error">Error</option>
 			</select>
 		</label>
-		<!-- svelte-ignore a11y_label_has_associated_control -->
-		<label class="filter-group">
-			<span class="filter-label">Type</span>
-			<select class="filter-select" bind:value={filterType}>
-				<option value="">All</option>
-				<option value="live">Live</option>
-				<option value="vod">VOD</option>
-			</select>
-		</label>
 		<div class="filter-spacer"></div>
 		<span class="row-count">{filtered.length} of {$streams.length}</span>
 	</div>
@@ -172,7 +157,6 @@
 					<tr>
 						<th class="th-status"></th>
 						<th class="th-sortable" onclick={() => toggleSort('channel')}>Channel{sortIndicator('channel')}</th>
-						<th class="th-sortable" onclick={() => toggleSort('type')}>Type{sortIndicator('type')}</th>
 						<th class="th-title">Title</th>
 						<th class="th-sortable th-right" onclick={() => toggleSort('size')}>Size{sortIndicator('size')}</th>
 						<th class="th-sortable th-right" onclick={() => toggleSort('chat')}>Chat{sortIndicator('chat')}</th>
@@ -191,11 +175,6 @@
 							<td class="cell-channel">
 								{stream.channel}
 							</td>
-							<td>
-								<span class="type-badge" class:vod={stream.sourceType === 'vod'}>
-									{stream.sourceType === 'vod' ? 'VOD' : 'Live'}
-								</span>
-							</td>
 							<td class="cell-title" title={stream.streamTitle || ''}>
 								{stream.streamTitle || ''}
 							</td>
@@ -205,11 +184,11 @@
 							<td class="cell-right cell-clips">{clipCounts[stream.id] || ''}</td>
 							<td class="cell-date">{formatDate(stream.startedAt)}</td>
 							<td class="cell-actions">
-								{#if stream.status === 'capturing' && stream.sourceType === 'vod'}
+								{#if stream.status === 'capturing'}
 									<button class="btn-action btn-stop" onclick={() => stopStream(stream.id)} title="Stop downloading">Stop</button>
 								{/if}
 								{#if stream.status === 'stopped'}
-									{#if stream.sourceType === 'vod' && stream.platform === 'twitch'}
+									{#if stream.platform === 'twitch'}
 										<button class="btn-action btn-resume" onclick={() => resumeVodStream(stream.id)} title="Resume VOD download">Resume</button>
 									{/if}
 									{#if stream.platform === 'twitch'}
@@ -380,21 +359,6 @@
 	.cell-channel {
 		font-weight: 700;
 		color: #e0e0ff;
-	}
-
-	.type-badge {
-		font-size: 0.6rem;
-		font-weight: 700;
-		padding: 1px 5px;
-		border-radius: 3px;
-		background: #22c55e22;
-		color: #22c55e;
-		text-transform: uppercase;
-	}
-
-	.type-badge.vod {
-		background: #d9770622;
-		color: #d97706;
 	}
 
 	.cell-title {

@@ -272,7 +272,7 @@
 				target="_blank"
 				rel="noopener noreferrer"
 				class="channel-link">{stream.channel}</a
-			>{#if stream.sourceType === 'vod'}<span class="vod-badge">(VOD)</span>{/if}
+			><span class="vod-badge">(VOD)</span>
 			{#if stream.streamTitle}<span class="stream-title">{stream.streamTitle}</span>{/if}
 			<span class="disk-usage">{formatBytes(stream.diskUsageBytes)}</span>
 			{#if stream.chatMessageCount > 0}<span class="chat-count">{stream.chatMessageCount.toLocaleString()} msgs</span
