@@ -6,7 +6,7 @@ import { z } from 'zod';
 import type { ToolRegistrar } from './types.js';
 import { textResult } from './types.js';
 import { getStream, getStreamRecordingDir } from '../streamManager.js';
-import { extractFrame, extractFrameCropped } from '../hlsUtils.js';
+import { extractFrame } from '../hlsUtils.js';
 import { resolveCameraBounds } from '../db/index.js';
 
 export function registerScreenshotTools(server: ToolRegistrar): void {
@@ -46,9 +46,7 @@ export function registerScreenshotTools(server: ToolRegistrar): void {
 			}
 
 			try {
-				const buffer = cropFilter
-					? await extractFrameCropped(recordingDir, localTs, cropFilter)
-					: await extractFrame(recordingDir, localTs);
+				const buffer = await extractFrame(recordingDir, localTs, cropFilter ?? undefined);
 				return {
 					content: [{
 						type: 'image' as const,

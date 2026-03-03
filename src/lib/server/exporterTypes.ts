@@ -3,8 +3,17 @@
  * All exporter modules import types from here to avoid circular dependencies.
  */
 
-import type { OverlayAnimation, EasingFunction } from '../types.js';
+import type { ClipRegion, ClipEntry, OverlayAnimation, EasingFunction } from '../types.js';
 import type { FrameSink } from './chatEffectRenderer.js';
+
+/** A clip on a non-zero video track with its composition position. */
+export interface OtherTrackClip {
+	clip: ClipRegion;
+	entry?: ClipEntry;
+	track: number;
+	compStart: number; // composition-time start (seconds)
+	compEnd: number;   // composition-time end (seconds)
+}
 
 /** Resolved stream info needed for encoding a clip from raw segments. */
 export interface StreamLookup {

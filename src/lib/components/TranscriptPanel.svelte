@@ -1,33 +1,50 @@
 <script lang="ts">
-	import { masterTime, seekRequest, transcriptions, type TranscriptionEntry } from '$lib/stores/streams.js';
+	import { masterTime, seekRequest, streams, syncOffsets, transcriptions, type TranscriptionEntry, type ClipRegion } from '$lib/stores/streams.js';
 	import { createPanelQueryState } from '$lib/panelQueryRanges.svelte.js';
 	import { getMultiStreamTranscriptions } from '$lib/streams.remote';
-	import { formatTime } from '$lib/utils.js';
+	import { formatTime, formatDuration } from '$lib/utils.js';
+
+	let {
+		clip,
+		currentLocalTime,
+		onseek
+	}: {
+		clip?: ClipRegion;
+		currentLocalTime?: number;
+		onseek?: (localTime: number) => void;
+	} = $props();
+
+	const isClipMode = $derived(!!clip);
 
 	let searchQuery = $state('');
 	let listEl = $state<HTMLDivElement | null>(null);
 	let userScrolled = $state(false);
 	let scrollTimeout: ReturnType<typeof setTimeout> | null = null;
 
-	interface TaggedEntry {
+	interface Entry {
 		id: number;
-		streamId: string;
-		channel: string;
-		color: string;
 		text: string;
-		masterStart: number; // epoch seconds
-		masterEnd: number;
+		/** Time value used for binary search (master-time in multi mode, local-time in clip mode) */
+		sortStart: number;
+		sortEnd: number;
+		/** Formatted display time */
+		displayTime: string;
+		/** For multi mode: channel name */
+		channel?: string;
+		/** For multi mode: stream color */
+		color?: string;
 	}
 
-	// Shared debounced query state (visible streams + windowed ranges)
-	const queryState = createPanelQueryState();
+	// --- Multi-stream mode ---
+	const queryState = !clip ? createPanelQueryState() : null;
 
-	// Fetch transcriptions via remote query — re-fetches when ranges change
-	const rawEntries = $derived(await getMultiStreamTranscriptions({ ranges: queryState.ranges }));
+	const multiRawEntries = $derived(
+		queryState ? await getMultiStreamTranscriptions({ ranges: queryState.ranges }) : null
+	);
 
-	// Feed StreamTile captions from the wider ±120s window (superset of ±60s caption window)
+	// Feed StreamTile captions from the transcript data
 	$effect(() => {
-		const data = rawEntries;
+		const data = multiRawEntries;
 		if (!data) return;
 		const grouped: Record<string, TranscriptionEntry[]> = {};
 		for (const r of data) {
@@ -37,59 +54,86 @@
 		transcriptions.set(grouped);
 	});
 
-	// Transform server data to TaggedEntry format with master-time positioning
-	let fetchedEntries = $derived.by(() => {
-		if (!rawEntries || rawEntries.length === 0) return [] as TaggedEntry[];
-		const streamLookup = new Map(queryState.visibleStreams.map((s) => [s.id, s]));
-		return rawEntries.map((e) => {
-			const s = streamLookup.get(e.streamId);
-			return {
+	// --- Clip mode ---
+	let clipBounds = $derived.by(() => {
+		if (!clip) return null;
+		const stream = $streams.find((s) => s.id === clip.streamId);
+		if (!stream) return null;
+		const offset = $syncOffsets[clip.streamId] || 0;
+		const anchor = stream.startedAt / 1000;
+		return {
+			localStart: clip.startTime - anchor + offset,
+			localEnd: clip.endTime - anchor + offset
+		};
+	});
+
+	const clipRawEntries = $derived(
+		clip && clipBounds
+			? await getMultiStreamTranscriptions({
+					ranges: [{ streamId: clip.streamId, from: clipBounds.localStart, to: clipBounds.localEnd }]
+				})
+			: null
+	);
+
+	// --- Unified entries ---
+	let entries = $derived.by((): Entry[] => {
+		if (!isClipMode && multiRawEntries) {
+			const streamLookup = new Map(queryState!.visibleStreams.map((s) => [s.id, s]));
+			return multiRawEntries.map((e) => {
+				const s = streamLookup.get(e.streamId);
+				const masterStart = e.startTime + (s ? s.anchor - s.offset : 0);
+				const masterEnd = e.endTime + (s ? s.anchor - s.offset : 0);
+				return {
+					id: e.id,
+					text: e.text,
+					sortStart: masterStart,
+					sortEnd: masterEnd,
+					displayTime: formatTime(masterStart),
+					channel: s?.channel || '',
+					color: s?.color || '#888'
+				};
+			});
+		}
+		if (isClipMode && clipRawEntries && clipBounds) {
+			return clipRawEntries.map((e) => ({
 				id: e.id,
-				streamId: e.streamId,
-				channel: s?.channel || '',
-				color: s?.color || '#888',
 				text: e.text,
-				masterStart: e.startTime + (s ? s.anchor - s.offset : 0),
-				masterEnd: e.endTime + (s ? s.anchor - s.offset : 0)
-			};
-		});
+				sortStart: e.startTime,
+				sortEnd: e.endTime,
+				displayTime: formatDuration(e.startTime - clipBounds.localStart)
+			}));
+		}
+		return [];
 	});
 
-	// Apply search filter
 	let filteredEntries = $derived.by(() => {
-		if (!searchQuery.trim()) return fetchedEntries;
+		if (!searchQuery.trim()) return entries;
 		const q = searchQuery.trim().toLowerCase();
-		return fetchedEntries.filter((e) => e.text.toLowerCase().includes(q));
+		return entries.filter((e) => e.text.toLowerCase().includes(q));
 	});
 
-	// Find the active entry based on current master playhead (binary search)
-	let activeEntryIndex = $derived.by(() => {
-		const now = $masterTime;
-		const entries = filteredEntries;
-		if (entries.length === 0) return -1;
+	// Current time for tracking the active entry
+	let now = $derived(isClipMode ? (currentLocalTime ?? 0) : $masterTime);
 
-		// Binary search: find the last entry whose masterStart <= now
+	// Binary search: find the last entry whose sortStart <= now
+	let activeEntryIndex = $derived.by(() => {
+		if (filteredEntries.length === 0) return -1;
 		let lo = 0,
-			hi = entries.length;
+			hi = filteredEntries.length;
 		while (lo < hi) {
 			const mid = (lo + hi) >>> 1;
-			if (entries[mid].masterStart <= now) lo = mid + 1;
+			if (filteredEntries[mid].sortStart <= now) lo = mid + 1;
 			else hi = mid;
 		}
-		// lo is now the first entry with masterStart > now; lo-1 is the candidate
 		if (lo === 0) return -1;
 		const candidate = lo - 1;
-		// Prefer exact match (playhead within range)
-		if (now < entries[candidate].masterEnd) return candidate;
-		// Fallback: last entry that started before now
+		if (now < filteredEntries[candidate].sortEnd) return candidate;
 		return candidate;
 	});
 
-	// Auto-scroll to active entry (suppressed briefly after manual scroll)
 	$effect(() => {
 		const idx = activeEntryIndex;
 		if (idx < 0 || !listEl || userScrolled) return;
-
 		const activeEl = listEl.querySelector(`[data-index="${idx}"]`);
 		if (activeEl) {
 			activeEl.scrollIntoView({ block: 'center', behavior: 'smooth' });
@@ -104,15 +148,18 @@
 		}, 3000);
 	}
 
-	// Clean up scroll timeout on unmount
 	$effect(() => {
 		return () => {
 			if (scrollTimeout) clearTimeout(scrollTimeout);
 		};
 	});
 
-	function seekToEntry(entry: TaggedEntry) {
-		seekRequest.update((r) => ({ time: entry.masterStart, seq: r.seq + 1 }));
+	function handleSeek(entry: Entry) {
+		if (isClipMode && onseek) {
+			onseek(entry.sortStart);
+		} else {
+			seekRequest.update((r) => ({ time: entry.sortStart, seq: r.seq + 1 }));
+		}
 	}
 
 	function clearSearch() {
@@ -135,13 +182,24 @@
 
 	<div class="entry-list" bind:this={listEl} onscroll={handleListScroll}>
 		{#each filteredEntries as entry, i (entry.id)}
-			<button class="entry-row" class:active={i === activeEntryIndex} data-index={i} onclick={() => seekToEntry(entry)}>
-				<div class="entry-meta">
-					<span class="color-dot" style="background: {entry.color}"></span>
-					<span class="entry-channel">{entry.channel}</span>
-					<span class="entry-time">{formatTime(entry.masterStart)}</span>
-				</div>
-				<p class="entry-text">{entry.text}</p>
+			<button
+				class="entry-row"
+				class:active={i === activeEntryIndex}
+				class:future={isClipMode && entry.sortStart > now}
+				data-index={i}
+				onclick={() => handleSeek(entry)}
+			>
+				{#if entry.channel != null}
+					<div class="entry-meta">
+						<span class="color-dot" style="background: {entry.color}"></span>
+						<span class="entry-channel">{entry.channel}</span>
+						<span class="entry-time">{entry.displayTime}</span>
+					</div>
+					<p class="entry-text">{entry.text}</p>
+				{:else}
+					<span class="entry-time">{entry.displayTime}</span>
+					<p class="entry-text">{entry.text}</p>
+				{/if}
 			</button>
 		{/each}
 
@@ -150,8 +208,10 @@
 				{#if searchQuery}
 					<p>No matches for &ldquo;{searchQuery}&rdquo;</p>
 				{:else}
-					<p>No transcriptions yet</p>
-					<p class="empty-hint">Transcriptions appear as streams are captured</p>
+					<p>No transcriptions{isClipMode ? '' : ' yet'}</p>
+					{#if !isClipMode}
+						<p class="empty-hint">Transcriptions appear as streams are captured</p>
+					{/if}
 				{/if}
 			</div>
 		{/if}
@@ -263,7 +323,10 @@
 	}
 
 	.entry-row {
-		display: block;
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0;
+		align-items: flex-start;
 		width: 100%;
 		text-align: left;
 		background: none;
@@ -285,11 +348,20 @@
 		border-left-color: #7c3aed;
 	}
 
+	.entry-row.future {
+		opacity: 0.4;
+	}
+
+	.entry-row.future.active {
+		opacity: 1;
+	}
+
 	.entry-meta {
 		display: flex;
 		align-items: center;
 		gap: 6px;
 		margin-bottom: 2px;
+		width: 100%;
 	}
 
 	.color-dot {
@@ -311,6 +383,9 @@
 		font-family: monospace;
 		font-variant-numeric: tabular-nums;
 		margin-left: auto;
+		flex-shrink: 0;
+		padding-top: 2px;
+		min-width: 3em;
 	}
 
 	.entry-text {

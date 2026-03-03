@@ -6,9 +6,10 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import type { ClipRegion, ClipEntry, EffectEntry } from '../types.js';
-import type { StreamLookup } from './exporterTypes.js';
-import { parseRelevantSegments, ffmpegConcatEscape, buildConcatContent } from './hlsUtils.js';
-import { runFfmpeg } from './ffmpeg.js';
+import type { StreamLookup, OtherTrackClip } from './exporterTypes.js';
+import type { ExtraTrackInput } from './exporterPipeline.js';
+import { getRecordingMp4 } from './remuxer.js';
+import { runFfmpeg, ffmpegConcatEscape, probeMedia } from './ffmpeg.js';
 
 export const EXPORTS_DIR = path.resolve(process.env.EXPORTS_DIR || path.join(process.cwd(), 'exports'));
 
@@ -25,10 +26,8 @@ export interface ResolvedClip {
 	dur: number;
 	localStart: number;
 	localEnd: number;
-	playlistPath: string;
-	trimStart: number; // seek offset within first segment
-	segments: Array<{ file: string; duration: number; startTime: number }>;
-	concatPath: string; // written concat file path
+	mp4Path: string;
+	seekOffset: number; // seek position into recording.mp4
 }
 
 /**
@@ -41,7 +40,7 @@ export function resolveClip(
 	stream: StreamLookup | undefined,
 	index: number,
 	total: number,
-	tempDir: string,
+	_tempDir: string,
 	tag: string
 ): ResolvedClip | null {
 	if (!stream) {
@@ -64,24 +63,18 @@ export function resolveClip(
 	const anchor = stream.startedAt / 1000;
 	const localStart = effectiveStart - anchor + stream.offset;
 	const localEnd = effectiveEnd - anchor + stream.offset;
-	const playlistPath = path.join(stream.recordingDir, 'playlist.m3u8');
 
-	const segments = parseRelevantSegments(playlistPath, stream.recordingDir, localStart, localEnd);
-	if (segments.length === 0) {
-		console.warn(`[${tag}] Skipping clip ${index + 1}/${total} — no segments`);
+	const mp4Path = getRecordingMp4(stream.recordingDir);
+	if (!mp4Path) {
+		console.warn(`[${tag}] Skipping clip ${index + 1}/${total} — recording.mp4 not found`);
 		return null;
 	}
-
-	const concatPath = path.join(tempDir, `${tag}_clip_${index}.concat.txt`);
-	fs.writeFileSync(concatPath, buildConcatContent(segments));
-
-	const trimStart = Math.max(0, localStart - segments[0].startTime);
 
 	return {
 		clip, entry, stream,
 		effectiveStart, effectiveEnd, dur,
-		localStart, localEnd, playlistPath,
-		trimStart, segments, concatPath
+		localStart, localEnd, mp4Path,
+		seekOffset: localStart
 	};
 }
 
@@ -108,26 +101,6 @@ export function cleanupTempDir(tempDir: string): void {
 }
 
 /**
- * Probe the video stream duration of a file in seconds. Returns 0 on failure.
- * Uses the video track specifically to avoid AAC encoder priming inflating the duration.
- */
-async function probeVideoDuration(filePath: string): Promise<number> {
-	try {
-		const proc = Bun.spawn(
-			['ffprobe', '-v', 'quiet', '-select_streams', 'v:0',
-				'-show_entries', 'stream=duration', '-of', 'default=noprint_wrappers=1:nokey=1', filePath],
-			{ stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' }
-		);
-		const stdout = await new Response(proc.stdout).text();
-		await proc.exited;
-		const dur = parseFloat(stdout.trim());
-		return isFinite(dur) && dur > 0 ? dur : 0;
-	} catch {
-		return 0;
-	}
-}
-
-/**
  * Concatenate multiple clip files into a single output using ffmpeg concat demuxer.
  * If there's only one file, it's renamed instead (no re-encode).
  */
@@ -143,7 +116,8 @@ export async function concatClipFiles(
 
 	// Probe video stream durations in parallel — use video-track timing for concat
 	// rather than container duration (which includes AAC encoder priming, causing gaps).
-	const durations = await Promise.all(clipFiles.map(probeVideoDuration));
+	const probes = await Promise.all(clipFiles.map(probeMedia));
+	const durations = probes.map((p) => p.videoDuration);
 
 	const concatListPath = path.join(tempDir, 'final_concat.txt');
 	const lines: string[] = [];
@@ -300,30 +274,50 @@ export function buildAudioMixFilter(
 	};
 }
 
-/** Probe a video file's width, height, and framerate. */
-export async function probeVideo(filePath: string): Promise<{ width: number; height: number; fps: number }> {
-	try {
-		const proc = Bun.spawn(
-			['ffprobe', '-v', 'quiet', '-select_streams', 'v:0',
-				'-show_entries', 'stream=width,height,r_frame_rate', '-of', 'json', filePath],
-			{ stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' }
+/**
+ * Find other-track clips that overlap a track 0 clip's composition window
+ * and resolve them into ExtraTrackInput entries for FFmpeg.
+ */
+export function resolveExtraTrackInputs(
+	otherTrackClips: OtherTrackClip[] | undefined,
+	clipCompStart: number,
+	clipCompEnd: number,
+	streamMap: Map<string, StreamLookup>,
+	tempDir: string,
+	clipIdx: number,
+	tag: string
+): ExtraTrackInput[] | undefined {
+	if (!otherTrackClips || otherTrackClips.length === 0) return undefined;
+
+	const overlapping = otherTrackClips.filter(
+		(o) => o.compStart < clipCompEnd && o.compEnd > clipCompStart
+	);
+	if (overlapping.length === 0) return undefined;
+
+	const results: ExtraTrackInput[] = [];
+	for (const otc of overlapping) {
+		const resolved = resolveClip(
+			otc.clip, otc.entry, streamMap.get(otc.clip.streamId),
+			clipIdx, 1, tempDir, `${tag}-track${otc.track}`
 		);
-		const stdout = await new Response(proc.stdout).text();
-		const code = await proc.exited;
-		if (code !== 0) return { width: 0, height: 0, fps: 0 };
-		const data = JSON.parse(stdout);
-		const stream = data.streams?.[0];
-		const width = parseInt(stream?.width, 10) || 0;
-		const height = parseInt(stream?.height, 10) || 0;
-		let fps = 0;
-		if (stream?.r_frame_rate) {
-			const [num, den] = stream.r_frame_rate.split('/').map(Number);
-			if (den > 0) fps = Math.round(num / den);
-		}
-		return { width, height, fps };
-	} catch {
-		return { width: 0, height: 0, fps: 0 };
+		if (!resolved) continue;
+
+		const overlapStart = Math.max(clipCompStart, otc.compStart);
+		const overlapEnd = Math.min(clipCompEnd, otc.compEnd);
+		const otcSourceOffset = overlapStart - otc.compStart;
+		const seekOffset = resolved.seekOffset + otcSourceOffset;
+		const dur = overlapEnd - overlapStart;
+
+		results.push({
+			track: otc.track,
+			mp4Path: resolved.mp4Path,
+			seekOffset,
+			dur,
+			clipOffset: overlapStart - clipCompStart,
+		});
 	}
+
+	return results.length > 0 ? results : undefined;
 }
 
 let nvencCached: boolean | null = null;

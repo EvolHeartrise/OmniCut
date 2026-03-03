@@ -102,8 +102,8 @@ export const GET: RequestHandler = async ({ params, request }) => {
 			'Content-Type': contentType,
 			'Content-Length': file.size.toString(),
 			'Accept-Ranges': 'bytes',
-			// Segments are immutable once written; cache aggressively
-			'Cache-Control': ext === '.ts' ? 'public, max-age=31536000, immutable' : 'no-cache'
+			// Segments and mp4 are immutable once written; cache aggressively
+			'Cache-Control': ext === '.ts' || ext === '.mp4' ? 'public, max-age=31536000, immutable' : 'no-cache'
 		}
 	});
 };

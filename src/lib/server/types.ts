@@ -1,7 +1,7 @@
 export interface StreamInfo {
 	id: string;
 	channel: string;
-	status: 'starting' | 'capturing' | 'error' | 'stopped';
+	status: 'starting' | 'capturing' | 'remuxing' | 'error' | 'stopped';
 	startedAt: number;
 	error?: string;
 	segmentCount: number;
@@ -17,6 +17,7 @@ export interface StreamInfo {
 	sourceUrl: string | null;
 	chatComplete: boolean;
 	durationSeconds: number | null;
+	remuxed?: boolean;
 }
 
 export interface ChatMessage {

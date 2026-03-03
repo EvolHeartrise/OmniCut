@@ -77,7 +77,8 @@ export function serializeStreamInfo(info: StreamInfo) {
 		chatMessageCount: chatMessageCounts.get(info.id) ?? 0,
 		transcriptionCount: transcriptionCounts.get(info.id) ?? 0,
 		chatComplete: info.chatComplete,
-		durationSeconds: info.durationSeconds
+		durationSeconds: info.durationSeconds,
+		remuxed: info.remuxed
 	};
 }
 

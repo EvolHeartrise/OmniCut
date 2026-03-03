@@ -1,6 +1,7 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { cleanupFiles } from './fsUtils.js';
+import { probeMedia } from './ffmpeg.js';
 
 const BATCH_SIZE = 15; // segments per batch (~30 seconds at 2s/segment, Whisper's full context window)
 const VOD_BATCH_SIZE = 3600; // segments per VOD batch (~2 hours at 2s/segment)
@@ -741,30 +742,70 @@ async function processVodJobQueue() {
 	}
 }
 
+/** Extract audio from mp4 for a time range, returning a wav file path. */
+async function extractAudioFromMp4(
+	mp4Path: string,
+	recordingDir: string,
+	startSec: number,
+	durationSec: number
+): Promise<string | null> {
+	const wavPath = path.join(
+		recordingDir,
+		'_transcribe_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6) + '.wav'
+	);
+
+	const proc = Bun.spawn(
+		[
+			'ffmpeg', '-y',
+			'-ss', startSec.toFixed(3),
+			'-t', durationSec.toFixed(3),
+			'-i', mp4Path,
+			'-vn', '-ar', '16000', '-ac', '1', '-f', 'wav', wavPath
+		],
+		{ stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' }
+	);
+
+	const code = await proc.exited;
+
+	if (code !== 0) {
+		console.warn(`[transcriber] mp4 audio extraction failed (code ${code})`);
+		cleanupFiles(wavPath);
+		return null;
+	}
+	return wavPath;
+}
+
 async function doFullTranscription(job: VodJob): Promise<void> {
 	const { streamId, recordingDir, onResult, language } = job;
 
-	// Enumerate all seg*.ts files, sort numerically
-	const allFiles = fs.readdirSync(recordingDir);
-	const segFiles = allFiles
-		.filter((f) => /^seg\d+\.ts$/.test(f))
-		.sort((a, b) => {
-			const numA = parseInt(a.match(/\d+/)![0], 10);
-			const numB = parseInt(b.match(/\d+/)![0], 10);
-			return numA - numB;
-		});
+	// Use recording.mp4 if available, otherwise fall back to segment-based extraction
+	const mp4Path = path.join(recordingDir, 'recording.mp4');
+	const useMp4 = fs.existsSync(mp4Path);
 
-	if (segFiles.length === 0) {
-		console.log(`[transcriber:vod] No segments found in ${recordingDir}, skipping full transcription`);
+	if (useMp4) {
+		await doFullTranscriptionMp4(job, mp4Path);
+	} else {
+		await doFullTranscriptionSegments(job);
+	}
+}
+
+/** Full transcription using recording.mp4 with time-based batches. */
+async function doFullTranscriptionMp4(job: VodJob, mp4Path: string): Promise<void> {
+	const { streamId, recordingDir, onResult, language } = job;
+	const VOD_BATCH_DURATION = 7200; // 2 hours per batch in seconds
+
+	const { duration: totalDuration } = await probeMedia(mp4Path);
+	if (totalDuration <= 0) {
+		console.log(`[transcriber:vod] Could not determine duration of ${mp4Path}, skipping`);
 		return;
 	}
 
-	const totalBatches = Math.ceil(segFiles.length / VOD_BATCH_SIZE);
+	const totalBatches = Math.ceil(totalDuration / VOD_BATCH_DURATION);
 	console.log(
-		`[transcriber:vod] Starting full transcription for stream ${streamId} (${segFiles.length} segments, ${totalBatches} batches)`
+		`[transcriber:vod] Starting full transcription for stream ${streamId} (${totalDuration.toFixed(0)}s, ${totalBatches} batches, mp4)`
 	);
 
-	// Ensure VOD worker pool is started; wait until at least one worker is ready (with timeout)
+	// Ensure VOD worker pool is started
 	ensurePool(vodPool);
 	const poolWaitStart = Date.now();
 	while (vodPool.readyCount === 0 && !vodPool.failed) {
@@ -782,40 +823,134 @@ async function doFullTranscription(job: VodJob): Promise<void> {
 		return;
 	}
 
-	// Process in batches, pipelining: extract WAV for batch N+1 on disk while
-	// the GPU transcribes batch N. Only disk space is used, not RAM.
 	let totalSentences = 0;
 	let totalDuplicates = 0;
-	let pendingPartial: { text: string; startTime: number; endTime: number; words?: WordTimestamp[] } | null =
-		null;
+	let pendingPartial: { text: string; startTime: number; endTime: number; words?: WordTimestamp[] } | null = null;
+
+	// Pre-extract batch 0
+	let pendingExtraction: Promise<string | null> = extractAudioFromMp4(
+		mp4Path, recordingDir, 0, Math.min(VOD_BATCH_DURATION, totalDuration)
+	);
+
+	for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
+		const batchStart = batchIdx * VOD_BATCH_DURATION;
+		const batchDur = Math.min(VOD_BATCH_DURATION, totalDuration - batchStart);
+
+		const wavPath = await pendingExtraction;
+
+		// Pipeline: start extracting next batch while transcribing current
+		if (batchIdx + 1 < totalBatches) {
+			const nextStart = (batchIdx + 1) * VOD_BATCH_DURATION;
+			const nextDur = Math.min(VOD_BATCH_DURATION, totalDuration - nextStart);
+			pendingExtraction = extractAudioFromMp4(mp4Path, recordingDir, nextStart, nextDur);
+		}
+
+		if (!wavPath) {
+			console.warn(`[transcriber:vod] Audio extraction failed for batch ${batchIdx + 1}/${totalBatches}, skipping`);
+			continue;
+		}
+
+		try {
+			const raw = await transcribeAudio(vodPool, wavPath, language, 5, VOD_QUEUE_ITEM_TIMEOUT_MS);
+			const sentences = deduplicateSentences(raw);
+			totalDuplicates += raw.length - sentences.length;
+
+			const result = processSentences(
+				sentences,
+				batchStart,
+				pendingPartial,
+				(text, startTime, endTime, words) => onResult(streamId, text, startTime, endTime, words)
+			);
+			pendingPartial = result.pendingPartial;
+			totalSentences += result.emitted;
+
+			console.log(
+				`[transcriber:vod] Stream ${streamId}: batch ${batchIdx + 1}/${totalBatches} (${totalSentences} sentences so far)`
+			);
+		} catch (err) {
+			console.warn(
+				`[transcriber:vod] Batch ${batchIdx + 1}/${totalBatches} failed for stream ${streamId}: ${err instanceof Error ? err.message : err}`
+			);
+		} finally {
+			try { fs.unlinkSync(wavPath); } catch {}
+		}
+	}
+
+	// Flush any remaining partial sentence
+	if (pendingPartial) {
+		onResult(streamId, pendingPartial.text, pendingPartial.startTime, pendingPartial.endTime, pendingPartial.words);
+		totalSentences++;
+	}
+
+	console.log(
+		`[transcriber:vod] Full transcription complete for stream ${streamId}: ${totalSentences} sentences${totalDuplicates > 0 ? ` (${totalDuplicates} duplicates removed)` : ''}`
+	);
+}
+
+/** Legacy: full transcription using raw HLS segments (for non-remuxed recordings). */
+async function doFullTranscriptionSegments(job: VodJob): Promise<void> {
+	const { streamId, recordingDir, onResult, language } = job;
+
+	const allFiles = fs.readdirSync(recordingDir);
+	const segFiles = allFiles
+		.filter((f) => /^seg\d+\.ts$/.test(f))
+		.sort((a, b) => {
+			const numA = parseInt(a.match(/\d+/)![0], 10);
+			const numB = parseInt(b.match(/\d+/)![0], 10);
+			return numA - numB;
+		});
+
+	if (segFiles.length === 0) {
+		console.log(`[transcriber:vod] No segments found in ${recordingDir}, skipping full transcription`);
+		return;
+	}
+
+	const totalBatches = Math.ceil(segFiles.length / VOD_BATCH_SIZE);
+	console.log(
+		`[transcriber:vod] Starting full transcription for stream ${streamId} (${segFiles.length} segments, ${totalBatches} batches, legacy)`
+	);
+
+	ensurePool(vodPool);
+	const poolWaitStart = Date.now();
+	while (vodPool.readyCount === 0 && !vodPool.failed) {
+		if (Date.now() - poolWaitStart > POOL_READY_TIMEOUT_MS) {
+			console.error(
+				`[transcriber:vod] Pool not ready after ${POOL_READY_TIMEOUT_MS / 1000}s, giving up on stream ${streamId}`
+			);
+			return;
+		}
+		await new Promise((r) => setTimeout(r, 500));
+		ensurePool(vodPool);
+	}
+	if (vodPool.failed) {
+		console.warn(`[transcriber:vod] Pool failed, cannot transcribe stream ${streamId}`);
+		return;
+	}
+
+	let totalSentences = 0;
+	let totalDuplicates = 0;
+	let pendingPartial: { text: string; startTime: number; endTime: number; words?: WordTimestamp[] } | null = null;
 
 	const getBatchFiles = (idx: number) => {
 		const start = idx * VOD_BATCH_SIZE;
 		return segFiles.slice(start, Math.min(start + VOD_BATCH_SIZE, segFiles.length));
 	};
 
-	// Pre-extract batch 0
 	let pendingExtraction: Promise<string | null> = extractAudio(recordingDir, getBatchFiles(0));
 
 	for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
 		const batchFiles = getBatchFiles(batchIdx);
-
-		// Await the extraction kicked off last iteration (or pre-loop for batch 0)
 		const wavPath = await pendingExtraction;
 
-		// Start extracting batch N+1 immediately (pipelines with GPU transcription below)
 		if (batchIdx + 1 < totalBatches) {
 			pendingExtraction = extractAudio(recordingDir, getBatchFiles(batchIdx + 1));
 		}
 
 		if (!wavPath) {
-			console.warn(
-				`[transcriber:vod] Audio extraction failed for batch ${batchIdx + 1}/${totalBatches}, skipping`
-			);
+			console.warn(`[transcriber:vod] Audio extraction failed for batch ${batchIdx + 1}/${totalBatches}, skipping`);
 			continue;
 		}
 
-		// Compute time offset from the first segment's index
 		const firstSegIndex = parseInt(batchFiles[0].match(/\d+/)![0], 10);
 		const batchOffset = firstSegIndex * SEGMENT_DURATION;
 
@@ -841,21 +976,12 @@ async function doFullTranscription(job: VodJob): Promise<void> {
 				`[transcriber:vod] Batch ${batchIdx + 1}/${totalBatches} failed for stream ${streamId}: ${err instanceof Error ? err.message : err}`
 			);
 		} finally {
-			try {
-				fs.unlinkSync(wavPath);
-			} catch {}
+			try { fs.unlinkSync(wavPath); } catch {}
 		}
 	}
 
-	// Flush any remaining partial sentence
 	if (pendingPartial) {
-		onResult(
-			streamId,
-			pendingPartial.text,
-			pendingPartial.startTime,
-			pendingPartial.endTime,
-			pendingPartial.words
-		);
+		onResult(streamId, pendingPartial.text, pendingPartial.startTime, pendingPartial.endTime, pendingPartial.words);
 		totalSentences++;
 	}
 

@@ -53,7 +53,9 @@
 	let lastStateUpdate = 0;
 	const STATE_UPDATE_INTERVAL = 250; // ms
 
-	let playlistUrl = $derived(`/hls/${stream.id}/playlist.m3u8`);
+	let playlistUrl = $derived(
+		stream.remuxed ? `/hls/${stream.id}/recording.mp4` : `/hls/${stream.id}/playlist.m3u8`
+	);
 	let offset = $derived($syncOffsets[stream.id] || 0);
 	let allCaptions = $derived($transcriptions[stream.id] || []);
 	// Show current + previous transcription lines
@@ -170,6 +172,23 @@
 			hls = null;
 		}
 
+		// For remuxed recordings, use native <video> — mp4 seeking works natively
+		if (stream.remuxed) {
+			videoEl.src = playlistUrl;
+			videoEl.volume = volume;
+			videoEl.muted = muted;
+			videoEl.playbackRate = get(masterPlaybackRate);
+			if (shouldAutoPlay()) {
+				needsInitialSeek = true;
+				const mt = get(masterTime);
+				const anchor = stream.startedAt / 1000;
+				const targetLocal = Math.max(0, mt - anchor + offset);
+				videoEl.currentTime = targetLocal;
+				videoEl.play().catch(() => {});
+			}
+			return;
+		}
+
 		if (!Hls.isSupported()) {
 			videoEl.src = playlistUrl;
 			if (shouldAutoPlay()) videoEl.play().catch(() => {});
@@ -248,10 +267,13 @@
 		}
 	}
 
-	// Init HLS when stream has data (capturing, stopped, or error — segments are on disk)
+	// Init playback when stream has data (capturing, stopped, or error — segments/mp4 on disk)
 	$effect(() => {
-		if (stream.status !== 'starting' && videoEl && !hls) {
-			initHls();
+		if (stream.status !== 'starting' && stream.status !== 'remuxing' && videoEl) {
+			// For remuxed mp4 playback, re-init when remuxed flag changes (no hls instance)
+			if (stream.remuxed || !hls) {
+				initHls();
+			}
 		}
 	});
 
@@ -280,6 +302,8 @@
 		</span>
 		{#if stream.status === 'stopped'}
 			<span class="status-badge">Stopped</span>
+		{:else if stream.status === 'remuxing'}
+			<span class="status-badge remuxing">Remuxing...</span>
 		{:else if stream.status === 'starting' || stream.status === 'error'}
 			<span class="status-badge" class:error={stream.status === 'error'}>
 				{stream.status === 'starting' ? 'Starting...' : 'Error'}
@@ -301,6 +325,11 @@
 			<div class="overlay">
 				<div class="spinner"></div>
 				<p>Connecting to {stream.channel}...</p>
+			</div>
+		{:else if stream.status === 'remuxing'}
+			<div class="overlay">
+				<div class="spinner"></div>
+				<p>Remuxing to mp4...</p>
 			</div>
 		{/if}
 
@@ -456,6 +485,11 @@
 
 	.status-badge.error {
 		background: #dc2626;
+		color: white;
+	}
+
+	.status-badge.remuxing {
+		background: #d97706;
 		color: white;
 	}
 

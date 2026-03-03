@@ -18,7 +18,7 @@
 	import { untrack } from 'svelte';
 	import { page } from '$app/state';
 	import CameraRegionOverlay from '$lib/components/CameraRegionOverlay.svelte';
-	import ReviewTranscriptPanel from '$lib/components/ReviewTranscriptPanel.svelte';
+	import TranscriptPanel from '$lib/components/TranscriptPanel.svelte';
 	import ClipChatPanel from '$lib/components/ClipChatPanel.svelte';
 
 	// --- URL-targeted clip (e.g. /review?clip=123) ---
@@ -979,7 +979,7 @@
 			</div>
 
 			{#if transcriptPanelOpen}
-				<ReviewTranscriptPanel {clip} {currentLocalTime} onseek={(t) => { if (videoEl) videoEl.currentTime = t; }} />
+				<TranscriptPanel {clip} {currentLocalTime} onseek={(t) => { if (videoEl) videoEl.currentTime = t; }} />
 			{/if}
 			{#if chatPanelOpen}
 				<ClipChatPanel {clip} {currentLocalTime} onseek={(t) => { if (videoEl) videoEl.currentTime = t; }} />

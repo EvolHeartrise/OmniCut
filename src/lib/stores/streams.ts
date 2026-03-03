@@ -24,7 +24,7 @@ export type { ClipRegion, VideoRecord };
 export interface StreamState {
 	id: string;
 	channel: string;
-	status: 'starting' | 'capturing' | 'error' | 'stopped';
+	status: 'starting' | 'capturing' | 'remuxing' | 'error' | 'stopped';
 	startedAt: number;
 	error?: string;
 	segmentCount: number;
@@ -41,6 +41,7 @@ export interface StreamState {
 	transcriptionCount: number;
 	chatComplete: boolean;
 	durationSeconds: number | null;
+	remuxed?: boolean;
 }
 
 export const streams = writable<StreamState[]>([]);

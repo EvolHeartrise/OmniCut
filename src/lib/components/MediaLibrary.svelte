@@ -87,6 +87,8 @@
 				return '#22c55e';
 			case 'starting':
 				return '#eab308';
+			case 'remuxing':
+				return '#d97706';
 			case 'stopped':
 				return '#666';
 			case 'error':
@@ -186,6 +188,9 @@
 							<td class="cell-actions">
 								{#if stream.status === 'capturing'}
 									<button class="btn-action btn-stop" onclick={() => stopStream(stream.id)} title="Stop downloading">Stop</button>
+								{/if}
+								{#if stream.status === 'remuxing'}
+									<span class="status-text">Remuxing...</span>
 								{/if}
 								{#if stream.status === 'stopped'}
 									{#if stream.platform === 'twitch'}
@@ -453,6 +458,12 @@
 	.btn-retranscribe:hover {
 		background: #7c3aed;
 		color: #fff;
+	}
+
+	.status-text {
+		font-size: 0.65rem;
+		color: #d97706;
+		font-weight: 600;
 	}
 
 	.btn-delete {

@@ -10,8 +10,8 @@ export function initStreamStatements(db: Database): void {
 	stmtSaveStream = db.prepare(
 		`INSERT INTO streams
 		(id, channel, status, started_at, error, segment_count, disk_usage_bytes,
-		 viewer_count, stream_title, game_name, recording_dir, offset, source_type, parent_stream_id, platform, source_url, chat_complete, duration_seconds)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 viewer_count, stream_title, game_name, recording_dir, offset, source_type, parent_stream_id, platform, source_url, chat_complete, duration_seconds, remuxed)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			status = excluded.status,
 			started_at = excluded.started_at,
@@ -28,7 +28,8 @@ export function initStreamStatements(db: Database): void {
 			platform = excluded.platform,
 			source_url = excluded.source_url,
 			chat_complete = excluded.chat_complete,
-			duration_seconds = excluded.duration_seconds`
+			duration_seconds = excluded.duration_seconds,
+			remuxed = excluded.remuxed`
 	);
 }
 
@@ -51,6 +52,7 @@ interface StreamRow {
 	source_url: string | null;
 	chat_complete: number;
 	duration_seconds: number | null;
+	remuxed: number;
 }
 
 export function saveStream(info: StreamInfo): void {
@@ -72,7 +74,8 @@ export function saveStream(info: StreamInfo): void {
 		info.platform,
 		info.sourceUrl,
 		info.chatComplete ? 1 : 0,
-		info.durationSeconds
+		info.durationSeconds,
+		info.remuxed ? 1 : 0
 	];
 	if (stmtSaveStream) {
 		stmtSaveStream.run(...params);
@@ -81,8 +84,8 @@ export function saveStream(info: StreamInfo): void {
 		d.run(
 			`INSERT INTO streams
 			(id, channel, status, started_at, error, segment_count, disk_usage_bytes,
-			 viewer_count, stream_title, game_name, recording_dir, offset, source_type, parent_stream_id, platform, source_url, chat_complete, duration_seconds)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 viewer_count, stream_title, game_name, recording_dir, offset, source_type, parent_stream_id, platform, source_url, chat_complete, duration_seconds, remuxed)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET
 				status = excluded.status,
 				started_at = excluded.started_at,
@@ -99,7 +102,8 @@ export function saveStream(info: StreamInfo): void {
 				platform = excluded.platform,
 				source_url = excluded.source_url,
 				chat_complete = excluded.chat_complete,
-				duration_seconds = excluded.duration_seconds`,
+				duration_seconds = excluded.duration_seconds,
+				remuxed = excluded.remuxed`,
 			params
 		);
 	}
@@ -131,7 +135,8 @@ export function loadAllStreams(): StreamInfo[] {
 		platform: (r.platform || 'twitch') as StreamInfo['platform'],
 		sourceUrl: r.source_url || null,
 		chatComplete: !!r.chat_complete,
-		durationSeconds: r.duration_seconds ?? null
+		durationSeconds: r.duration_seconds ?? null,
+		remuxed: !!r.remuxed
 	}));
 }
 

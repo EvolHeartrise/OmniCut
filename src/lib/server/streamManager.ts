@@ -4,6 +4,7 @@ import * as crypto from 'node:crypto';
 import { startCapture, fetchStreamMeta, fetchVodMeta, type CaptureHandle } from './captureProcess.js';
 import { startTranscription, stopTranscription, transcribeFullRecording, shutdownTranscriber } from './transcriber.js';
 
+import { remuxRecording, getRecordingMp4 } from './remuxer.js';
 import { startVodChatFetch, extractVideoId } from './vodChatFetcher.js';
 import type { StreamInfo, ChatMessage } from './types.js';
 import * as db from './db/index.js';
@@ -67,7 +68,7 @@ interface CaptureCallbackOpts {
 }
 
 function createStatusCallback(opts: CaptureCallbackOpts): (info: StreamInfo) => void {
-	return (info: StreamInfo) => {
+	const callback = (info: StreamInfo) => {
 		broadcastUpdate(info);
 		db.saveStream(info);
 
@@ -108,6 +109,32 @@ function createStatusCallback(opts: CaptureCallbackOpts): (info: StreamInfo) => 
 			);
 		}
 
+		// Handle remuxing status — remux recording to mp4
+		if (info.status === 'remuxing') {
+			stopTranscription(opts.id);
+			remuxRecording(info.recordingDir)
+				.then((result) => {
+					info.remuxed = true;
+					info.durationSeconds = result.durationSeconds;
+					// Update disk usage to include mp4
+					try {
+						const mp4Stat = fs.statSync(result.mp4Path);
+						info.diskUsageBytes += mp4Stat.size;
+					} catch { /* ok */ }
+					info.status = 'stopped';
+					// Re-invoke callback to trigger full transcription
+					callback(info);
+				})
+				.catch((err) => {
+					console.error(`[remux:${info.channel}] Remux failed:`, err);
+					info.status = 'error';
+					info.error = `Remux failed: ${err instanceof Error ? err.message : String(err)}`;
+					broadcastUpdate(info);
+					db.saveStream(info);
+				});
+			return;
+		}
+
 		// Full-file transcription when VOD download completes
 		if (info.status === 'stopped' && opts.fullTranscribeOnStop && !handle.transcriptionStarted) {
 			handle.transcriptionStarted = true;
@@ -123,6 +150,7 @@ function createStatusCallback(opts: CaptureCallbackOpts): (info: StreamInfo) => 
 			});
 		}
 	};
+	return callback;
 }
 
 // In-memory store of active captures (hot cache; persisted to SQLite on changes)
@@ -140,6 +168,7 @@ export async function initStreamManager(): Promise<void> {
 
 	// Restore streams as stopped stub handles
 	const savedStreams = db.loadAllStreams();
+	const needsRemux: StreamInfo[] = [];
 	for (const info of savedStreams) {
 		// Verify recording directory still exists
 		if (!fs.existsSync(info.recordingDir)) {
@@ -151,15 +180,43 @@ export async function initStreamManager(): Promise<void> {
 		// Mark all restored streams as stopped (processes are gone after restart)
 		info.status = 'stopped';
 
+		// Check remux state
+		const mp4Path = getRecordingMp4(info.recordingDir);
+		const playlistPath = path.join(info.recordingDir, 'playlist.m3u8');
+		const hasPlaylist = fs.existsSync(playlistPath);
+
+		if (mp4Path) {
+			// mp4 exists — check if it's valid (not suspiciously small / partial)
+			try {
+				const mp4Stat = fs.statSync(mp4Path);
+				if (hasPlaylist && mp4Stat.size < 1024) {
+					// Partial/corrupt mp4 — delete and queue for remux
+					console.warn(`[init] Deleting partial recording.mp4 for ${info.channel} (${mp4Stat.size} bytes)`);
+					fs.unlinkSync(mp4Path);
+					info.remuxed = false;
+					if (hasPlaylist) needsRemux.push(info);
+				} else {
+					info.remuxed = true;
+				}
+			} catch {
+				info.remuxed = false;
+				if (hasPlaylist) needsRemux.push(info);
+			}
+		} else if (hasPlaylist) {
+			// No mp4 but segments exist — queue for remux
+			info.remuxed = false;
+			needsRemux.push(info);
+		}
+
 		// Backfill VOD duration from HLS playlist if not stored yet
 		if (info.durationSeconds == null) {
-			const playlistPath = path.join(info.recordingDir, 'playlist.m3u8');
 			const dur = parsePlaylistDuration(playlistPath);
 			if (dur > 0) {
 				info.durationSeconds = dur;
-				db.saveStream(info);
 			}
 		}
+
+		db.saveStream(info);
 
 		const stubHandle: CaptureHandle = {
 			info,
@@ -218,7 +275,43 @@ export async function initStreamManager(): Promise<void> {
 
 	const streamCount = captures.size;
 	console.log(`[init] Restored ${streamCount} streams, ${getClipRegionCount()} clip regions` +
-		(chatResumed > 0 ? `, resumed ${chatResumed} chat downloads` : ''));
+		(chatResumed > 0 ? `, resumed ${chatResumed} chat downloads` : '') +
+		(needsRemux.length > 0 ? `, ${needsRemux.length} pending remux` : ''));
+
+	// Auto-migration: remux stopped recordings that don't have recording.mp4 yet.
+	// Runs sequentially in the background so it doesn't block startup.
+	if (needsRemux.length > 0) {
+		(async () => {
+			for (const info of needsRemux) {
+				const handle = captures.get(info.id);
+				if (!handle || handle.info.status !== 'stopped') continue;
+
+				console.log(`[remux-migrate] Remuxing ${info.channel}...`);
+				handle.info.status = 'remuxing';
+				broadcastUpdate(handle.info);
+				db.saveStream(handle.info);
+
+				try {
+					const result = await remuxRecording(info.recordingDir);
+					handle.info.remuxed = true;
+					handle.info.durationSeconds = result.durationSeconds;
+					try {
+						const mp4Stat = fs.statSync(result.mp4Path);
+						handle.info.diskUsageBytes += mp4Stat.size;
+					} catch { /* ok */ }
+					handle.info.status = 'stopped';
+					console.log(`[remux-migrate] ${info.channel} remuxed successfully (${result.durationSeconds.toFixed(1)}s)`);
+				} catch (err) {
+					console.error(`[remux-migrate] ${info.channel} remux failed:`, err);
+					handle.info.status = 'stopped'; // Revert to stopped, segments still intact
+				}
+
+				broadcastUpdate(handle.info);
+				db.saveStream(handle.info);
+			}
+			console.log(`[remux-migrate] Auto-migration complete`);
+		})();
+	}
 }
 
 // Re-export SSE client management

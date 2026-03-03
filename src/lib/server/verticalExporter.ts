@@ -9,12 +9,13 @@ import { clearEffectRendererCache } from './effectRenderer.js';
 import { clearChatEffectCache } from './chatEffectRenderer.js';
 import {
 	resolveClip, buildOutputPath, createTempDir, cleanupTempDir,
-	concatClipFiles, resolveAudioOverlays, probeVideo, detectNvenc
+	concatClipFiles, resolveAudioOverlays, detectNvenc,
+	resolveExtraTrackInputs
 } from './exporterCommon.js';
+import { probeMedia } from './ffmpeg.js';
 import { resolveOverlappingEffects, resolveViewEffects } from './effectResolver.js';
-import { encodeClip, type ExtraTrackInput } from './exporterPipeline.js';
-import type { StreamLookup, ClipContext } from './exporterTypes.js';
-import type { OtherTrackClip } from './exporter.js';
+import { encodeClip } from './exporterPipeline.js';
+import type { StreamLookup, ClipContext, OtherTrackClip } from './exporterTypes.js';
 
 // Output dimensions
 const OUT_W = 1080;
@@ -63,11 +64,11 @@ export async function exportVerticalVideo(
 			);
 			if (!resolved) continue;
 
-			const { dur, segments, localStart: clipLocalStart, localEnd: clipLocalEnd } = resolved;
+			const { dur, localStart: clipLocalStart, localEnd: clipLocalEnd } = resolved;
 			onProgress(`Encoding clip ${i + 1}/${verticalClips.length} as vertical (${dur.toFixed(1)}s)`, i, totalSteps);
 
-			// Probe source resolution from first segment
-			const probe = await probeVideo(segments[0].file);
+			// Probe source resolution from mp4
+			const probe = await probeMedia(resolved.mp4Path);
 			if (probe.width === 0 || probe.height === 0) {
 				console.warn(`[vertical-export] Skipping clip ${i + 1} (probe failed)`);
 				continue;
@@ -107,7 +108,7 @@ export async function exportVerticalVideo(
 				: undefined;
 
 			// Resolve extra track inputs for multi-track compositing
-			const extraTrackInputs = resolveExtraTrackInputsVert(
+			const extraTrackInputs = resolveExtraTrackInputs(
 				otherTrackClips, clipCompStart, clipCompEnd, streamMap, tempDir, i, 'vertical-export'
 			);
 
@@ -143,50 +144,4 @@ export async function exportVerticalVideo(
 	} finally {
 		cleanupTempDir(tempDir);
 	}
-}
-
-/**
- * Find other-track clips that overlap a track 0 clip's composition window
- * and resolve them into ExtraTrackInput entries for FFmpeg.
- */
-function resolveExtraTrackInputsVert(
-	otherTrackClips: OtherTrackClip[] | undefined,
-	clipCompStart: number,
-	clipCompEnd: number,
-	streamMap: Map<string, StreamLookup>,
-	tempDir: string,
-	clipIdx: number,
-	tag: string
-): ExtraTrackInput[] | undefined {
-	if (!otherTrackClips || otherTrackClips.length === 0) return undefined;
-
-	const overlapping = otherTrackClips.filter(
-		(o) => o.compStart < clipCompEnd && o.compEnd > clipCompStart
-	);
-	if (overlapping.length === 0) return undefined;
-
-	const results: ExtraTrackInput[] = [];
-	for (const otc of overlapping) {
-		const resolved = resolveClip(
-			otc.clip, otc.entry, streamMap.get(otc.clip.streamId),
-			clipIdx, 1, tempDir, `${tag}-track${otc.track}`
-		);
-		if (!resolved) continue;
-
-		const overlapStart = Math.max(clipCompStart, otc.compStart);
-		const overlapEnd = Math.min(clipCompEnd, otc.compEnd);
-		const otcSourceOffset = overlapStart - otc.compStart;
-		const seekOffset = resolved.trimStart + otcSourceOffset;
-		const dur = overlapEnd - overlapStart;
-
-		results.push({
-			track: otc.track,
-			concatPath: resolved.concatPath,
-			seekOffset,
-			dur,
-			clipOffset: overlapStart - clipCompStart,
-		});
-	}
-
-	return results.length > 0 ? results : undefined;
 }

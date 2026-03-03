@@ -16,7 +16,7 @@ import type { FrameSink } from './chatEffectRenderer.js';
 /** Extra video track input for multi-track compositing. */
 export interface ExtraTrackInput {
 	track: number;
-	concatPath: string;
+	mp4Path: string;
 	seekOffset: number;
 	dur: number;
 	/** Offset from the start of the current clip's composition window (seconds). */
@@ -75,7 +75,7 @@ export async function encodeClip(opts: ClipEncodeOptions): Promise<string> {
 		extraTrackInputs
 	} = opts;
 
-	const { dur, trimStart: seekOffset, concatPath } = resolved;
+	const { dur, seekOffset, mp4Path } = resolved;
 	// Use input seeking (-ss before -i) so the filter graph PTS starts from ~0
 	// and the output file has PTS starting from 0. This prevents edit-list
 	// misalignment that causes black frames at concat boundaries.
@@ -100,14 +100,10 @@ export async function encodeClip(opts: ClipEncodeOptions): Promise<string> {
 
 		for (let ti = 0; ti < extraTrackInputs.length; ti++) {
 			const et = extraTrackInputs[ti];
-			// Each extra track is a separate concat input with seek.
-			// +genpts ensures PTS starts at 0 (like track 0) so view
-			// overlay enable timing aligns with the canvas.
 			extraInputs.push(
-				'-fflags', '+genpts',
 				'-ss', et.seekOffset.toFixed(3),
 				'-t', et.dur.toFixed(3),
-				'-f', 'concat', '-safe', '0', '-i', et.concatPath
+				'-i', et.mp4Path
 			);
 			trackInputLabels.set(et.track, `t${et.track}`);
 		}
@@ -302,12 +298,11 @@ export async function encodeClip(opts: ClipEncodeOptions): Promise<string> {
 	}
 
 	const ffmpegArgs = [
-		// Input options: seek + limit reading on the concat source.
+		// Input options: seek + limit reading on the mp4 source.
 		// Input seeking rebases PTS to ~0, avoiding edit-list issues during concat.
-		'-fflags', '+genpts',
 		'-ss', seekOffset.toFixed(3),
 		'-t', dur.toFixed(3),
-		'-f', 'concat', '-safe', '0', '-i', concatPath,
+		'-i', mp4Path,
 		...extraInputs,
 		...videoFilterArgs,
 		// Output -t prevents the color source (d=999) from extending past the clip.

@@ -263,7 +263,8 @@ export async function initDatabase(): Promise<void> {
 		'ALTER TABLE videos ADD COLUMN effect_entries TEXT',
 		'ALTER TABLE exports ADD COLUMN effect_entries TEXT',
 		'ALTER TABLE videos ADD COLUMN vertical_layout TEXT',
-		'ALTER TABLE exports ADD COLUMN vertical_layout TEXT'
+		'ALTER TABLE exports ADD COLUMN vertical_layout TEXT',
+		'ALTER TABLE streams ADD COLUMN remuxed INTEGER NOT NULL DEFAULT 0'
 	];
 	for (const sql of migrations) {
 		try { db.exec(sql); } catch { /* column already exists */ }

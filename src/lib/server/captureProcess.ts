@@ -106,7 +106,7 @@ export function startCapture(
 	let nextSegIndex = 0;
 	let cumulativeDiskUsage = 0;
 	const segmentWatchInterval = setInterval(async () => {
-		if (info.status === 'stopped' || info.status === 'error') return;
+		if (info.status === 'stopped' || info.status === 'error' || info.status === 'remuxing') return;
 		try {
 			// Probe sequentially for new segments
 			while (true) {
@@ -142,6 +142,7 @@ export function startCapture(
 
 	const kill = () => {
 		info.status = 'stopped';
+		info.remuxed = false;
 		clearPolling();
 		try {
 			sourceProc?.kill();
@@ -237,7 +238,7 @@ export function startCapture(
 
 		ffmpegRef.exited.then((code) => {
 			console.log(`[ffmpeg:${channel}] exited with code ${code}`);
-			if (info.status !== 'stopped' && info.status !== 'error') {
+			if (info.status !== 'stopped' && info.status !== 'error' && info.status !== 'remuxing') {
 				clearPolling();
 				if (code !== 0) {
 					info.status = 'error';
@@ -245,7 +246,8 @@ export function startCapture(
 						? `FFmpeg error: ${lastErrors['ffmpeg']}`
 						: `ffmpeg exited with code ${code}`;
 				} else {
-					info.status = 'stopped';
+					// Natural completion — trigger remux
+					info.status = 'remuxing';
 				}
 				onStatusChange(info);
 			}
@@ -253,7 +255,7 @@ export function startCapture(
 
 		sourceRef.exited.then((code) => {
 			console.log(`[streamlink:${channel}] exited with code ${code}`);
-			if (info.status !== 'stopped' && info.status !== 'error') {
+			if (info.status !== 'stopped' && info.status !== 'error' && info.status !== 'remuxing') {
 				clearPolling();
 				if (code !== 0) {
 					info.status = 'error';
@@ -263,10 +265,9 @@ export function startCapture(
 						: lastErrors['streamlink']
 							? `streamlink: ${lastErrors['streamlink']}`
 							: `streamlink exited with code ${code}`;
-				} else {
-					info.status = 'stopped';
+					onStatusChange(info);
 				}
-				onStatusChange(info);
+				// On clean exit (code 0), don't set status — wait for FFmpeg to finish
 			}
 		});
 	}

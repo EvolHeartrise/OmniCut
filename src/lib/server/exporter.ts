@@ -8,20 +8,13 @@ import { clearEffectRendererCache } from './effectRenderer.js';
 import { clearChatEffectCache } from './chatEffectRenderer.js';
 import {
 	resolveClip, buildOutputPath, createTempDir, cleanupTempDir,
-	concatClipFiles, resolveAudioOverlays, probeVideo, detectNvenc
+	concatClipFiles, resolveAudioOverlays, detectNvenc,
+	resolveExtraTrackInputs
 } from './exporterCommon.js';
+import { probeMedia } from './ffmpeg.js';
 import { resolveOverlappingEffects, resolveViewEffects } from './effectResolver.js';
-import { encodeClip, type ExtraTrackInput } from './exporterPipeline.js';
-import type { StreamLookup, ClipContext } from './exporterTypes.js';
-
-/** A clip on a non-zero video track with its composition position. */
-export interface OtherTrackClip {
-	clip: ClipRegion;
-	entry?: ClipEntry;
-	track: number;
-	compStart: number; // composition-time start (seconds)
-	compEnd: number;   // composition-time end (seconds)
-}
+import { encodeClip } from './exporterPipeline.js';
+import type { StreamLookup, ClipContext, OtherTrackClip } from './exporterTypes.js';
 
 /**
  * Export all clip regions as a single stitched video file.
@@ -59,11 +52,11 @@ export async function exportVideo(
 			);
 			if (!resolved) { skipped++; continue; }
 
-			const { dur, segments, localStart: clipLocalStart, localEnd: clipLocalEnd } = resolved;
+			const { dur, localStart: clipLocalStart, localEnd: clipLocalEnd } = resolved;
 			onProgress(`Encoding clip ${i + 1}/${clips.length} (${dur.toFixed(1)}s)`, i, totalSteps);
 
 			// Probe actual source resolution (no scaling in standard export)
-			const probe = await probeVideo(segments[0].file);
+			const probe = await probeMedia(resolved.mp4Path);
 			const srcW = probe.width || 1920;
 			const srcH = probe.height || 1080;
 
@@ -130,51 +123,4 @@ export async function exportVideo(
 	} finally {
 		cleanupTempDir(tempDir);
 	}
-}
-
-/**
- * Find other-track clips that overlap a track 0 clip's composition window
- * and resolve them into ExtraTrackInput entries for FFmpeg.
- */
-function resolveExtraTrackInputs(
-	otherTrackClips: OtherTrackClip[] | undefined,
-	clipCompStart: number,
-	clipCompEnd: number,
-	streamMap: Map<string, StreamLookup>,
-	tempDir: string,
-	clipIdx: number,
-	tag: string
-): ExtraTrackInput[] | undefined {
-	if (!otherTrackClips || otherTrackClips.length === 0) return undefined;
-
-	const overlapping = otherTrackClips.filter(
-		(o) => o.compStart < clipCompEnd && o.compEnd > clipCompStart
-	);
-	if (overlapping.length === 0) return undefined;
-
-	const results: ExtraTrackInput[] = [];
-	for (const otc of overlapping) {
-		const resolved = resolveClip(
-			otc.clip, otc.entry, streamMap.get(otc.clip.streamId),
-			clipIdx, 1, tempDir, `${tag}-track${otc.track}`
-		);
-		if (!resolved) continue;
-
-		// Compute the overlap portion in composition time
-		const overlapStart = Math.max(clipCompStart, otc.compStart);
-		const overlapEnd = Math.min(clipCompEnd, otc.compEnd);
-		const otcSourceOffset = overlapStart - otc.compStart;
-		const seekOffset = resolved.trimStart + otcSourceOffset;
-		const dur = overlapEnd - overlapStart;
-
-		results.push({
-			track: otc.track,
-			concatPath: resolved.concatPath,
-			seekOffset,
-			dur,
-			clipOffset: overlapStart - clipCompStart,
-		});
-	}
-
-	return results.length > 0 ? results : undefined;
 }
