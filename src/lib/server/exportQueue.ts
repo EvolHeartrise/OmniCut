@@ -8,9 +8,10 @@ import { newExportId } from '../ids.js';
 import { getClipRegion } from './clipManager.js';
 import { validateClipIds } from './clipValidation.js';
 import { getVideo } from './videoManager.js';
-import { exportVideo } from './exporter.js';
+import { exportVideo, type OtherTrackClip } from './exporter.js';
 import type { StreamLookup } from './exporterTypes.js';
 import { exportVerticalVideo, type VerticalClip } from './verticalExporter.js';
+import type { ClipEntry } from '../types.js';
 import { cleanupFiles } from './fsUtils.js';
 import * as db from './db/index.js';
 import type { ExportRecord } from './db/index.js';
@@ -148,21 +149,30 @@ async function runExport(exportId: string): Promise<void> {
 
 	// Resolve clip IDs → ClipRegion objects paired with their entries by index,
 	// so duplicate clipIds each keep their own ClipEntry.
-	const resolved = record.clipIds
+	const allResolved = record.clipIds
 		.map((id, i) => ({ clip: getClipRegion(id), entry: record.clipEntries?.[i] }))
 		.filter((p) => p.clip !== undefined);
 
-	const clips = resolved.map((p) => p.clip!);
-
-	if (clips.length === 0) {
+	if (allResolved.length === 0) {
 		db.updateExportStatus(exportId, 'error', undefined, 'No valid clips found');
 		broadcastExportStatus(exportId, 'error', undefined, 'No valid clips found');
 		return;
 	}
 
-	const clipEntries = resolved.map((p) => p.entry);
+	// Partition clips by track: track 0 = primary sequential, tracks 1+ = free-positioned
+	const track0Resolved = allResolved.filter((p) => (p.entry?.track ?? 0) === 0);
+	const otherTrackResolved = allResolved.filter((p) => (p.entry?.track ?? 0) !== 0);
 
-	// Compute composition-time offsets for each clip (used to map effectEntries to per-clip windows)
+	const clips = track0Resolved.map((p) => p.clip!);
+	const clipEntries = track0Resolved.map((p) => p.entry);
+
+	if (clips.length === 0) {
+		db.updateExportStatus(exportId, 'error', undefined, 'No track 0 clips found');
+		broadcastExportStatus(exportId, 'error', undefined, 'No track 0 clips found');
+		return;
+	}
+
+	// Compute composition-time offsets for track 0 clips (sequential layout)
 	const compOffsets: number[] = [];
 	let compTime = 0;
 	for (let i = 0; i < clips.length; i++) {
@@ -170,19 +180,39 @@ async function runExport(exportId: string): Promise<void> {
 		const entry = clipEntries[i];
 		const trimStart = entry?.trimStart ?? 0;
 		const trimEnd = entry?.trimEnd ?? 0;
-		const speed = entry?.speed ?? 1;
-		const dur = (clips[i].endTime - clips[i].startTime - trimStart - trimEnd) / speed;
+		const dur = clips[i].endTime - clips[i].startTime - trimStart - trimEnd;
 		compTime += Math.max(0, dur);
 	}
+
+	// Build other-track clip data (composition position from entry.startTime)
+	function clipEffectiveDuration(clip: import('../types.js').ClipRegion, entry?: ClipEntry): number {
+		const trimStart = entry?.trimStart ?? 0;
+		const trimEnd = entry?.trimEnd ?? 0;
+		return Math.max(0, clip.endTime - clip.startTime - trimStart - trimEnd);
+	}
+
+	const otherTrackClips: OtherTrackClip[] = otherTrackResolved.map((p) => {
+		const clip = p.clip!;
+		const entry = p.entry;
+		const dur = clipEffectiveDuration(clip, entry);
+		return {
+			clip,
+			entry,
+			track: entry?.track ?? 1,
+			compStart: entry?.startTime ?? 0,
+			compEnd: (entry?.startTime ?? 0) + dur,
+		};
+	});
 
 	// Update status → exporting
 	db.updateExportStatus(exportId, 'exporting');
 	broadcastExportStatus(exportId, 'exporting');
 
 	try {
-		// Build stream lookup map for all clips
+		// Build stream lookup map for all clips (including other-track clips)
+		const allClips = [...clips, ...otherTrackClips.map((o) => o.clip)];
 		const streamMap = new Map<string, StreamLookup>();
-		for (const clip of clips) {
+		for (const clip of allClips) {
 			if (streamMap.has(clip.streamId)) continue;
 			const stream = getStream(clip.streamId);
 			const recordingDir = getStreamRecordingDir(clip.streamId);
@@ -197,7 +227,7 @@ async function runExport(exportId: string): Promise<void> {
 
 		// Build channel map (streamId → channel login) for twitch-chat effects
 		const channelMap = new Map<string, string>();
-		for (const clip of clips) {
+		for (const clip of allClips) {
 			if (channelMap.has(clip.streamId)) continue;
 			const stream = getStream(clip.streamId);
 			if (stream) channelMap.set(clip.streamId, stream.channel);
@@ -234,9 +264,9 @@ async function runExport(exportId: string): Promise<void> {
 					? 'No clips have camera bounds set — cannot create vertical export'
 					: 'No valid clips for vertical export');
 			}
-			({ outputPath } = await exportVerticalVideo(verticalClips, streamMap, exportId, () => {}, record.effectEntries, compOffsets, channelMap));
+			({ outputPath } = await exportVerticalVideo(verticalClips, streamMap, exportId, () => {}, record.effectEntries, compOffsets, channelMap, otherTrackClips));
 		} else {
-			({ outputPath } = await exportVideo(clips, streamMap, exportId, () => {}, clipEntries, record.effectEntries, compOffsets, channelMap));
+			({ outputPath } = await exportVideo(clips, streamMap, exportId, () => {}, clipEntries, record.effectEntries, compOffsets, channelMap, otherTrackClips));
 		}
 
 		db.updateExportStatus(exportId, 'ready', outputPath);

@@ -13,10 +13,9 @@
 		getChannelVods
 	} from '$lib/streams.remote.js';
 
-	type Platform = 'twitch' | 'douyu';
 	interface WatchlistEntry {
 		login: string;
-		platform: Platform;
+		platform: string;
 	}
 
 	const LEGACY_STORAGE_KEY = 'omni-channel-history';
@@ -53,10 +52,9 @@
 	let now = $state(Date.now());
 	let tickTimer: ReturnType<typeof setInterval> | null = null;
 
-	// Detect input type: VOD URL, Douyu URL/room, or Twitch channel
+	// Detect input type: VOD URL or Twitch channel
 	let isVodInput = $derived(!!channelInput.match(/(?:twitch\.tv\/videos\/|^)(\d{8,})\b/));
-	let isDouyuInput = $derived(!!channelInput.match(/douyu\.com\/(\d+)/) || !!channelInput.match(/^\d{6,7}$/));
-	let inputPrefix = $derived(isVodInput ? 'twitch.tv/videos/' : isDouyuInput ? 'douyu.com/' : 'twitch.tv/');
+	let inputPrefix = $derived(isVodInput ? 'twitch.tv/videos/' : 'twitch.tv/');
 
 	// Channel language settings (login → language code or null)
 	let channelSettings = $state(new Map<string, string | null>());
@@ -117,31 +115,31 @@
 			const data = await getWatchlist();
 			watchlist = data.watchlist.map((e: { login: string; platform: string }) => ({
 				login: e.login,
-				platform: e.platform as Platform
+				platform: e.platform
 			}));
 		} catch (err) {
 			console.error('Failed to load watchlist:', err);
 		}
 	}
 
-	async function addToWatchlist(channel: string, platform: Platform = 'twitch') {
+	async function addToWatchlist(channel: string) {
 		const lower = channel.toLowerCase().trim();
 		if (!lower) return;
-		if (watchlist.some((w) => w.login === lower && w.platform === platform)) return;
+		if (watchlist.some((w) => w.login === lower)) return;
 		try {
-			await addToWatchlistCmd({ login: lower, platform });
-			watchlist = [...watchlist, { login: lower, platform }];
+			await addToWatchlistCmd({ login: lower, platform: 'twitch' });
+			watchlist = [...watchlist, { login: lower, platform: 'twitch' }];
 			fetchChannelData();
 		} catch (err) {
 			console.error('Failed to add to watchlist:', err);
 		}
 	}
 
-	async function removeFromWatchlist(login: string, platform: Platform) {
+	async function removeFromWatchlist(login: string) {
 		try {
-			await removeFromWatchlistCmd({ login, platform });
-			watchlist = watchlist.filter((w) => !(w.login === login && w.platform === platform));
-			channelData = channelData.filter((c) => !(c.login === login && c.platform === platform));
+			await removeFromWatchlistCmd({ login, platform: 'twitch' });
+			watchlist = watchlist.filter((w) => w.login !== login);
+			channelData = channelData.filter((c) => c.login !== login);
 		} catch (err) {
 			console.error('Failed to remove from watchlist:', err);
 		}
@@ -153,21 +151,9 @@
 			return;
 		}
 		try {
-			// Group by platform and fetch each batch
-			const byPlatform = new Map<Platform, string[]>();
-			for (const entry of watchlist) {
-				const list = byPlatform.get(entry.platform) || [];
-				list.push(entry.login);
-				byPlatform.set(entry.platform, list);
-			}
-
-			const results: ChannelInfo[] = [];
-			const fetches = [...byPlatform.entries()].map(async ([platform, channels]) => {
-				const data = await lookupChannels({ channels, platform });
-				results.push(...data.channels);
-			});
-			await Promise.all(fetches);
-			channelData = results;
+			const channels = watchlist.map((w) => w.login);
+			const data = await lookupChannels({ channels });
+			channelData = data.channels;
 		} catch (err) {
 			console.error('Failed to fetch channel data:', err);
 		}
@@ -223,7 +209,7 @@
 		error = '';
 		try {
 			const lang = channelSettings.get(channel.login) || undefined;
-			await addStream(channel.login, { language: lang, platform: channel.platform });
+			await addStream(channel.login, { language: lang });
 		} catch (err) {
 			error = err instanceof Error ? err.message : 'Failed to start capture';
 		} finally {
@@ -248,14 +234,6 @@
 	function parseVodUrl(input: string): string | null {
 		const m = input.match(/(?:twitch\.tv\/videos\/|^)(\d{8,})\b/);
 		return m ? m[1] : null;
-	}
-
-	function parseDouyuInput(input: string): string | null {
-		const urlMatch = input.match(/douyu\.com\/(\d+)/);
-		if (urlMatch) return urlMatch[1];
-		// Bare 6-7 digit number → Douyu room ID (8+ digits → Twitch VOD)
-		if (/^\d{6,7}$/.test(input)) return input;
-		return null;
 	}
 
 	async function handleAddVodByUrl(vodUrl: string) {
@@ -335,16 +313,6 @@
 		const value = channelInput.trim();
 		if (!value) return;
 
-		// Check Douyu first
-		if (isDouyuInput) {
-			const roomId = parseDouyuInput(value);
-			if (roomId) {
-				channelInput = '';
-				addToWatchlist(roomId, 'douyu');
-				return;
-			}
-		}
-
 		const vodId = parseVodUrl(value);
 		if (vodId) {
 			channelInput = '';
@@ -356,7 +324,7 @@
 				.replace(/\/.*$/, '')
 				.trim()
 				.toLowerCase();
-			addToWatchlist(cleaned, 'twitch');
+			addToWatchlist(cleaned);
 			channelInput = '';
 		}
 	}
@@ -369,7 +337,7 @@
 
 	function handleWatchlistAdd(e: Event) {
 		const login = (e as CustomEvent<string>).detail;
-		if (login) addToWatchlist(login, 'twitch');
+		if (login) addToWatchlist(login);
 	}
 
 	/** Migrate any existing localStorage watchlist entries to the server */
@@ -424,7 +392,7 @@
 			class="channel-input"
 		/>
 		<button onclick={handleSubmit} disabled={!channelInput.trim() || loading} class="add-btn">
-			{isVodInput ? '+ Add VOD' : isDouyuInput ? '+ Add DY' : '+ Add'}
+			{isVodInput ? '+ Add VOD' : '+ Add'}
 		</button>
 	</div>
 
@@ -453,9 +421,6 @@
 					<div class="channel-info">
 						<div class="channel-name-row">
 							<span class="channel-name">{channel.displayName || channel.login}</span>
-							{#if channel.platform === 'douyu'}
-								<span class="dy-badge">DY</span>
-							{/if}
 							{#if isCapturing}
 								<span class="rec-badge">REC</span>
 							{/if}
@@ -498,14 +463,12 @@
 						</div>
 					{/if}
 
-					{#if channel.platform === 'twitch'}
-						<button
-							class="vods-btn"
-							class:active={expandedVodsLogin === channel.login}
-							onclick={() => toggleVodBrowser(channel.login)}
-							title="Browse past VODs">VODs</button
-						>
-					{/if}
+					<button
+						class="vods-btn"
+						class:active={expandedVodsLogin === channel.login}
+						onclick={() => toggleVodBrowser(channel.login)}
+						title="Browse past VODs">VODs</button
+					>
 
 					<button class="settings-btn" onclick={() => openSettingsModal(channel.login)} title="Language settings">
 						<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
@@ -520,7 +483,7 @@
 
 					<button
 						class="remove-btn"
-						onclick={() => removeFromWatchlist(channel.login, channel.platform)}
+						onclick={() => removeFromWatchlist(channel.login)}
 						title="Remove from watchlist">&times;</button
 					>
 				</div>
@@ -773,16 +736,6 @@
 	}
 
 	.vod-rec-badge {
-		font-size: 0.55rem;
-		font-weight: 700;
-		color: #d97706;
-		background: rgba(217, 119, 6, 0.15);
-		padding: 1px 5px;
-		border-radius: 3px;
-		letter-spacing: 0.5px;
-	}
-
-	.dy-badge {
 		font-size: 0.55rem;
 		font-weight: 700;
 		color: #d97706;

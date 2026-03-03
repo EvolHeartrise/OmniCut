@@ -7,7 +7,7 @@ import type { ToolRegistrar } from './types.js';
 import { textResult, jsonResult } from './types.js';
 import { loadWatchlist } from '../db/index.js';
 import {
-	fetchTwitchChannel, fetchDouyuChannel,
+	fetchTwitchChannel,
 	twitchGql, CHANNEL_VODS_GQL, mapVideoEdges, type VideoEdge
 } from '../twitchApi.js';
 
@@ -17,16 +17,15 @@ export function registerChannelTools(server: ToolRegistrar): void {
 		'lookup_channel',
 		'Look up a channel\'s live status, title, game, and viewer count.',
 		{
-			channel: z.string().describe('Channel login or room ID'),
-			platform: z.enum(['twitch', 'douyu']).optional().default('twitch')
+			channel: z.string().describe('Channel login'),
+			platform: z.enum(['twitch']).optional().default('twitch')
 		},
-		async ({ channel, platform }) => {
+		async ({ channel }) => {
 			try {
-				const fetcher = platform === 'douyu' ? fetchDouyuChannel : fetchTwitchChannel;
-				const info = await fetcher(channel);
+				const info = await fetchTwitchChannel(channel);
 				return jsonResult(info);
 			} catch (err) {
-				return textResult(`Failed to look up channel "${channel}" on ${platform}: ${err instanceof Error ? err.message : String(err)}`, true);
+				return textResult(`Failed to look up channel "${channel}": ${err instanceof Error ? err.message : String(err)}`, true);
 			}
 		}
 	);

@@ -65,6 +65,8 @@ export interface EffectEntry {
 	viewDestH?: number;
 	/** For view type: z-order for layering when views overlap (default 0). */
 	viewZOrder?: number;
+	/** For view type: which video track to source from (default 0 = primary track). */
+	viewSourceTrack?: number;
 	/** For subtitle type: the text to display. */
 	subtitleText?: string;
 	/** For subtitle type: font size in pixels (default 48). */
@@ -145,9 +147,10 @@ export interface ClipEntry {
 	clipId: string;
 	trimStart?: number; // seconds offset into clip to start (default 0)
 	trimEnd?: number; // seconds offset from clip end to stop (default 0 = full duration)
-	speed?: number; // playback speed multiplier (default 1)
 	transition?: 'none' | 'crossfade' | 'fade-black'; // transition INTO this clip
 	transitionDuration?: number; // seconds (default 0.5)
+	track?: number; // video track index (default 0 = primary sequential track)
+	startTime?: number; // absolute composition-time position (seconds); tracks 1+ only
 }
 
 /** Video composition — an ordered collection of clips with effects. */
@@ -183,5 +186,5 @@ export interface ChannelInfo {
 	viewerCount: number | null;
 	startedAt: string | null;
 	hasVod: boolean;
-	platform: 'twitch' | 'douyu';
+	platform: 'twitch';
 }

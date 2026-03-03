@@ -190,7 +190,6 @@
 							</td>
 							<td class="cell-channel">
 								{stream.channel}
-								{#if stream.platform === 'douyu'}<span class="platform-badge">DY</span>{/if}
 							</td>
 							<td>
 								<span class="type-badge" class:vod={stream.sourceType === 'vod'}>
@@ -381,14 +380,6 @@
 	.cell-channel {
 		font-weight: 700;
 		color: #e0e0ff;
-	}
-
-	.platform-badge {
-		font-size: 0.55rem;
-		font-weight: 700;
-		color: #f59e0b;
-		margin-left: 3px;
-		vertical-align: super;
 	}
 
 	.type-badge {

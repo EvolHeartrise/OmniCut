@@ -30,8 +30,6 @@ import {
 	getAllVideos as smGetAllVideos
 } from '$lib/server/streamManager.js';
 import {
-	addIgnoredChannel,
-	loadIgnoredChannels,
 	loadAllChannelSettings,
 	saveChannelSettings,
 	loadWatchlist as dbLoadWatchlist,
@@ -49,14 +47,8 @@ import {
 import {
 	twitchGql,
 	fetchTwitchChannel,
-	fetchDouyuChannel,
-	mapBrowseEdges,
 	mapVideoEdges,
-	BROWSE_STREAMS_GQL,
-	BROWSE_GAME_STREAMS_GQL,
-	SEARCH_CATEGORIES_GQL,
 	CHANNEL_VODS_GQL,
-	type BrowseStreamEdge,
 	type VideoEdge
 } from '$lib/server/twitchApi.js';
 import type { ChannelInfo, VodInfo, CameraBoundsEntry, ClipEntry, EffectEntry, VideoRecord } from '$lib/types.js';
@@ -116,87 +108,18 @@ export const getChatMessageByTwitchId = query('unchecked', async (args: { twitch
 });
 
 // ---------------------------------------------------------------------------
-// Queries — Browse & Discovery
+// Queries — Channel Lookup & VODs
 // ---------------------------------------------------------------------------
 
-/** Browse live Twitch streams, optionally filtered by game. */
-export const browseStreams = query('unchecked', async (args: { gameId?: string; first?: number; after?: string }) => {
-	const gameId = args.gameId;
-	const maxFirst = gameId ? 100 : 30;
-	const first = Math.min(Math.max(args.first ?? maxFirst, 1), maxFirst);
-	const after = args.after;
-
-	try {
-		const gqlQuery = gameId ? BROWSE_GAME_STREAMS_GQL : BROWSE_STREAMS_GQL;
-		const variables: Record<string, unknown> = { first, opts: { languages: ['EN'] } };
-		if (after) variables.after = after;
-		if (gameId) variables.id = gameId;
-
-		const data = await twitchGql<Record<string, unknown>>(gqlQuery, variables);
-
-		if ((data as { errors?: unknown[] }).errors) {
-			console.error('Twitch GQL errors:', (data as { errors: unknown[] }).errors);
-			return { streams: [] as ChannelInfo[], cursor: null as string | null, hasNextPage: false };
-		}
-
-		const connection = gameId
-			? (
-					data as {
-						data?: { game?: { streams?: { edges: BrowseStreamEdge[]; pageInfo?: { hasNextPage?: boolean } } } };
-					}
-				)?.data?.game?.streams
-			: (data as { data?: { streams?: { edges: BrowseStreamEdge[]; pageInfo?: { hasNextPage?: boolean } } } })?.data
-					?.streams;
-
-		if (!connection) {
-			return { streams: [] as ChannelInfo[], cursor: null as string | null, hasNextPage: false };
-		}
-
-		const edges: BrowseStreamEdge[] = connection.edges ?? [];
-		const { streams, cursor: lastCursor } = mapBrowseEdges(edges);
-		const hasNextPage = connection.pageInfo?.hasNextPage ?? false;
-
-		return { streams, cursor: lastCursor, hasNextPage };
-	} catch (err) {
-		console.error('Browse API error:', err);
-		return { streams: [] as ChannelInfo[], cursor: null as string | null, hasNextPage: false };
-	}
-});
-
-/** Search Twitch game categories by name. */
-export const searchCategories = query('unchecked', async (args: { query: string }) => {
-	const q = args.query ?? '';
-	if (!q.trim()) return { categories: [] as Array<{ id: string; name: string }> };
-
-	try {
-		const data = await twitchGql<{
-			data?: { searchCategories?: { edges?: Array<{ node: { id: string; name: string } }> } };
-		}>(SEARCH_CATEGORIES_GQL, { query: q });
-		const edges = data?.data?.searchCategories?.edges ?? [];
-		const categories = edges.map((e) => ({ id: e.node.id, name: e.node.name }));
-		return { categories };
-	} catch (err) {
-		console.error('Category search error:', err);
-		return { categories: [] as Array<{ id: string; name: string }> };
-	}
-});
-
-/** Load ignored channel logins from the database. */
-export const getIgnoredChannels = query(async () => {
-	return { channels: loadIgnoredChannels() };
-});
-
-/** Batch channel info lookup (Twitch or Douyu). */
+/** Batch channel info lookup. */
 export const lookupChannels = query('unchecked', async (args: { channels: string[]; platform?: string }) => {
 	const channels = args.channels;
-	const platform = args.platform || 'twitch';
 
 	if (!Array.isArray(channels) || channels.length === 0) {
 		return { channels: [] as ChannelInfo[] };
 	}
 
-	const fetcher = platform === 'douyu' ? fetchDouyuChannel : fetchTwitchChannel;
-	const results = await Promise.all(channels.map(fetcher));
+	const results = await Promise.all(channels.map(fetchTwitchChannel));
 	return { channels: results };
 });
 
@@ -272,7 +195,6 @@ export const addStreamCmd = command(
 		language?: string | null;
 		vod?: boolean;
 		vodUrl?: string;
-		platform?: 'twitch' | 'douyu';
 	}) => {
 		if (args.vodUrl) {
 			const info = await addVodByUrl(args.vodUrl.trim(), args.language ?? null);
@@ -286,7 +208,7 @@ export const addStreamCmd = command(
 
 		const info = args.vod
 			? await addVodStream(cleanChannel, args.language ?? null)
-			: await smAddStream(cleanChannel, args.language ?? null, args.platform || 'twitch');
+			: await smAddStream(cleanChannel, args.language ?? null);
 
 		await getStreams().refresh();
 		return info;
@@ -411,12 +333,6 @@ export const loadCameraBoundsForChannel = query(
 // Commands — Channel Settings & Watchlist
 // ---------------------------------------------------------------------------
 
-/** Ignore a channel in the discovery browser. */
-export const ignoreChannelCmd = command('unchecked', async (args: { login: string }) => {
-	if (!args.login?.trim()) throw new Error('login required');
-	addIgnoredChannel(args.login.trim());
-});
-
 /** Save per-channel transcription language setting. */
 export const saveChannelSettingsCmd = command(
 	'unchecked',
@@ -466,12 +382,6 @@ export const getVideoById = query('unchecked', async (args: { id: string }): Pro
 	const video = smGetVideo(args.id);
 	if (!video) throw new Error('Video not found');
 	return video;
-});
-
-/** Get thumbnail for a video. */
-export const getThumbnailByVideo = query('unchecked', async (args: { videoId: string }) => {
-	const { loadThumbnailByVideo } = await import('$lib/server/db/index.js');
-	return { thumbnail: loadThumbnailByVideo(args.videoId) };
 });
 
 // ---------------------------------------------------------------------------
@@ -629,85 +539,6 @@ export const youtubeDeleteUploadCmd = command('unchecked', async (args: { id: st
 	const { deleteUpload } = await import('$lib/server/youtubeUploadQueue.js');
 	deleteUpload(args.id);
 	return { success: true };
-});
-
-// ---------------------------------------------------------------------------
-// Queries — Thumbnails
-// ---------------------------------------------------------------------------
-
-/** Check if AI (Gemini) is configured. */
-export const isAIConfigured = query(async () => {
-	const { isAIConfigured } = await import('$lib/server/thumbnailStore.js');
-	return { configured: isAIConfigured() };
-});
-
-// ---------------------------------------------------------------------------
-// Commands — Thumbnails
-// ---------------------------------------------------------------------------
-
-/** Save a thumbnail PNG for a video. */
-export const saveThumbnailCmd = command('unchecked', async (args: {
-	videoId: string;
-	exportId?: string;
-	pngBase64: string;
-	width?: number;
-	height?: number;
-	layers?: Array<
-		| {
-			id: string; type: 'text';
-			text: string; x: number; y: number;
-			fontSize: number; fontFamily: string; color: string;
-			strokeColor?: string; strokeWidth?: number; rotation?: number; scaleX?: number; scaleY?: number;
-			cropX?: number; cropY?: number; cropW?: number; cropH?: number;
-			shadow?: { color: string; blur: number; offsetX: number; offsetY: number };
-		}
-		| {
-			id: string; type: 'image';
-			x: number; y: number;
-			rotation?: number; scaleX?: number; scaleY?: number;
-			opacity?: number;
-			cropX?: number; cropY?: number; cropW?: number; cropH?: number;
-			streamId?: string; timestamp?: number;
-			dataUrl?: string;
-			naturalWidth: number; naturalHeight: number;
-		}
-		| {
-			id: string; type: 'effect';
-			kind: 'blur' | 'ai';
-			blurRadius?: number;
-			prompt?: string;
-		}
-	>;
-}) => {
-	const { saveThumbnailFromPng } = await import('$lib/server/thumbnailStore.js');
-	const pngBuffer = Buffer.from(args.pngBase64, 'base64');
-	const record = saveThumbnailFromPng(args.videoId, pngBuffer, {
-		width: args.width,
-		height: args.height,
-		layers: args.layers,
-		exportId: args.exportId
-	});
-	return record;
-});
-
-/** Enhance a thumbnail with AI (Gemini). */
-export const enhanceThumbnailCmd = command('unchecked', async (args: {
-	thumbnailId: string;
-	prompt: string;
-	conversationHistory?: Array<{ role: 'user' | 'model'; text?: string; imageBase64?: string }>;
-}) => {
-	const { enhanceWithAI } = await import('$lib/server/thumbnailStore.js');
-	return await enhanceWithAI(args.thumbnailId, args.prompt, args.conversationHistory);
-});
-
-/** Run Nano Banana Pro AI edit on a raw PNG (stateless, no disk I/O). */
-export const aiEditImageCmd = command('unchecked', async (args: {
-	pngBase64: string;
-	prompt: string;
-}) => {
-	const { aiEditImage } = await import('$lib/server/thumbnailStore.js');
-	const resultBase64 = await aiEditImage(args.pngBase64, args.prompt);
-	return { pngBase64: resultBase64 };
 });
 
 /** Upload an overlay image (base64 data) → saves to data/overlays/ and returns ID + dimensions. */

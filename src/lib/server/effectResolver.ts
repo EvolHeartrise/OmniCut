@@ -216,6 +216,7 @@ export function resolveViewEffects(
 			destW: effect.viewDestW ?? 1,
 			destH: effect.viewDestH ?? 1,
 			zOrder: effect.viewZOrder ?? 0,
+			sourceTrack: effect.viewSourceTrack ?? 0,
 		});
 	}
 	return results.sort((a, b) => a.zOrder - b.zOrder);

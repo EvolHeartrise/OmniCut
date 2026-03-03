@@ -35,7 +35,7 @@ export interface StreamState {
 	offset: number;
 	sourceType: 'live' | 'vod';
 	parentStreamId: string | null;
-	platform: 'twitch' | 'douyu';
+	platform: 'twitch';
 	sourceUrl?: string | null;
 	chatMessageCount: number;
 	transcriptionCount: number;
@@ -191,15 +191,14 @@ export async function refreshStreams() {
  */
 export async function addStream(
 	channel: string,
-	opts?: { language?: string | null; vod?: boolean; vodUrl?: string; platform?: 'twitch' | 'douyu' }
+	opts?: { language?: string | null; vod?: boolean; vodUrl?: string }
 ): Promise<void> {
 	try {
 		await addStreamCmd({
 			channel,
 			language: opts?.language,
 			vod: opts?.vod,
-			vodUrl: opts?.vodUrl,
-			platform: opts?.platform
+			vodUrl: opts?.vodUrl
 		});
 		await refreshStreams();
 		return;

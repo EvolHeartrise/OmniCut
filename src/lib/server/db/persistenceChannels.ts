@@ -1,23 +1,5 @@
 import { getDb } from './persistenceBase.js';
 
-// --- Ignored Channels ---
-
-export function addIgnoredChannel(login: string): void {
-	const d = getDb();
-	d.run('INSERT OR IGNORE INTO ignored_channels (login) VALUES (?)', [login.toLowerCase()]);
-}
-
-export function removeIgnoredChannel(login: string): void {
-	const d = getDb();
-	d.run('DELETE FROM ignored_channels WHERE login = ?', [login.toLowerCase()]);
-}
-
-export function loadIgnoredChannels(): string[] {
-	const d = getDb();
-	const rows = d.query('SELECT login FROM ignored_channels ORDER BY ignored_at').all() as { login: string }[];
-	return rows.map((r) => r.login);
-}
-
 // --- Channel Settings ---
 
 export function getChannelSettings(login: string): { login: string; language: string | null } | null {

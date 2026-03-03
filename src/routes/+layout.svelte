@@ -15,7 +15,6 @@
 	let pathname = $derived(page.url.pathname);
 
 	const tabs = [
-		{ href: '/browse', label: 'Browse' },
 		{ href: '/watchlist', label: 'Watchlist' },
 		{ href: '/library', label: 'Library' },
 		{ href: '/clipping', label: 'Clipping' },
@@ -23,7 +22,6 @@
 		{ href: '/review', label: 'Review' },
 		{ href: '/videos', label: 'Videos' },
 		{ href: '/exports', label: 'Exports' },
-		{ href: '/thumbnail', label: 'Thumbnail' },
 		{ href: '/upload', label: 'Upload' }
 	];
 </script>

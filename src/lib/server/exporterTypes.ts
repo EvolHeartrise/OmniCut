@@ -69,4 +69,6 @@ export interface ResolvedView {
 	destX: number; destY: number; destW: number; destH: number;
 	/** Z-order for layering */
 	zOrder: number;
+	/** Which video track to source from (default 0 = primary track) */
+	sourceTrack: number;
 }

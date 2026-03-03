@@ -209,23 +209,6 @@ export async function initDatabase(): Promise<void> {
 			updated_at INTEGER DEFAULT (unixepoch())
 		);
 
-		CREATE TABLE IF NOT EXISTS thumbnails (
-			id TEXT PRIMARY KEY,
-			export_id TEXT,
-			video_id TEXT,
-			file_path TEXT NOT NULL,
-			width INTEGER NOT NULL DEFAULT 1280,
-			height INTEGER NOT NULL DEFAULT 720,
-			source_stream_id TEXT,
-			source_timestamp REAL,
-			text_layers TEXT,
-			ai_enhanced INTEGER NOT NULL DEFAULT 0,
-			created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-			updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
-			FOREIGN KEY (export_id) REFERENCES exports(id) ON DELETE SET NULL,
-			FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE
-		);
-
 		CREATE TABLE IF NOT EXISTS channel_camera_bounds (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			channel TEXT NOT NULL,
@@ -238,9 +221,6 @@ export async function initDatabase(): Promise<void> {
 		);
 
 		CREATE INDEX IF NOT EXISTS idx_cam_bounds_channel_time ON channel_camera_bounds(channel, timestamp);
-
-		-- Purge old-format thumbnail rows (schema changed to unified layer system)
-		DELETE FROM thumbnails;
 
 		CREATE TABLE IF NOT EXISTS censor_terms (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -279,7 +259,6 @@ export async function initDatabase(): Promise<void> {
 		'ALTER TABLE chat_messages ADD COLUMN emotes TEXT',
 		'ALTER TABLE exports ADD COLUMN video_id TEXT REFERENCES videos(id)',
 		'ALTER TABLE exports ADD COLUMN clip_entries TEXT',
-		'ALTER TABLE thumbnails ADD COLUMN video_id TEXT REFERENCES videos(id)',
 		'ALTER TABLE clip_regions ADD COLUMN favourite INTEGER NOT NULL DEFAULT 0',
 		'ALTER TABLE videos ADD COLUMN effect_entries TEXT',
 		'ALTER TABLE exports ADD COLUMN effect_entries TEXT',
@@ -323,7 +302,6 @@ export async function initDatabase(): Promise<void> {
 				`INSERT INTO videos (id, title, description, clip_entries, format, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`
 			);
 			const linkExport = db.prepare(`UPDATE exports SET video_id = ? WHERE id = ?`);
-			const linkThumbnail = db.prepare(`UPDATE thumbnails SET video_id = ? WHERE export_id = ?`);
 			for (const exp of unmigrated) {
 				const videoId = newVideoId();
 				let clipIds: string[];
@@ -331,7 +309,6 @@ export async function initDatabase(): Promise<void> {
 				const clipEntries: ClipEntry[] = clipIds.map((clipId) => ({ clipId }));
 				insertVideo.run(videoId, exp.title, exp.description, JSON.stringify(clipEntries), exp.format || 'standard', exp.created_at, exp.created_at);
 				linkExport.run(videoId, exp.id);
-				linkThumbnail.run(videoId, exp.id);
 			}
 			console.log(`[persistence] Migrated ${unmigrated.length} exports to videos`);
 		}

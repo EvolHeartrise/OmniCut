@@ -1,5 +1,4 @@
 import type { ClipEntry, EffectEntry, VideoRecord } from '../../types.js';
-import type { ThumbnailRecord } from './persistenceThumbnails.js';
 import { getDb } from './persistenceBase.js';
 
 interface VideoRow {
@@ -105,13 +104,3 @@ export function deleteVideoRecord(id: string): void {
 	d.run('DELETE FROM videos WHERE id = ?', [id]);
 }
 
-// Note: This function uses ThumbnailRow/mapThumbnailRow from persistenceThumbnails,
-// but to avoid circular imports we inline the query and mapping here.
-import { mapThumbnailRow, type ThumbnailRow } from './persistenceThumbnails.js';
-
-export function loadThumbnailByVideo(videoId: string): ThumbnailRecord | null {
-	const d = getDb();
-	const row = d.query('SELECT * FROM thumbnails WHERE video_id = ? ORDER BY updated_at DESC LIMIT 1').get(videoId) as ThumbnailRow | null;
-	if (!row) return null;
-	return mapThumbnailRow(row);
-}

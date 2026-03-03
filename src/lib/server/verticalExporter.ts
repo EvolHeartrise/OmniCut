@@ -12,8 +12,9 @@ import {
 	concatClipFiles, resolveAudioOverlays, probeVideo, detectNvenc
 } from './exporterCommon.js';
 import { resolveOverlappingEffects, resolveViewEffects } from './effectResolver.js';
-import { encodeClip } from './exporterPipeline.js';
+import { encodeClip, type ExtraTrackInput } from './exporterPipeline.js';
 import type { StreamLookup, ClipContext } from './exporterTypes.js';
+import type { OtherTrackClip } from './exporter.js';
 
 // Output dimensions
 const OUT_W = 1080;
@@ -38,7 +39,8 @@ export async function exportVerticalVideo(
 	onProgress: (message: string, step: number, totalSteps: number) => void,
 	effectEntries?: EffectEntry[],
 	compOffsets?: number[],
-	channelMap?: Map<string, string>
+	channelMap?: Map<string, string>,
+	otherTrackClips?: OtherTrackClip[]
 ): Promise<{ outputPath: string }> {
 	if (verticalClips.length === 0) {
 		throw new Error('No clips to export');
@@ -61,7 +63,7 @@ export async function exportVerticalVideo(
 			);
 			if (!resolved) continue;
 
-			const { dur, clipDur, speed, segments, localStart: clipLocalStart, localEnd: clipLocalEnd } = resolved;
+			const { dur, segments, localStart: clipLocalStart, localEnd: clipLocalEnd } = resolved;
 			onProgress(`Encoding clip ${i + 1}/${verticalClips.length} as vertical (${dur.toFixed(1)}s)`, i, totalSteps);
 
 			// Probe source resolution from first segment
@@ -73,10 +75,10 @@ export async function exportVerticalVideo(
 
 			// Find overlapping effects for this clip
 			const clipCompStart = compOffsets?.[i] ?? 0;
-			const clipCompEnd = clipCompStart + clipDur;
+			const clipCompEnd = clipCompStart + dur;
 
 			// Resolve view effects
-			const clipViews = resolveViewEffects(effectEntries, clipCompStart, clipCompEnd, clipDur);
+			const clipViews = resolveViewEffects(effectEntries, clipCompStart, clipCompEnd, dur);
 
 			// Resolve camera bounds for view effects with 'camera' source type
 			const camBounds = cam ? { camX: cam.camX, camY: cam.camY, camW: cam.camW, camH: cam.camH } : null;
@@ -93,17 +95,21 @@ export async function exportVerticalVideo(
 
 			// All overlay effects composited after view composition
 			const allEffects = await resolveOverlappingEffects(
-				effectEntries, clipCompStart, clipCompEnd, clipDur, tempDir, i,
+				effectEntries, clipCompStart, clipCompEnd, dur, tempDir, i,
 				OUT_W, OUT_H, clipCtx
 			);
 
 			const fps = probe.fps > 0 ? probe.fps : 30;
 
 			// When no views, scale full frame to fill vertical canvas (legacy fallback)
-			const speedSuffix = speed !== 1 ? `,setpts=PTS/${speed}` : '';
 			const baseVideoFilter = clipViews.length === 0
-				? `scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=increase,crop=${OUT_W}:${OUT_H}${speedSuffix},format=yuv420p`
+				? `scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=increase,crop=${OUT_W}:${OUT_H},format=yuv420p`
 				: undefined;
+
+			// Resolve extra track inputs for multi-track compositing
+			const extraTrackInputs = resolveExtraTrackInputsVert(
+				otherTrackClips, clipCompStart, clipCompEnd, streamMap, tempDir, i, 'vertical-export'
+			);
 
 			const outFile = await encodeClip({
 				resolved, clipIdx: i,
@@ -114,7 +120,8 @@ export async function exportVerticalVideo(
 				gop: Math.round(fps * 2),
 				extraOutputArgs: ['-r', `${fps}`],
 				audioMapFallback: '0:a?',
-				logTag: 'vertical-export'
+				logTag: 'vertical-export',
+				extraTrackInputs
 			});
 
 			verticalFiles.push(outFile);
@@ -136,4 +143,50 @@ export async function exportVerticalVideo(
 	} finally {
 		cleanupTempDir(tempDir);
 	}
+}
+
+/**
+ * Find other-track clips that overlap a track 0 clip's composition window
+ * and resolve them into ExtraTrackInput entries for FFmpeg.
+ */
+function resolveExtraTrackInputsVert(
+	otherTrackClips: OtherTrackClip[] | undefined,
+	clipCompStart: number,
+	clipCompEnd: number,
+	streamMap: Map<string, StreamLookup>,
+	tempDir: string,
+	clipIdx: number,
+	tag: string
+): ExtraTrackInput[] | undefined {
+	if (!otherTrackClips || otherTrackClips.length === 0) return undefined;
+
+	const overlapping = otherTrackClips.filter(
+		(o) => o.compStart < clipCompEnd && o.compEnd > clipCompStart
+	);
+	if (overlapping.length === 0) return undefined;
+
+	const results: ExtraTrackInput[] = [];
+	for (const otc of overlapping) {
+		const resolved = resolveClip(
+			otc.clip, otc.entry, streamMap.get(otc.clip.streamId),
+			clipIdx, 1, tempDir, `${tag}-track${otc.track}`
+		);
+		if (!resolved) continue;
+
+		const overlapStart = Math.max(clipCompStart, otc.compStart);
+		const overlapEnd = Math.min(clipCompEnd, otc.compEnd);
+		const otcSourceOffset = overlapStart - otc.compStart;
+		const seekOffset = resolved.trimStart + otcSourceOffset;
+		const dur = overlapEnd - overlapStart;
+
+		results.push({
+			track: otc.track,
+			concatPath: resolved.concatPath,
+			seekOffset,
+			dur,
+			clipOffset: overlapStart - clipCompStart,
+		});
+	}
+
+	return results.length > 0 ? results : undefined;
 }

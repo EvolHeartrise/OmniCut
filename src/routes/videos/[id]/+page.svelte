@@ -91,11 +91,21 @@
 		censorTerms = await getCensorTerms();
 	}
 
-	// --- Vertical (9:16) canvas preview ---
+	// --- Canvas preview (vertical and multi-track standard) ---
 	const VERT_OUT_W = 1080;
 	const VERT_OUT_H = 1920;
 	const VERT_CANVAS_W = 540; // half-res for perf, CSS-scaled
 	const VERT_CANVAS_H = 960;
+	const STD_CANVAS_W = 960;
+	const STD_CANVAS_H = 540;
+
+	// Detect whether any view effect uses a non-zero source track
+	let hasMultiTrackViews = $derived(
+		effectEntries.some((e) => e.type === 'view' && (e.viewSourceTrack ?? 0) !== 0)
+	);
+	// Need canvas compositing for standard format when multi-track views exist
+	let needsStdCanvas = $derived(format === 'standard' && hasMultiTrackViews);
+	let stdCanvasEl = $state<HTMLCanvasElement | null>(null);
 	let verticalCanvasEl = $state<HTMLCanvasElement | null>(null);
 	let verticalRafId: number | null = null;
 	let currentCamBounds = $state<CameraBoundsEntry | null>(null);
@@ -191,22 +201,12 @@
 		let dur = clip.endTime - clip.startTime;
 		if (entry.trimStart) dur -= entry.trimStart;
 		if (entry.trimEnd) dur -= entry.trimEnd;
-		if (entry.speed && entry.speed > 0) dur /= entry.speed;
 		return Math.max(0, dur);
 	}
 
 	function clipRawDuration(clip: ClipRegion): number {
 		return clip.endTime - clip.startTime;
 	}
-
-	let totalDuration = $derived.by(() => {
-		let total = 0;
-		for (const entry of entries) {
-			const clip = resolveClip(entry.clipId);
-			if (clip) total += clipDuration(clip, entry);
-		}
-		return total;
-	});
 
 	// --- Timeline state ---
 	const MIN_PPS = 1;
@@ -216,12 +216,14 @@
 	let selectedIndex = $state<number | null>(null);
 
 	// Drag state
-	let dragMode = $state<'none' | 'reorder' | 'trim-start' | 'trim-end'>('none');
+	let dragMode = $state<'none' | 'reorder' | 'trim-start' | 'trim-end' | 'move-track'>('none');
 	let dragEntryIndex = $state<number | null>(null);
 	let dragStartX = $state(0);
+	let dragStartY = $state(0);
 	let dragStartValue = $state(0);
 	let dragInsertIndex = $state<number | null>(null);
 	let dragPreviewDelta = $state(0);
+	let dragStartTrack = $state(0);
 
 	// Scroll/viewport
 	let scrollAreaEl = $state<HTMLDivElement | null>(null);
@@ -259,14 +261,18 @@
 		color: string;
 	}
 
-	let clipLayout = $derived.by(() => {
-		const layout: ClipLayoutEntry[] = [];
+	// Per-track layout maps
+	let trackLayouts = $derived.by(() => {
+		const map = new Map<number, ClipLayoutEntry[]>();
+		// Track 0: sequential layout
+		const track0: ClipLayoutEntry[] = [];
 		let offset = 0;
 		for (let i = 0; i < entries.length; i++) {
 			const entry = entries[i];
+			if ((entry.track ?? 0) !== 0) continue;
 			const clip = resolveClip(entry.clipId);
 			const dur = clip ? clipDuration(clip, entry) : 0;
-			layout.push({
+			track0.push({
 				index: i,
 				entry,
 				clip,
@@ -276,7 +282,39 @@
 			});
 			offset += dur;
 		}
-		return layout;
+		map.set(0, track0);
+
+		// Tracks 1+: absolute positioning via startTime
+		for (let i = 0; i < entries.length; i++) {
+			const entry = entries[i];
+			const track = entry.track ?? 0;
+			if (track === 0) continue;
+			if (!map.has(track)) map.set(track, []);
+			const clip = resolveClip(entry.clipId);
+			const dur = clip ? clipDuration(clip, entry) : 0;
+			map.get(track)!.push({
+				index: i,
+				entry,
+				clip,
+				startOffset: entry.startTime ?? 0,
+				effectiveDuration: dur,
+				color: TRACK_COLORS[i % TRACK_COLORS.length]
+			});
+		}
+		return map;
+	});
+
+	let clipLayout = $derived(trackLayouts.get(0) ?? []);
+
+	let totalDuration = $derived.by(() => {
+		let maxEnd = 0;
+		for (const [, layout] of trackLayouts) {
+			for (const cl of layout) {
+				const end = cl.startOffset + cl.effectiveDuration;
+				if (end > maxEnd) maxEnd = end;
+			}
+		}
+		return maxEnd;
 	});
 
 	// Content width for timeline
@@ -334,9 +372,8 @@
 		const cl = clipLayout.find((c) => t > c.startOffset && t < c.startOffset + c.effectiveDuration);
 		if (!cl || !cl.clip) return;
 		const entry = cl.entry;
-		const speed = entry.speed || 1;
 		// Convert timeline offset at split point to source-time offset
-		const sourceOffset = (t - cl.startOffset) * speed;
+		const sourceOffset = t - cl.startOffset;
 		const rawDur = cl.clip.endTime - cl.clip.startTime;
 		const first: ClipEntry = {
 			...entry,
@@ -718,6 +755,13 @@
 		return usedTracks.size + 1;
 	});
 
+	// Video track count: used tracks + 1 empty track
+	let videoTrackCount = $derived.by(() => {
+		const usedTracks = new Set(entries.map((e) => e.track ?? 0));
+		usedTracks.add(0); // always show track 0
+		return usedTracks.size + 1;
+	});
+
 	// --- Effect timeline drag state ---
 	let effectDragMode = $state<'none' | 'move' | 'trim-start' | 'trim-end'>('none');
 	let effectDragId = $state<string | null>(null);
@@ -1087,11 +1131,13 @@
 		ctx.globalAlpha = 1;
 	}
 
-	// Fetch waveforms for all clips in the layout
+	// Fetch waveforms for all clips in all tracks
 	$effect(() => {
-		for (const cl of clipLayout) {
-			if (!cl.clip) continue;
-			fetchClipWaveform(cl.entry, cl.clip);
+		for (const [, layout] of trackLayouts) {
+			for (const cl of layout) {
+				if (!cl.clip) continue;
+				fetchClipWaveform(cl.entry, cl.clip);
+			}
 		}
 	});
 
@@ -1109,12 +1155,13 @@
 	// Redraw all clip waveforms on changes
 	$effect(() => {
 		// Re-read dependencies
-		void clipLayout;
+		void trackLayouts;
 		void clipWaveformCache;
 		void compositionTime;
 		// Schedule a draw on next frame
 		requestAnimationFrame(() => {
-			for (const cl of clipLayout) {
+			for (const [, layout] of trackLayouts) {
+				for (const cl of layout) {
 				const canvas = clipCanvasMap.get(cl.index);
 				if (!canvas || !cl.clip) continue;
 				const key = getClipWaveformKey(cl.entry, cl.clip);
@@ -1128,6 +1175,7 @@
 					progress = (compositionTime - cl.startOffset) / cl.effectiveDuration;
 				}
 				drawClipWaveformCanvas(canvas, peaks, progress, cl.color);
+				}
 			}
 		});
 	});
@@ -1181,7 +1229,7 @@
 					clipProgress = tb.trimmedDur > 0 ? Math.max(0, Math.min(1, elapsed / tb.trimmedDur)) : 0;
 					const layoutEntry = clipLayout[currentPreviewIndex];
 					if (layoutEntry) {
-						compositionTime = layoutEntry.startOffset + Math.max(0, elapsed) / (entry.speed || 1);
+						compositionTime = layoutEntry.startOffset + Math.max(0, elapsed);
 						previewCurrentTime = formatDuration(compositionTime);
 					}
 				}
@@ -1255,12 +1303,13 @@
 			// Sync composition time for playhead
 			const layoutEntry = clipLayout[currentPreviewIndex];
 			if (layoutEntry) {
-				compositionTime = layoutEntry.startOffset + Math.max(0, elapsed) / (entry.speed || 1);
+				compositionTime = layoutEntry.startOffset + Math.max(0, elapsed);
 			}
 			previewProgress = totalDuration > 0 ? Math.max(0, Math.min(1, compositionTime / totalDuration)) : 0;
 			previewCurrentTime = formatDuration(compositionTime);
 		}
 		syncAudioEffects();
+		syncOtherTrackVideos();
 	}
 
 	function seekToCompositionTime(targetTime: number) {
@@ -1275,13 +1324,13 @@
 			const cl = clipLayout[i];
 			if (accumulated + cl.effectiveDuration > compositionTime) {
 				targetIndex = i;
-				offsetInClip = (compositionTime - accumulated) * (cl.entry.speed || 1);
+				offsetInClip = compositionTime - accumulated;
 				break;
 			}
 			accumulated += cl.effectiveDuration;
 			if (i === clipLayout.length - 1) {
 				targetIndex = i;
-				offsetInClip = cl.effectiveDuration * (cl.entry.speed || 1);
+				offsetInClip = cl.effectiveDuration;
 			}
 		}
 
@@ -1308,6 +1357,7 @@
 				previewVideoEl.currentTime = bounds.localStart + (entry.trimStart || 0) + offsetInClip;
 			}
 		}
+		syncOtherTrackVideos();
 	}
 
 	function togglePreviewPlay() {
@@ -1327,11 +1377,13 @@
 			startWaveformLoop();
 		}
 		previewPlaying = !previewPlaying;
+		syncOtherTrackVideos();
 	}
 
 	function setPreviewRate(rate: number) {
 		previewPlaybackRate = Math.max(0.25, Math.min(4, rate));
 		if (previewVideoEl) previewVideoEl.playbackRate = previewPlaybackRate;
+		syncOtherTrackVideos();
 	}
 
 	// Clip-change detection: update clipDurationText, fetch transcription.
@@ -1360,7 +1412,7 @@
 			clipDurationSec = 0;
 			return;
 		}
-		clipDurationSec = tb.trimmedDur / (entry.speed || 1);
+		clipDurationSec = tb.trimmedDur;
 		clipDurationText = formatDuration(clipDurationSec);
 
 		// Fetch transcription for trimmed range
@@ -1408,6 +1460,148 @@
 		};
 	});
 
+	// --- Other-track video sources for multi-track preview ---
+	interface OtherTrackSource {
+		el: HTMLVideoElement;
+		hls: Hls | null;
+		clipId: string;
+		streamId: string;
+		track: number;
+		trimmedLocalStart: number;
+		trimmedLocalEnd: number;
+		compStart: number;
+	}
+	let otherTrackSources = new Map<string, OtherTrackSource>();
+
+	// Derive other-track clip entries (stable reference for effect diffing)
+	let otherTrackEntryKeys = $derived(
+		entries
+			.filter((e) => (e.track ?? 0) !== 0)
+			.map((e) => `${e.clipId}:${e.track}:${e.trimStart ?? 0}:${e.trimEnd ?? 0}:${e.startTime ?? 0}`)
+			.join('|')
+	);
+
+	// Manage HLS instances for other-track clips
+	$effect(() => {
+		void otherTrackEntryKeys; // depend on entries changes
+		const otherEntries = entries.filter((e) => (e.track ?? 0) !== 0);
+		const neededIds = new Set(otherEntries.map((e) => e.clipId));
+
+		// Remove sources for clips no longer in entries
+		for (const [clipId, src] of otherTrackSources) {
+			if (!neededIds.has(clipId)) {
+				if (src.hls) src.hls.destroy();
+				src.el.remove();
+				otherTrackSources.delete(clipId);
+			}
+		}
+
+		// Create sources for new clips
+		for (const entry of otherEntries) {
+			if (otherTrackSources.has(entry.clipId)) continue;
+			const clip = resolveClip(entry.clipId);
+			if (!clip) continue;
+			const bounds = clipBounds(clip);
+			if (!bounds) continue;
+
+			const el = document.createElement('video');
+			el.muted = true;
+			el.playsInline = true;
+			el.style.display = 'none';
+			document.body.appendChild(el);
+
+			const trimmedLocalStart = bounds.localStart + (entry.trimStart || 0);
+			const trimmedLocalEnd = bounds.localEnd - (entry.trimEnd || 0);
+			const url = `/hls/${clip.streamId}/playlist.m3u8`;
+			const hls = setupHls(Hls, el, url, trimmedLocalStart, () => {});
+
+			otherTrackSources.set(entry.clipId, {
+				el, hls,
+				clipId: entry.clipId,
+				streamId: clip.streamId,
+				track: entry.track ?? 1,
+				trimmedLocalStart,
+				trimmedLocalEnd,
+				compStart: entry.startTime ?? 0,
+			});
+		}
+
+		return () => {
+			for (const [, src] of otherTrackSources) {
+				if (src.hls) src.hls.destroy();
+				src.el.remove();
+			}
+			otherTrackSources.clear();
+		};
+	});
+
+	/**
+	 * Get the video element for a given track at the current composition time.
+	 * For track 0, returns the main preview video. For other tracks, finds the
+	 * matching other-track source and returns it (even mid-seek — drawImage
+	 * will use the last decoded frame, which is better than flashing black).
+	 */
+	function getTrackVideoEl(track: number): HTMLVideoElement | null {
+		if (track === 0) return previewVideoEl;
+
+		// Find the active clip on this track at compositionTime
+		for (const entry of entries) {
+			if ((entry.track ?? 0) !== track) continue;
+			const clip = resolveClip(entry.clipId);
+			if (!clip) continue;
+			const dur = clipDuration(clip, entry);
+			const start = entry.startTime ?? 0;
+			if (compositionTime < start || compositionTime >= start + dur) continue;
+
+			const src = otherTrackSources.get(entry.clipId);
+			if (!src) continue;
+
+			// Return element if it has ever loaded a frame (videoWidth > 0).
+			// Don't gate on readyState — during seeks it temporarily drops,
+			// but drawImage still uses the last decoded frame.
+			return src.el.videoWidth > 0 ? src.el : null;
+		}
+		return null;
+	}
+
+	/**
+	 * Sync all other-track video elements to the current composition time.
+	 * Called on seek and during playback to keep frames aligned.
+	 */
+	function syncOtherTrackVideos() {
+		for (const entry of entries) {
+			if ((entry.track ?? 0) === 0) continue;
+			const src = otherTrackSources.get(entry.clipId);
+			if (!src) continue;
+
+			const dur = clipDuration(resolveClip(entry.clipId)!, entry);
+			const start = entry.startTime ?? 0;
+			if (compositionTime < start || compositionTime >= start + dur) {
+				// Outside this clip's range — pause if playing
+				if (!src.el.paused) src.el.pause();
+				continue;
+			}
+
+			const compOffset = compositionTime - start;
+			const localTime = src.trimmedLocalStart + compOffset;
+
+			// Set playback rate to match preview rate
+			if (src.el.playbackRate !== previewPlaybackRate) src.el.playbackRate = previewPlaybackRate;
+
+			// Only seek if drifted beyond threshold (avoids constant seek jank)
+			if (Math.abs(src.el.currentTime - localTime) > 0.3) {
+				src.el.currentTime = localTime;
+			}
+
+			// Match play/pause state with main preview
+			if (previewPlaying && src.el.paused) {
+				src.el.play().catch(() => {});
+			} else if (!previewPlaying && !src.el.paused) {
+				src.el.pause();
+			}
+		}
+	}
+
 	// --- Resolve camera bounds for current clip (needed by view effects with camera source) ---
 	$effect(() => {
 		const hasCameraView = effectEntries.some((e) => e.type === 'view' && e.viewSourceType === 'camera');
@@ -1436,7 +1630,8 @@
 	}
 
 	function drawViewFrame() {
-		const canvas = verticalCanvasEl;
+		const isVertical = format === 'mobile_short';
+		const canvas = isVertical ? verticalCanvasEl : stdCanvasEl;
 		const video = previewVideoEl;
 		if (!canvas || !video || !video.videoWidth || !video.videoHeight) return;
 		const ctx = canvas.getContext('2d');
@@ -1444,14 +1639,14 @@
 
 		const vw = video.videoWidth;
 		const vh = video.videoHeight;
-		const cw = VERT_CANVAS_W;
-		const ch = VERT_CANVAS_H;
+		const cw = canvas.width;
+		const ch = canvas.height;
 
 		ctx.fillStyle = '#000';
 		ctx.fillRect(0, 0, cw, ch);
 
 		const t = compositionTime;
-		// Get active view effects at current time, sorted by z-order
+		// Get active view effects at current time, sorted by z-order.
 		const activeViews = effectEntries
 			.filter((e) => e.type === 'view' && t >= e.startTime && t < e.startTime + e.duration)
 			.sort((a, b) => (a.viewZOrder ?? 0) - (b.viewZOrder ?? 0));
@@ -1463,24 +1658,30 @@
 		}
 
 		for (const view of activeViews) {
+			// Resolve video source for this view's track
+			const trackEl = getTrackVideoEl(view.viewSourceTrack ?? 0);
+			if (!trackEl || !trackEl.videoWidth || !trackEl.videoHeight) continue; // skip — no video data yet
+
+			const tvw = trackEl.videoWidth;
+			const tvh = trackEl.videoHeight;
 			const progress = Math.max(0, Math.min(1, (t - view.startTime) / Math.max(0.001, view.duration)));
 
 			// Resolve source region
 			let srcX: number, srcY: number, srcW: number, srcH: number;
 			if (view.viewSourceType === 'camera' && currentCamBounds) {
-				srcX = currentCamBounds.camX * vw;
-				srcY = currentCamBounds.camY * vh;
-				srcW = currentCamBounds.camW * vw;
-				srcH = currentCamBounds.camH * vh;
+				srcX = currentCamBounds.camX * tvw;
+				srcY = currentCamBounds.camY * tvh;
+				srcW = currentCamBounds.camW * tvw;
+				srcH = currentCamBounds.camH * tvh;
 			} else if (view.viewSourceType === 'full') {
-				srcX = 0; srcY = 0; srcW = vw; srcH = vh;
+				srcX = 0; srcY = 0; srcW = tvw; srcH = tvh;
 			} else {
 				// Custom/animated source
 				const sx = (view.viewSourceStartX ?? 0) + ((view.viewSourceEndX ?? view.viewSourceStartX ?? 0) - (view.viewSourceStartX ?? 0)) * progress;
 				const sy = (view.viewSourceStartY ?? 0) + ((view.viewSourceEndY ?? view.viewSourceStartY ?? 0) - (view.viewSourceStartY ?? 0)) * progress;
 				const sw = (view.viewSourceStartW ?? 1) + ((view.viewSourceEndW ?? view.viewSourceStartW ?? 1) - (view.viewSourceStartW ?? 1)) * progress;
 				const sh = (view.viewSourceStartH ?? 1) + ((view.viewSourceEndH ?? view.viewSourceStartH ?? 1) - (view.viewSourceStartH ?? 1)) * progress;
-				srcX = sx * vw; srcY = sy * vh; srcW = sw * vw; srcH = sh * vh;
+				srcX = sx * tvw; srcY = sy * tvh; srcW = sw * tvw; srcH = sh * tvh;
 			}
 
 			// Resolve dest rect (scaled to canvas)
@@ -1489,25 +1690,27 @@
 			const dstW = (view.viewDestW ?? 1) * cw;
 			const dstH = (view.viewDestH ?? 1) * ch;
 
-			verticalCoverDraw(ctx, video, srcX, srcY, srcW, srcH, dstX, dstY, dstW, dstH);
+			verticalCoverDraw(ctx, trackEl, srcX, srcY, srcW, srcH, dstX, dstY, dstW, dstH);
 		}
 	}
 
-	function verticalRenderLoop() {
+	function viewRenderLoop() {
 		drawViewFrame();
-		verticalRafId = requestAnimationFrame(verticalRenderLoop);
+		verticalRafId = requestAnimationFrame(viewRenderLoop);
 	}
 
-	// Start/stop vertical canvas loop based on format
+	// Start/stop canvas render loop for vertical format or standard multi-track views
 	$effect(() => {
-		if (format !== 'mobile_short' || !verticalCanvasEl || !previewVideoEl) {
+		const useVertCanvas = format === 'mobile_short' && !!verticalCanvasEl;
+		const useStdCanvas = needsStdCanvas && !!stdCanvasEl;
+		if ((!useVertCanvas && !useStdCanvas) || !previewVideoEl) {
 			if (verticalRafId != null) { cancelAnimationFrame(verticalRafId); verticalRafId = null; }
 			return;
 		}
 		// Wait for video data
 		const startLoop = () => {
 			if (verticalRafId != null) return;
-			verticalRafId = requestAnimationFrame(verticalRenderLoop);
+			verticalRafId = requestAnimationFrame(viewRenderLoop);
 		};
 		if (previewVideoEl.videoWidth) {
 			startLoop();
@@ -1591,15 +1794,20 @@
 		window.addEventListener('mouseup', handleDragEnd);
 	}
 
-	// --- Drag-to-reorder ---
+	// --- Drag-to-reorder / move between tracks ---
 	function handleReorderStart(e: MouseEvent, index: number) {
 		// Only start reorder if not on a trim handle
 		if ((e.target as HTMLElement).closest('.trim-handle')) return;
 		e.stopPropagation();
 		e.preventDefault();
-		dragMode = 'reorder';
+		const entry = entries[index];
+		const track = entry.track ?? 0;
+		dragMode = track === 0 ? 'reorder' : 'move-track';
 		dragEntryIndex = index;
 		dragStartX = e.clientX;
+		dragStartY = e.clientY;
+		dragStartValue = entry.startTime ?? 0;
+		dragStartTrack = track;
 		dragInsertIndex = null;
 		dragPreviewDelta = 0;
 		selectedIndex = index;
@@ -1627,6 +1835,19 @@
 			updateEntry(dragEntryIndex, { trimEnd: newTrim > 0.01 ? newTrim : undefined });
 		} else if (dragMode === 'reorder') {
 			dragPreviewDelta = deltaX;
+			// Check vertical movement — dragging up from track 0 moves to higher tracks
+			const deltaRows = Math.round((dragStartY - e.clientY) / 64);
+			if (deltaRows > 0 && dragEntryIndex !== null) {
+				// Convert reorder to move-track: assign track and startTime
+				const cl = clipLayout.find((c) => c.index === dragEntryIndex);
+				const newStartTime = cl ? cl.startOffset : 0;
+				const newTrack = Math.max(1, deltaRows);
+				updateEntry(dragEntryIndex, { track: newTrack, startTime: newStartTime });
+				dragMode = 'move-track';
+				dragStartTrack = newTrack;
+				dragStartValue = newStartTime;
+				return;
+			}
 			// Compute insert position from cursor X
 			if (!scrollAreaEl) return;
 			const rect = scrollAreaEl.getBoundingClientRect();
@@ -1644,6 +1865,20 @@
 				}
 			}
 			dragInsertIndex = insertIdx;
+		} else if (dragMode === 'move-track') {
+			// Horizontal: change startTime; Vertical: change track
+			const deltaSec = deltaX / pixelsPerSecond;
+			const deltaRows = Math.round((dragStartY - e.clientY) / 64);
+			const newTrack = Math.max(0, dragStartTrack + deltaRows);
+			const newStartTime = Math.max(0, dragStartValue + deltaSec);
+			if (dragEntryIndex === null) return;
+			if (newTrack === 0) {
+				// Moving back to track 0 — remove startTime, become sequential
+				updateEntry(dragEntryIndex, { track: undefined, startTime: undefined });
+				dragMode = 'reorder';
+			} else {
+				updateEntry(dragEntryIndex, { track: newTrack, startTime: newStartTime });
+			}
 		}
 	}
 
@@ -1786,7 +2021,7 @@
 						ontimeupdate={handlePreviewTimeUpdate}
 						playsinline
 						class="preview-video"
-						class:preview-video-hidden={format === 'mobile_short'}
+						class:preview-video-hidden={format === 'mobile_short' || needsStdCanvas}
 					></video>
 					{#if format === 'mobile_short'}
 						<canvas
@@ -1794,6 +2029,13 @@
 							width={VERT_CANVAS_W}
 							height={VERT_CANVAS_H}
 							class="vertical-preview-canvas"
+						></canvas>
+					{:else if needsStdCanvas}
+						<canvas
+							bind:this={stdCanvasEl}
+							width={STD_CANVAS_W}
+							height={STD_CANVAS_H}
+							class="std-preview-canvas"
 						></canvas>
 					{/if}
 					<!-- Effect overlays on video — positioned to match the video's actual rendered area -->
@@ -2026,6 +2268,16 @@
 										<option value="full">Full Frame</option>
 										<option value="camera">Camera</option>
 									</select>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Source Track</label>
+									<input type="number" class="prop-input" min="0" step="1"
+										value={selEffect.viewSourceTrack ?? 0}
+										onchange={(e) => {
+											const val = Math.max(0, Math.round(+(e.target as HTMLInputElement).value));
+											updateEffectEntry(selEffect.id, { viewSourceTrack: val || undefined });
+										}}
+									/>
 								</div>
 								{#if !selEffect.viewSourceType}
 									<div class="prop-field">
@@ -2702,7 +2954,6 @@
 						<button class="btn-props btn-export" onclick={handleExport} disabled={exporting || entries.length === 0}>
 							{exporting ? 'Queueing...' : 'Export Video'}
 						</button>
-						<a class="btn-props btn-thumbnail" href="/thumbnail?video={video.id}">Thumbnail</a>
 						<button class="btn-props btn-delete" onclick={handleDeleteVideo}>Delete</button>
 					</div>
 
@@ -2828,7 +3079,10 @@
 							{@const trackIdx = effectTrackCount - 1 - i}
 							<div class="tl-label-row" style="height: 30px"><span class="tl-label-icon" style="color: #38bdf8">[FX{trackIdx > 0 ? trackIdx : ''}]</span><span class="tl-label-text">Effects</span></div>
 						{/each}
-						<div class="tl-label-row" style="height: 64px"><span class="tl-label-icon">[V]</span><span class="tl-label-text">Video</span></div>
+						{#each { length: videoTrackCount } as _, i}
+							{@const vTrackIdx = videoTrackCount - 1 - i}
+							<div class="tl-label-row" style="height: 64px"><span class="tl-label-icon">[V{vTrackIdx > 0 ? vTrackIdx : ''}]</span><span class="tl-label-text">Video</span></div>
+						{/each}
 					</div>
 
 					<!-- Scrollable timeline area -->
@@ -2902,51 +3156,55 @@
 								</div>
 							{/each}
 
-							<!-- [V] Video Track -->
-							<div class="tl-track tl-track-video" style="height: 64px">
-								{#each clipLayout as cl (cl.entry.clipId + '-' + cl.index)}
-									{@const leftPx = cl.startOffset * pixelsPerSecond}
-									{@const widthPx = cl.effectiveDuration * pixelsPerSecond}
-									{@const isVisible = leftPx + widthPx > viewportLeft - CULL_MARGIN && leftPx < viewportLeft + viewportWidth + CULL_MARGIN}
-									{@const isSelected = selectedIndex === cl.index}
-									{@const isDragging = dragMode === 'reorder' && dragEntryIndex === cl.index}
-									{#if isVisible}
-										<!-- svelte-ignore a11y_no_static_element_interactions -->
-										<div
-											class="clip-block"
-											class:selected={isSelected}
-											class:dragging={isDragging}
-											style="left: {leftPx + (isDragging ? dragPreviewDelta : 0)}px; width: {widthPx}px; background: {cl.color};"
-											onclick={(e) => handleClipClick(e, cl.index)}
-											onmousedown={(e) => handleReorderStart(e, cl.index)}
-										>
-											<canvas
-												class="clip-waveform-canvas"
-												use:clipWaveformAction={() => cl.index}
-											></canvas>
-											<!-- Trim handles -->
+							<!-- [V] Video Tracks (highest track at top) -->
+							{#each { length: videoTrackCount } as _, vi}
+								{@const vTrackIdx = videoTrackCount - 1 - vi}
+								{@const vTrackLayout = trackLayouts.get(vTrackIdx) ?? []}
+								<div class="tl-track tl-track-video" style="height: 64px">
+									{#each vTrackLayout as cl (cl.entry.clipId + '-' + cl.index)}
+										{@const leftPx = cl.startOffset * pixelsPerSecond}
+										{@const widthPx = cl.effectiveDuration * pixelsPerSecond}
+										{@const isVisible = leftPx + widthPx > viewportLeft - CULL_MARGIN && leftPx < viewportLeft + viewportWidth + CULL_MARGIN}
+										{@const isSelected = selectedIndex === cl.index}
+										{@const isDragging = (dragMode === 'reorder' || dragMode === 'move-track') && dragEntryIndex === cl.index}
+										{#if isVisible}
 											<!-- svelte-ignore a11y_no_static_element_interactions -->
-											<div class="trim-handle trim-handle-start" onmousedown={(e) => handleTrimStart(e, cl.index)}></div>
-											<span class="clip-label">
-												{#if cl.clip}
-													<span class="clip-ch">{clipChannel(cl.clip)}</span>
-													{cl.clip.title || ''}
-												{:else}
-													Missing
-												{/if}
-											</span>
-											<!-- svelte-ignore a11y_no_static_element_interactions -->
-											<div class="trim-handle trim-handle-end" onmousedown={(e) => handleTrimEnd(e, cl.index)}></div>
-										</div>
-									{/if}
-								{/each}
+											<div
+												class="clip-block"
+												class:selected={isSelected}
+												class:dragging={isDragging}
+												style="left: {leftPx + (isDragging ? dragPreviewDelta : 0)}px; width: {widthPx}px; background: {cl.color};"
+												onclick={(e) => handleClipClick(e, cl.index)}
+												onmousedown={(e) => handleReorderStart(e, cl.index)}
+											>
+												<canvas
+													class="clip-waveform-canvas"
+													use:clipWaveformAction={() => cl.index}
+												></canvas>
+												<!-- Trim handles -->
+												<!-- svelte-ignore a11y_no_static_element_interactions -->
+												<div class="trim-handle trim-handle-start" onmousedown={(e) => handleTrimStart(e, cl.index)}></div>
+												<span class="clip-label">
+													{#if cl.clip}
+														<span class="clip-ch">{clipChannel(cl.clip)}</span>
+														{cl.clip.title || ''}
+													{:else}
+														Missing
+													{/if}
+												</span>
+												<!-- svelte-ignore a11y_no_static_element_interactions -->
+												<div class="trim-handle trim-handle-end" onmousedown={(e) => handleTrimEnd(e, cl.index)}></div>
+											</div>
+										{/if}
+									{/each}
 
-								<!-- Drop indicator for reorder -->
-								{#if dragMode === 'reorder' && dragInsertIndex !== null}
-									{@const insertOffset = dragInsertIndex < clipLayout.length ? clipLayout[dragInsertIndex].startOffset : totalDuration}
-									<div class="drop-indicator" style="left: {insertOffset * pixelsPerSecond}px"></div>
-								{/if}
-							</div>
+									<!-- Drop indicator for reorder (track 0 only) -->
+									{#if vTrackIdx === 0 && dragMode === 'reorder' && dragInsertIndex !== null}
+										{@const insertOffset = dragInsertIndex < clipLayout.length ? clipLayout[dragInsertIndex].startOffset : totalDuration}
+										<div class="drop-indicator" style="left: {insertOffset * pixelsPerSecond}px"></div>
+									{/if}
+								</div>
+							{/each}
 
 							<!-- Ghost playhead (mouse hover) -->
 							{#if ghostX !== null}
@@ -3099,6 +3357,14 @@
 		max-width: 100%;
 		max-height: 100%;
 		aspect-ratio: 9 / 16;
+		display: block;
+		background: #000;
+	}
+
+	.std-preview-canvas {
+		max-width: 100%;
+		max-height: 100%;
+		aspect-ratio: 16 / 9;
 		display: block;
 		background: #000;
 	}
@@ -3301,17 +3567,6 @@
 	.btn-export:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
-	}
-
-	.btn-thumbnail {
-		background: rgba(59, 130, 246, 0.15);
-		border: 1px solid rgba(59, 130, 246, 0.3);
-		color: #93c5fd;
-	}
-
-	.btn-thumbnail:hover {
-		background: rgba(59, 130, 246, 0.25);
-		color: #bfdbfe;
 	}
 
 	.btn-delete {

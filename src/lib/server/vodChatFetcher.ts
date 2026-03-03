@@ -34,14 +34,6 @@ export function extractVideoId(sourceUrl: string): string | null {
 	return match ? match[1] : null;
 }
 
-/**
- * Extract a Douyu room ID from a URL like https://douyu.com/12345
- */
-export function extractDouyuRoomId(sourceUrl: string): string | null {
-	const match = sourceUrl.match(/douyu\.com\/(\d+)/);
-	return match ? match[1] : null;
-}
-
 // --- Chat fetch queue (one at a time to avoid Twitch GQL rate limits) ---
 
 interface QueueEntry {

@@ -7,11 +7,21 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 import type { ResolvedEffect, ResolvedView } from './exporterTypes.js';
 import type { ResolvedClip, ResolvedAudioOverlay } from './exporterCommon.js';
-import { buildAudioArgs, buildVideoEncoderArgs, buildAudioMixFilter } from './exporterCommon.js';
+import { buildVideoEncoderArgs, buildAudioMixFilter } from './exporterCommon.js';
 import { buildViewFilter } from './viewFilter.js';
 import { buildAnimatedOverlay } from './overlayAnimation.js';
 import { runFfmpeg, spawnFfmpegWithPipe } from './ffmpeg.js';
 import type { FrameSink } from './chatEffectRenderer.js';
+
+/** Extra video track input for multi-track compositing. */
+export interface ExtraTrackInput {
+	track: number;
+	concatPath: string;
+	seekOffset: number;
+	dur: number;
+	/** Offset from the start of the current clip's composition window (seconds). */
+	clipOffset: number;
+}
 
 export interface ClipEncodeOptions {
 	/** Resolved clip metadata */
@@ -48,6 +58,8 @@ export interface ClipEncodeOptions {
 	audioMapFallback?: string;
 	/** Log tag prefix for console output */
 	logTag?: string;
+	/** Extra track inputs for multi-track compositing */
+	extraTrackInputs?: ExtraTrackInput[];
 }
 
 /**
@@ -59,10 +71,11 @@ export async function encodeClip(opts: ClipEncodeOptions): Promise<string> {
 		resolved, clipIdx, outW, outH, srcW, srcH, fps,
 		allEffects, clipViews, audioOverlays, camBounds,
 		useNvenc, tempDir, baseVideoFilter, gop,
-		extraOutputArgs, audioMapFallback, logTag
+		extraOutputArgs, audioMapFallback, logTag,
+		extraTrackInputs
 	} = opts;
 
-	const { dur, clipDur, speed, trimStart: seekOffset, concatPath } = resolved;
+	const { dur, trimStart: seekOffset, concatPath } = resolved;
 	// Use input seeking (-ss before -i) so the filter graph PTS starts from ~0
 	// and the output file has PTS starting from 0. This prevents edit-list
 	// misalignment that causes black frames at concat boundaries.
@@ -74,11 +87,35 @@ export async function encodeClip(opts: ClipEncodeOptions): Promise<string> {
 	let videoFilterArgs: string[];
 	const hasOverlays = allEffects.length > 0;
 	const hasViews = clipViews.length > 0;
+	const hasExtraTracks = extraTrackInputs && extraTrackInputs.length > 0;
 	let pipeEffect: ResolvedEffect | null = null;
 
-	if (hasOverlays || hasViews) {
+	// --- Build extra track inputs (inserted before overlay inputs) ---
+	const trackCount = hasExtraTracks ? extraTrackInputs.length : 0;
+	let trackInputLabels: Map<number, string> | undefined;
+
+	if (hasExtraTracks) {
+		trackInputLabels = new Map<number, string>();
+		trackInputLabels.set(0, 'base');
+
+		for (let ti = 0; ti < extraTrackInputs.length; ti++) {
+			const et = extraTrackInputs[ti];
+			// Each extra track is a separate concat input with seek.
+			// +genpts ensures PTS starts at 0 (like track 0) so view
+			// overlay enable timing aligns with the canvas.
+			extraInputs.push(
+				'-fflags', '+genpts',
+				'-ss', et.seekOffset.toFixed(3),
+				'-t', et.dur.toFixed(3),
+				'-f', 'concat', '-safe', '0', '-i', et.concatPath
+			);
+			trackInputLabels.set(et.track, `t${et.track}`);
+		}
+	}
+
+	if (hasOverlays || hasViews || hasExtraTracks) {
 		if (allEffects.length > 0) {
-			console.log(`[${tag}] Clip ${clipIdx}: ${allEffects.length} overlay(s), ${clipViews.length} views, ss=${seekOffset.toFixed(3)} t=${dur.toFixed(3)} speed=${speed}`);
+			console.log(`[${tag}] Clip ${clipIdx}: ${allEffects.length} overlay(s), ${clipViews.length} views, ${trackCount} extra tracks, ss=${seekOffset.toFixed(3)} t=${dur.toFixed(3)}`);
 			for (const eff of allEffects) {
 				console.log(`[${tag}]   overlay: pos=(${eff.x},${eff.y}) local=[${eff.localStart.toFixed(3)},${eff.localEnd.toFixed(3)}] raw=${!!eff.rawVideo} piped=${!!eff.deferredRender}`);
 			}
@@ -125,7 +162,9 @@ export async function encodeClip(opts: ClipEncodeOptions): Promise<string> {
 			}
 		}
 
-		const speedFilter = speed !== 1 ? `setpts=PTS/${speed},` : '';
+		// Reset PTS to start at exactly 0 so overlay enable windows and the
+		// color=black canvas (PTS=0) align with the video frames.
+		// Audio is also PTS-reset in the filter graph to stay in sync.
 		let filterGraph: string;
 		let prevLabel: string;
 
@@ -134,24 +173,40 @@ export async function encodeClip(opts: ClipEncodeOptions): Promise<string> {
 			filterGraph = `[0:v]${baseVideoFilter}[base]`;
 			prevLabel = 'base';
 		} else {
-			filterGraph = `[0:v]${speedFilter}format=yuv420p[base]`;
+			filterGraph = `[0:v]setpts=PTS-STARTPTS,format=yuv420p[base]`;
 			prevLabel = 'base';
+		}
+
+		// Format-convert extra track inputs: [N:v] -> setpts/speed, format -> [tN]
+		if (hasExtraTracks) {
+			for (let ti = 0; ti < extraTrackInputs.length; ti++) {
+				const et = extraTrackInputs[ti];
+				// Extra track inputs start at index 1 (index 0 is track 0 concat)
+				const inputIdx = 1 + ti;
+				// Offset PTS by clipOffset so the first frame's PTS matches the
+				// composition position where the overlay enable window starts.
+				// This keeps extra-track video in sync with its adelay'd audio.
+				const offset = et.clipOffset > 0 ? `+${et.clipOffset.toFixed(3)}` : '';
+				filterGraph += `;[${inputIdx}:v]setpts=PTS-STARTPTS${offset},format=yuv420p[t${et.track}]`;
+			}
 		}
 
 		// 1. View composition
 		const viewFps = fps > 0 ? fps : 30;
 		if (hasViews) {
 			const viewFilter = buildViewFilter(
-				'base', 'viewed', clipViews, trimStart, srcW, srcH, outW, outH, viewFps, camBounds
+				'base', 'viewed', clipViews, trimStart, srcW, srcH, outW, outH, viewFps, camBounds, trackInputLabels
 			);
 			filterGraph += viewFilter;
 			prevLabel = 'viewed';
 		}
 
 		// 2. Overlay chain (all overlays composited after views)
+		// Overlay input indices: after track 0 (idx 0) + extra tracks + overlay inputs
+		const overlayInputOffset = 1 + trackCount;
 		for (let ei = 0; ei < allEffects.length; ei++) {
 			const eff = allEffects[ei];
-			const inputIdx = ei + 1;
+			const inputIdx = overlayInputOffset + ei;
 			const isLast = ei === allEffects.length - 1;
 			const nextLabel = isLast ? 'outv' : `v${ei}`;
 			const enableStart = (trimStart + eff.localStart).toFixed(3);
@@ -189,21 +244,35 @@ export async function encodeClip(opts: ClipEncodeOptions): Promise<string> {
 			filterGraph = filterGraph.replace(`[${prevLabel}]`, '[outv]');
 		}
 
-		if (allEffects.length > 0 || hasViews) {
+		if (allEffects.length > 0 || hasViews || hasExtraTracks) {
 			console.log(`[${tag}]   filter_complex: ${filterGraph}`);
 		}
 
 		// Audio overlay mixing
-		const audioNextIdx = 1 + allEffects.length;
-		const audioMix = buildAudioMixFilter(audioOverlays, audioNextIdx, speed, clipDur, trimStart);
+		const audioNextIdx = overlayInputOffset + allEffects.length;
+		const audioMix = buildAudioMixFilter(audioOverlays, audioNextIdx, dur, trimStart);
 		if (audioMix.totalAudioInputs > 0) {
 			extraInputs.push(...audioMix.extraInputs);
 			filterGraph += ';' + audioMix.audioFilterGraph;
 		}
 
-		const audioMap = audioMix.totalAudioInputs > 0
-			? ['-map', `[${audioMix.audioOutLabel}]`]
-			: ['-map', audioMapFallback ?? '0:a:0'];
+		// Audio mapping: use track 0 audio only (extra tracks are video-only).
+		// Extra track inputs provide video for view compositing; their audio
+		// would overlap/echo track 0's audio since they often come from the
+		// same or overlapping source streams.
+		let audioMap: string[];
+		if (audioMix.totalAudioInputs > 0) {
+			audioMap = ['-map', `[${audioMix.audioOutLabel}]`];
+		} else if (audioMapFallback === '0:a?') {
+			// Optional audio (vertical exporter) — use direct mapping since
+			// the stream may not have audio and filter_complex can't handle '?'.
+			audioMap = ['-map', '0:a?'];
+		} else {
+			// Route audio through filter_complex with PTS reset to match
+			// video PTS-STARTPTS (no audio overlays, no extra tracks).
+			filterGraph += `;[0:a]asetpts=PTS-STARTPTS[aout0]`;
+			audioMap = ['-map', '[aout0]'];
+		}
 
 		videoFilterArgs = [
 			'-filter_complex', filterGraph,
@@ -213,16 +282,11 @@ export async function encodeClip(opts: ClipEncodeOptions): Promise<string> {
 		];
 	} else {
 		// No overlays or views
-		const audioArgs = buildAudioArgs(speed);
-		const vFilters: string[] = [];
-		if (speed !== 1) vFilters.push(`setpts=PTS/${speed}`);
-		vFilters.push('format=yuv420p');
-
 		if (audioOverlays.length > 0) {
 			// Need filter_complex for audio mixing even without video overlays
-			const audioMix = buildAudioMixFilter(audioOverlays, 1, speed, clipDur, trimStart);
+			const audioMix = buildAudioMixFilter(audioOverlays, 1, dur, trimStart);
 			extraInputs.push(...audioMix.extraInputs);
-			const fullFilter = `[0:v]${vFilters.join(',')}[outv];${audioMix.audioFilterGraph}`;
+			const fullFilter = `[0:v]format=yuv420p[outv];${audioMix.audioFilterGraph}`;
 			videoFilterArgs = [
 				'-filter_complex', fullFilter,
 				'-map', '[outv]', '-map', `[${audioMix.audioOutLabel}]`,
@@ -230,16 +294,12 @@ export async function encodeClip(opts: ClipEncodeOptions): Promise<string> {
 			];
 		} else {
 			videoFilterArgs = [
-				'-vf', vFilters.join(','),
+				'-vf', 'format=yuv420p',
 				'-map', '0:v:0', '-map', audioMapFallback ?? '0:a:0',
 				...buildVideoEncoderArgs(useNvenc, gop)
 			];
 		}
 	}
-
-	// When using audio filter_complex, skip -af args (already handled in filter graph)
-	const hasAudioMix = audioOverlays.length > 0;
-	const audioArgs = buildAudioArgs(speed);
 
 	const ffmpegArgs = [
 		// Input options: seek + limit reading on the concat source.
@@ -251,10 +311,10 @@ export async function encodeClip(opts: ClipEncodeOptions): Promise<string> {
 		...extraInputs,
 		...videoFilterArgs,
 		// Output -t prevents the color source (d=999) from extending past the clip.
-		'-t', clipDur.toFixed(3),
+		'-t', dur.toFixed(3),
 		'-fps_mode', 'cfr',
 		...(extraOutputArgs ?? []),
-		...(hasAudioMix ? ['-c:a', 'aac', '-ar', '48000', '-b:a', '192k'] : audioArgs),
+		'-c:a', 'aac', '-ar', '48000', '-b:a', '192k',
 		'-movflags', '+faststart',
 		'-y', outFile
 	];

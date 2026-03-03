@@ -4,7 +4,7 @@ import * as crypto from 'node:crypto';
 import { startCapture, fetchStreamMeta, fetchVodMeta, type CaptureHandle } from './captureProcess.js';
 import { startTranscription, stopTranscription, transcribeFullRecording, shutdownTranscriber } from './transcriber.js';
 import { startChatCollection } from './chatCollector.js';
-import { startVodChatFetch, extractVideoId, extractDouyuRoomId } from './vodChatFetcher.js';
+import { startVodChatFetch, extractVideoId } from './vodChatFetcher.js';
 import type { StreamInfo, ChatMessage } from './types.js';
 import * as db from './db/index.js';
 import {
@@ -58,8 +58,8 @@ interface CaptureCallbackOpts {
 	getHandle: () => CaptureHandle;
 	id: string;
 	language: string | null;
-	/** Live chat: provide channel + platform to start IRC collection. */
-	liveChat?: { channel: string; platform: 'twitch' | 'douyu' };
+	/** Live chat: provide channel to start IRC collection. */
+	liveChat?: { channel: string };
 	/** VOD chat: provide videoId to start VOD chat download. */
 	vodChat?: { videoId: string };
 	/** If true, run full-file transcription when status transitions to 'stopped'. */
@@ -91,11 +91,9 @@ function createStatusCallback(opts: CaptureCallbackOpts): (info: StreamInfo) => 
 		// Start live chat collection (Twitch IRC) — guarded, only once per capture
 		if (info.status === 'capturing' && opts.liveChat && !handle.chatStarted) {
 			handle.chatStarted = true;
-			if (opts.liveChat.platform === 'twitch') {
-				handle.stopChat = startChatCollection(opts.id, opts.liveChat.channel, info.startedAt, (_sid, msg) => {
-					persistChatMessage(opts.id, msg);
-				});
-			}
+			handle.stopChat = startChatCollection(opts.id, opts.liveChat.channel, info.startedAt, (_sid, msg) => {
+				persistChatMessage(opts.id, msg);
+			});
 		}
 
 		// Start VOD chat download — guarded, only once per capture
@@ -278,10 +276,9 @@ function findCaptureBySourceUrl(url: string): CaptureHandle | undefined {
  */
 export async function addStream(
 	channel: string,
-	language?: string | null,
-	platform: 'twitch' | 'douyu' = 'twitch'
+	language?: string | null
 ): Promise<StreamInfo> {
-	if (findActiveCapture(channel, platform, 'live')) {
+	if (findActiveCapture(channel, 'twitch', 'live')) {
 		throw new Error(`Already capturing channel: ${channel}`);
 	}
 
@@ -294,10 +291,10 @@ export async function addStream(
 		id,
 		language: transcriptionLanguage,
 		streamTranscribeOnCapturing: true,
-		liveChat: { channel, platform }
+		liveChat: { channel }
 	});
 
-	handle = startCapture(channel, id, RECORDINGS_DIR, onStatus, undefined, platform);
+	handle = startCapture(channel, id, RECORDINGS_DIR, onStatus);
 	captures.set(id, handle);
 	db.saveStream(handle.info);
 
@@ -361,45 +358,17 @@ export async function addVodStream(channel: string, language?: string | null): P
  * Fetches VOD metadata to determine the channel and start time.
  */
 export async function addVodByUrl(vodUrl: string, language?: string | null): Promise<StreamInfo> {
-	// Detect platform and extract IDs using shared extractors
-	const douyuRoomId = extractDouyuRoomId(vodUrl);
 	const twitchVideoId = extractVideoId(vodUrl);
-	const isDouyu = !!douyuRoomId;
 
-	// Normalize the source URL for dedup: extract canonical form
-	const canonicalUrl = isDouyu
-		? `https://douyu.com/${douyuRoomId}`
-		: twitchVideoId
-			? `https://twitch.tv/videos/${twitchVideoId}`
-			: vodUrl.trim();
+	// Normalize the source URL for dedup
+	const canonicalUrl = twitchVideoId
+		? `https://twitch.tv/videos/${twitchVideoId}`
+		: vodUrl.trim();
 
-	// Check for duplicate VOD by source URL
 	if (findCaptureBySourceUrl(canonicalUrl)) {
 		throw new Error(`VOD already added: ${canonicalUrl}`);
 	}
 
-	if (isDouyu) {
-		const roomId = douyuRoomId!;
-		const transcriptionLanguage = language ?? db.getChannelSettings(roomId)?.language ?? null;
-		const id = crypto.randomUUID();
-
-		let vodHandle!: CaptureHandle;
-		const onStatus = createStatusCallback({
-			getHandle: () => vodHandle,
-			id,
-			language: transcriptionLanguage,
-			fullTranscribeOnStop: true
-		});
-
-		vodHandle = startCapture(roomId, id, RECORDINGS_DIR, onStatus, vodUrl, 'douyu');
-		captures.set(id, vodHandle);
-		db.saveStream(vodHandle.info);
-
-		console.log(`[vod:douyu:${roomId}] Started Douyu VOD capture`);
-		return vodHandle.info;
-	}
-
-	// Twitch VOD
 	if (!twitchVideoId) {
 		throw new Error('Invalid VOD URL — expected twitch.tv/videos/<id>');
 	}
@@ -424,7 +393,7 @@ export async function addVodByUrl(vodUrl: string, language?: string | null): Pro
 		fullTranscribeOnStop: true
 	});
 
-	vodHandle = startCapture(channel, id, RECORDINGS_DIR, onStatus, fullVodUrl, 'twitch');
+	vodHandle = startCapture(channel, id, RECORDINGS_DIR, onStatus, fullVodUrl);
 
 	if (meta.createdAt) {
 		vodHandle.info.startedAt = Date.parse(meta.createdAt);
@@ -525,7 +494,6 @@ export function resumeVodStream(id: string): boolean {
 			baseCallback(info);
 		},
 		sourceUrl,
-		'twitch',
 		hlsStartOffset
 	);
 

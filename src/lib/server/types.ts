@@ -13,7 +13,7 @@ export interface StreamInfo {
 	offset: number;
 	sourceType: 'live' | 'vod';
 	parentStreamId: string | null;
-	platform: 'twitch' | 'douyu';
+	platform: 'twitch';
 	sourceUrl: string | null;
 	chatComplete: boolean;
 	durationSeconds: number | null;

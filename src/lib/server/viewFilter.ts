@@ -9,6 +9,10 @@ import type { ResolvedView } from './exporterTypes.js';
  * Build FFmpeg filter chain for view effects.
  * Uses canvas composition: black background with views overlaid.
  * Single full-canvas view: simplified to crop+scale (no canvas needed).
+ *
+ * @param trackInputLabels - Maps video track index to its FFmpeg label.
+ *   When provided, each view looks up its source by `view.sourceTrack`.
+ *   When omitted, all views use `inputLabel` (backward compat = single track).
  */
 export function buildViewFilter(
 	inputLabel: string,
@@ -20,40 +24,60 @@ export function buildViewFilter(
 	outW: number,
 	outH: number,
 	fps: number,
-	camBounds?: { camX: number; camY: number; camW: number; camH: number } | null
+	camBounds?: { camX: number; camY: number; camW: number; camH: number } | null,
+	trackInputLabels?: Map<number, string>
 ): string {
 	if (views.length === 0) return '';
 
+	// Build effective label map: track -> FFmpeg label
+	const labelMap = trackInputLabels ?? new Map<number, string>([[0, inputLabel]]);
+	if (!labelMap.has(0)) labelMap.set(0, inputLabel);
+
+	// Filter out views whose source track has no active clip (no label)
+	const activeViews = views.filter((v) => labelMap.has(v.sourceTrack));
+	if (activeViews.length === 0) return '';
+
 	// Optimization: single full-canvas view — skip canvas composition
-	if (views.length === 1) {
-		const v = views[0];
+	if (activeViews.length === 1) {
+		const v = activeViews[0];
 		const isFullDest = v.destX === 0 && v.destY === 0 && v.destW === 1 && v.destH === 1;
 		if (isFullDest) {
-			return buildViewCropScale(inputLabel, outputLabel, v, trimStart, srcW, srcH, outW, outH, camBounds);
+			const srcLabel = labelMap.get(v.sourceTrack) ?? inputLabel;
+			return buildViewCropScale(srcLabel, outputLabel, v, trimStart, srcW, srcH, outW, outH, camBounds);
 		}
 	}
 
 	// General case: canvas composition
 	let filter = '';
 
-	// When multiple views reference the same source, we must split it —
-	// FFmpeg labels can only be consumed once.
-	const viewInputLabels: string[] = [];
-	if (views.length > 1) {
-		const splitLabels = views.map((_, vi) => `[bv${vi}]`).join('');
-		filter += `;[${inputLabel}]split=${views.length}${splitLabels}`;
-		for (let vi = 0; vi < views.length; vi++) viewInputLabels.push(`bv${vi}`);
-	} else {
-		viewInputLabels.push(inputLabel);
+	// Group views by source track to determine which labels need splitting
+	const viewsByTrack = new Map<number, number[]>();
+	for (let vi = 0; vi < activeViews.length; vi++) {
+		const track = activeViews[vi].sourceTrack;
+		if (!viewsByTrack.has(track)) viewsByTrack.set(track, []);
+		viewsByTrack.get(track)!.push(vi);
+	}
+
+	// For each track, if multiple views use it, split; otherwise use directly
+	const viewInputLabels: string[] = new Array(activeViews.length);
+	for (const [track, viewIndices] of viewsByTrack) {
+		const trackLabel = labelMap.get(track) ?? inputLabel;
+		if (viewIndices.length > 1) {
+			const splitLabels = viewIndices.map((vi) => `[bv${vi}]`).join('');
+			filter += `;[${trackLabel}]split=${viewIndices.length}${splitLabels}`;
+			for (const vi of viewIndices) viewInputLabels[vi] = `bv${vi}`;
+		} else {
+			viewInputLabels[viewIndices[0]] = trackLabel;
+		}
 	}
 
 	const canvasLabel = `vcanvas`;
 	filter += `;color=black:s=${outW}x${outH}:d=999:r=${fps}[${canvasLabel}]`;
 	let prevLabel = canvasLabel;
 
-	for (let vi = 0; vi < views.length; vi++) {
-		const v = views[vi];
-		const nextLabel = vi === views.length - 1 ? outputLabel : `vw${vi}`;
+	for (let vi = 0; vi < activeViews.length; vi++) {
+		const v = activeViews[vi];
+		const nextLabel = vi === activeViews.length - 1 ? outputLabel : `vw${vi}`;
 		const T0 = (trimStart + v.localStart).toFixed(3);
 		// Pad T1 by one frame to prevent the last output frame (after -ss seek
 		// misalignment) from falling outside the enable window and showing the

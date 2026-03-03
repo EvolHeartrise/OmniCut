@@ -23,8 +23,6 @@ export interface ResolvedClip {
 	effectiveStart: number;
 	effectiveEnd: number;
 	dur: number;
-	clipDur: number; // dur / speed
-	speed: number;
 	localStart: number;
 	localEnd: number;
 	playlistPath: string;
@@ -55,7 +53,6 @@ export function resolveClip(
 	const trimEndOffset = entry?.trimEnd ?? 0;
 	const effectiveStart = clip.startTime + trimStartOffset;
 	const effectiveEnd = clip.endTime - trimEndOffset;
-	const speed = entry?.speed ?? 1;
 
 	if (effectiveEnd <= effectiveStart) {
 		console.warn(`[${tag}] Skipping clip ${index + 1}/${total} — trim makes duration ≤ 0`);
@@ -63,7 +60,6 @@ export function resolveClip(
 	}
 
 	const dur = effectiveEnd - effectiveStart;
-	const clipDur = dur / speed;
 
 	const anchor = stream.startedAt / 1000;
 	const localStart = effectiveStart - anchor + stream.offset;
@@ -76,41 +72,17 @@ export function resolveClip(
 		return null;
 	}
 
-	const concatPath = path.join(tempDir, `clip_${index}.concat.txt`);
+	const concatPath = path.join(tempDir, `${tag}_clip_${index}.concat.txt`);
 	fs.writeFileSync(concatPath, buildConcatContent(segments));
 
 	const trimStart = Math.max(0, localStart - segments[0].startTime);
 
 	return {
 		clip, entry, stream,
-		effectiveStart, effectiveEnd, dur, clipDur, speed,
+		effectiveStart, effectiveEnd, dur,
 		localStart, localEnd, playlistPath,
 		trimStart, segments, concatPath
 	};
-}
-
-/**
- * Build the atempo filter chain for a given speed.
- * atempo only supports 0.5-2.0 range, so we chain multiple for wider ranges.
- */
-export function buildAtempoChain(speed: number): string[] {
-	if (speed === 1) return [];
-	const parts: string[] = [];
-	let remaining = speed;
-	while (remaining > 2.0) { parts.push('atempo=2.0'); remaining /= 2.0; }
-	while (remaining < 0.5) { parts.push('atempo=0.5'); remaining /= 0.5; }
-	parts.push(`atempo=${remaining.toFixed(4)}`);
-	return parts;
-}
-
-/**
- * Build the audio encoding args with optional tempo filter.
- */
-export function buildAudioArgs(speed: number): string[] {
-	const atempoFilters = buildAtempoChain(speed);
-	return atempoFilters.length > 0
-		? ['-af', atempoFilters.join(','), '-c:a', 'aac', '-ar', '48000', '-b:a', '192k']
-		: ['-c:a', 'aac', '-ar', '48000', '-b:a', '192k'];
 }
 
 /**
@@ -271,15 +243,13 @@ export function resolveAudioOverlays(
  *
  * @param audioOverlays Resolved audio overlays for this clip
  * @param nextInputIdx The next available ffmpeg input index (after video overlays)
- * @param speed Playback speed multiplier
- * @param clipDur Duration of the clip in real time (after speed)
+ * @param clipDur Duration of the clip (seconds)
  * @param trimStart Output -ss seek offset (seconds) — added to adelay so overlay audio
  *                  isn't clipped by the output seek that discards pre-clip content
  */
 export function buildAudioMixFilter(
 	audioOverlays: ResolvedAudioOverlay[],
 	nextInputIdx: number,
-	speed: number,
 	clipDur: number,
 	trimStart = 0
 ): { extraInputs: string[]; audioFilterGraph: string; audioOutLabel: string; totalAudioInputs: number } {
@@ -291,13 +261,8 @@ export function buildAudioMixFilter(
 	const filters: string[] = [];
 	const mixLabels: string[] = [];
 
-	// Source audio with speed adjustment
-	const atempoChain = buildAtempoChain(speed);
-	if (atempoChain.length > 0) {
-		filters.push(`[0:a]${atempoChain.join(',')}[asrc]`);
-	} else {
-		filters.push(`[0:a]anull[asrc]`);
-	}
+	// Source audio with PTS reset to match video PTS so A/V stays in sync.
+	filters.push(`[0:a]asetpts=PTS-STARTPTS[asrc]`);
 	mixLabels.push('[asrc]');
 
 	for (let i = 0; i < audioOverlays.length; i++) {
@@ -312,14 +277,13 @@ export function buildAudioMixFilter(
 		);
 
 		const label = `aov${i}`;
-		// Apply volume, atempo for speed, and delay to align with clip position.
+		// Apply volume and delay to align with clip position.
 		// trimStart compensates for the output -ss seek that discards the pre-clip
 		// portion of the filter graph — without it the overlay audio starts early.
-		const delayMs = Math.round((trimStart + ao.clipOffset / speed) * 1000);
+		const delayMs = Math.round((trimStart + ao.clipOffset) * 1000);
 		const volFilter = `volume=${ao.volume.toFixed(3)}`;
-		const atempoFilter = atempoChain.length > 0 ? `,${atempoChain.join(',')}` : '';
 		const delayFilter = delayMs > 0 ? `,adelay=${delayMs}|${delayMs}` : '';
-		filters.push(`[${inputIdx}:a]${volFilter}${atempoFilter}${delayFilter}[${label}]`);
+		filters.push(`[${inputIdx}:a]${volFilter}${delayFilter}[${label}]`);
 		mixLabels.push(`[${label}]`);
 	}
 

@@ -11,8 +11,7 @@
 		youtubeUploads,
 		youtubeUploadCmd,
 		youtubeDeleteUploadCmd,
-		listExports,
-		getThumbnailByVideo
+		listExports
 	} from '$lib/streams.remote';
 
 	// --- Types ---
@@ -82,10 +81,6 @@
 	let categoryId = $state('');
 	let playlistId = $state('');
 	let uploading = $state(false);
-
-	// Thumbnail state
-	let thumbnailId = $state<string | null>(null);
-	let thumbnailUrl = $state<string | null>(null);
 
 	// Auth popup listener
 	let messageHandler: ((e: MessageEvent) => void) | null = null;
@@ -181,17 +176,6 @@
 		if (exp) {
 			title = exp.title;
 			description = exp.description ?? '';
-		}
-		// Fetch thumbnail for the video
-		thumbnailId = null;
-		thumbnailUrl = null;
-		if (exp?.videoId) {
-			getThumbnailByVideo({ videoId: exp.videoId }).then((data) => {
-				if (data.thumbnail) {
-					thumbnailId = data.thumbnail.id;
-					thumbnailUrl = `/api/thumbnail/${data.thumbnail.id}`;
-				}
-			}).catch(() => {});
 		}
 	}
 
@@ -430,19 +414,6 @@ YOUTUBE_REDIRECT_URI=http://localhost:5173/api/youtube/callback</pre>
 							</label>
 						{/if}
 					</div>
-
-					{#if thumbnailUrl}
-						<div class="thumbnail-preview">
-							<span class="thumbnail-label">Thumbnail</span>
-							<img class="thumbnail-img" src={thumbnailUrl} alt="Thumbnail" />
-							<span class="thumbnail-hint">Will be auto-set after upload</span>
-						</div>
-					{:else if selectedExport?.videoId}
-						<div class="thumbnail-preview">
-							<span class="thumbnail-label">Thumbnail</span>
-							<a class="thumbnail-link" href="/thumbnail?video={selectedExport.videoId}">Create a thumbnail</a>
-						</div>
-					{/if}
 
 					<button
 						class="btn-upload"
@@ -774,47 +745,6 @@ YOUTUBE_REDIRECT_URI=http://localhost:5173/api/youtube/callback</pre>
 	.btn-upload:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
-	}
-
-	/* Thumbnail preview */
-	.thumbnail-preview {
-		margin-top: 12px;
-		padding: 12px;
-		background: #0f0f23;
-		border: 1px solid #2a2a4a;
-		border-radius: 6px;
-		display: flex;
-		flex-direction: column;
-		gap: 8px;
-	}
-
-	.thumbnail-label {
-		font-size: 0.7rem;
-		color: #888;
-		font-weight: 500;
-	}
-
-	.thumbnail-img {
-		width: 100%;
-		max-width: 320px;
-		border-radius: 4px;
-		border: 1px solid #2a2a4a;
-	}
-
-	.thumbnail-hint {
-		font-size: 0.65rem;
-		color: #4ade80;
-	}
-
-	.thumbnail-link {
-		font-size: 0.75rem;
-		color: #7c3aed;
-		text-decoration: none;
-	}
-
-	.thumbnail-link:hover {
-		text-decoration: underline;
-		color: #a78bfa;
 	}
 
 	/* Upload history */

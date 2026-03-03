@@ -328,38 +328,6 @@ export async function uploadVideo(
 	}
 }
 
-/**
- * Set a custom thumbnail for a YouTube video.
- * Uses the YouTube Data API v3 thumbnails.set endpoint.
- */
-export async function setThumbnail(
-	accountId: string,
-	videoId: string,
-	thumbnailPath: string
-): Promise<void> {
-	const accessToken = await getAccessToken(accountId);
-	const imageData = fs.readFileSync(thumbnailPath);
-
-	const url = new URL('https://www.googleapis.com/upload/youtube/v3/thumbnails/set');
-	url.searchParams.set('videoId', videoId);
-	url.searchParams.set('uploadType', 'media');
-
-	const res = await fetch(url.toString(), {
-		method: 'POST',
-		headers: {
-			Authorization: `Bearer ${accessToken}`,
-			'Content-Type': 'image/png',
-			'Content-Length': String(imageData.length)
-		},
-		body: imageData
-	});
-
-	if (!res.ok) {
-		const errText = await res.text();
-		throw new Error(`Failed to set thumbnail (${res.status}): ${errText}`);
-	}
-}
-
 /** Add a video to a playlist. */
 export async function addToPlaylist(
 	accountId: string,

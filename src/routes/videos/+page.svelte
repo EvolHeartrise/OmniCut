@@ -34,7 +34,6 @@
 			let dur = clip.endTime - clip.startTime;
 			if (entry.trimStart) dur -= entry.trimStart;
 			if (entry.trimEnd) dur -= entry.trimEnd;
-			if (entry.speed && entry.speed > 0) dur /= entry.speed;
 			total += Math.max(0, dur);
 		}
 		return total;
@@ -121,7 +120,6 @@
 								>
 									{exportingId === video.id ? 'Queueing...' : 'Export'}
 								</button>
-								<a class="btn-thumbnail" href="/thumbnail?video={video.id}">Thumbnail</a>
 								<button
 									class="btn-delete"
 									class:confirming={deleteConfirmId === video.id}
@@ -298,22 +296,6 @@
 	.btn-export:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
-	}
-
-	.btn-thumbnail {
-		background: rgba(59, 130, 246, 0.15);
-		border: 1px solid rgba(59, 130, 246, 0.3);
-		color: #93c5fd;
-		font-size: 0.65rem;
-		padding: 2px 8px;
-		border-radius: 3px;
-		cursor: pointer;
-		text-decoration: none;
-	}
-
-	.btn-thumbnail:hover {
-		background: rgba(59, 130, 246, 0.25);
-		color: #bfdbfe;
 	}
 
 	.btn-delete {

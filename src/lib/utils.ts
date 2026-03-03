@@ -41,12 +41,12 @@ export function formatBytes(bytes: number): string {
 }
 
 /**
- * Normalize a channel input — strips common Twitch/Douyu URL prefixes,
+ * Normalize a channel input — strips Twitch URL prefix,
  * trailing path segments, and lowercases the result.
  */
 export function normalizeChannel(input: string): string {
 	return input
-		.replace(/^https?:\/\/(www\.)?(twitch\.tv|douyu\.com)\//, '')
+		.replace(/^https?:\/\/(www\.)?twitch\.tv\//, '')
 		.replace(/\/.*$/, '')
 		.trim()
 		.toLowerCase();
