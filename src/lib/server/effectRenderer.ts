@@ -11,8 +11,9 @@ import { createCanvas, type SKRSContext2D } from '@napi-rs/canvas';
 import type { ChatMessage } from './types.js';
 import { loadChatMessageByTwitchId } from './db/index.js';
 import { getStream } from './streamManager.js';
-import { parseEmotes, getThirdPartyEmotes, type EmoteMap } from '../emoteParser.js';
-import { fetchTwitchBadges, resolveBadges, type BadgeMap } from '../badgeParser.js';
+import { parseEmotes } from '../emoteParser.js';
+import { resolveBadges } from '../badgeParser.js';
+import { getChannelData } from './channelDataCache.js';
 import {
 	prepareMessages,
 	prefetchImages,
@@ -31,9 +32,6 @@ import { shadowPadding } from './exporterCommon.js';
 const DEFAULT_MAX_WIDTH = 400;
 const BG_COLOR = 'rgba(24, 24, 27, 0.8)'; // #18181b at 80% opacity
 const BORDER_RADIUS = 6;
-
-// Channel data cache (reused across effects within the same export)
-const channelCache = new Map<string, { emotes: EmoteMap; badges: BadgeMap }>();
 
 /**
  * Render a single chat message effect as a PNG file.
@@ -63,15 +61,7 @@ export async function renderEffectOverlay(opts: {
 	}
 
 	// Fetch emotes/badges (cached across calls)
-	let channelData = channelCache.get(channel);
-	if (!channelData) {
-		const [emotes, badges] = await Promise.all([
-			getThirdPartyEmotes(channel),
-			fetchTwitchBadges(channel)
-		]);
-		channelData = { emotes, badges };
-		channelCache.set(channel, channelData);
-	}
+	const channelData = await getChannelData(channel);
 
 	// Collect image URLs for badges + emotes
 	const imageUrls = new Set<string>();
@@ -182,10 +172,6 @@ export async function renderEffectOverlay(opts: {
 	return { pngPath: outputPath, width: canvasWidth, height: canvasHeight };
 }
 
-/** Clear the channel data cache (call between exports if needed). */
-export function clearEffectRendererCache(): void {
-	channelCache.clear();
-}
 
 function drawRoundedRect(
 	ctx: SKRSContext2D,

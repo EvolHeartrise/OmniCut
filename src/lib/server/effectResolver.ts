@@ -10,17 +10,7 @@ import { renderEffectOverlay } from './effectRenderer.js';
 import { prepareChatEffect } from './chatEffectRenderer.js';
 import { renderSubtitleOverlay } from './subtitleRenderer.js';
 import { renderImageOverlay } from './imageRenderer.js';
-
-export function shadowPadding(shadow?: ShadowConfig): { top: number; right: number; bottom: number; left: number } {
-	if (!shadow) return { top: 0, right: 0, bottom: 0, left: 0 };
-	const b = shadow.blur;
-	return {
-		top:    Math.max(0, b - shadow.offsetY),
-		bottom: Math.max(0, b + shadow.offsetY),
-		left:   Math.max(0, b - shadow.offsetX),
-		right:  Math.max(0, b + shadow.offsetX),
-	};
-}
+import { shadowPadding } from './exporterCommon.js';
 
 /**
  * Find effects that overlap a clip's composition time window,

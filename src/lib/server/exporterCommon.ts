@@ -41,7 +41,6 @@ export function resolveClip(
 	stream: StreamLookup | undefined,
 	index: number,
 	total: number,
-	_tempDir: string,
 	tag: string
 ): ResolvedClip | null {
 	if (!stream) {
@@ -297,7 +296,7 @@ export function resolveExtraTrackInputs(
 	for (const otc of overlapping) {
 		const resolved = resolveClip(
 			otc.clip, otc.entry, streamMap.get(otc.clip.streamId),
-			clipIdx, 1, tempDir, `${tag}-track${otc.track}`
+			clipIdx, 1, `${tag}-track${otc.track}`
 		);
 		if (!resolved) continue;
 

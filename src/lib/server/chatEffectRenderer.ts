@@ -6,11 +6,11 @@
  * Frame rendering adapted from chatOverlayExporter.ts renderFrame().
  */
 
-import * as fs from 'node:fs';
 import { createCanvas, type SKRSContext2D } from '@napi-rs/canvas';
 import { loadChatMessagesInRange, loadAllCensorTerms } from './db/index.js';
-import { parseEmotes, getThirdPartyEmotes, type EmoteMap } from '../emoteParser.js';
-import { fetchTwitchBadges, resolveBadges, type BadgeMap } from '../badgeParser.js';
+import { parseEmotes } from '../emoteParser.js';
+import { resolveBadges } from '../badgeParser.js';
+import { getChannelData } from './channelDataCache.js';
 import {
 	prefetchImages, prepareMessages, getAnimFrame, buildChatFonts,
 	CHAT_TEXT_COLOR,
@@ -157,14 +157,6 @@ function renderFrame(
 	}
 }
 
-// Channel data cache (reused across calls within the same export)
-const channelDataCache = new Map<string, { emotes: EmoteMap; badges: BadgeMap }>();
-
-/** Clear the channel data cache (call between exports). */
-export function clearChatEffectCache(): void {
-	channelDataCache.clear();
-}
-
 // ---------------------------------------------------------------------------
 // Two-phase pipeline: prepare (load data + layout) then render (write frames)
 // ---------------------------------------------------------------------------
@@ -226,15 +218,7 @@ export async function prepareChatEffect(opts: {
 	jitterTimestamps(chatMessages);
 
 	// 2. Fetch emotes + badges (cached)
-	let channelData = channelDataCache.get(channel);
-	if (!channelData) {
-		const [emotes, badges] = await Promise.all([
-			getThirdPartyEmotes(channel),
-			fetchTwitchBadges(channel)
-		]);
-		channelData = { emotes, badges };
-		channelDataCache.set(channel, channelData);
-	}
+	const channelData = await getChannelData(channel);
 
 	// 3. Collect image URLs and prefetch
 	const imageUrls = new Set<string>();
@@ -340,48 +324,4 @@ export async function prepareChatEffect(opts: {
 	};
 }
 
-// ---------------------------------------------------------------------------
-// File-based wrapper (backward compat + fallback for multiple raw effects)
-// ---------------------------------------------------------------------------
-
-/**
- * Render a scrolling Twitch chat panel as raw RGBA frames written to a file.
- * This is a convenience wrapper around prepareChatEffect() that writes to disk.
- * Used as a fallback when piping to FFmpeg stdin is not possible.
- */
-export async function renderChatEffectVideo(opts: {
-	streamId: string;
-	channel: string;
-	localStart: number;
-	localEnd: number;
-	outputPath: string;
-	panelWidth?: number;
-	panelHeight?: number;
-	chatOffset?: number;
-	fontWeight?: number;
-	chatScale?: number;
-	shadow?: ShadowConfig;
-}): Promise<{ videoPath: string; width: number; height: number; raw: true; fps: number }> {
-	const prepared = await prepareChatEffect(opts);
-	const rawPath = opts.outputPath.replace(/\.\w+$/, '.rgba');
-
-	console.log(`[chat-fx] Writing ${prepared.width}x${prepared.height} to file: ${rawPath}`);
-	const fd = fs.openSync(rawPath, 'w');
-
-	try {
-		await prepared.renderFrames({
-			write(buf: Buffer) { fs.writeSync(fd, buf); },
-			async flush() { /* no-op for sync file writes */ }
-		});
-	} finally {
-		fs.closeSync(fd);
-	}
-
-	const totalFrameCount = Math.ceil((opts.localEnd - opts.localStart) * FPS) + FPS; // matches totalFrames in prepareChatEffect
-	const expectedSize = totalFrameCount * prepared.width * prepared.height * 4;
-	const actualSize = fs.statSync(rawPath).size;
-	console.log(`[chat-fx]   raw file ${actualSize} bytes (expected ${expectedSize}, ${actualSize === expectedSize ? 'OK' : 'MISMATCH!'})`);
-
-	return { videoPath: rawPath, width: prepared.width, height: prepared.height, raw: true as const, fps: prepared.fps };
-}
 

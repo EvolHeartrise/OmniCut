@@ -5,8 +5,7 @@
  */
 
 import type { ClipRegion, CameraBoundsEntry, ClipEntry, EffectEntry } from '../types.js';
-import { clearEffectRendererCache } from './effectRenderer.js';
-import { clearChatEffectCache } from './chatEffectRenderer.js';
+import { clearChannelDataCache } from './channelDataCache.js';
 import {
 	resolveClip, buildOutputPath, createTempDir, cleanupTempDir,
 	concatClipFiles, resolveAudioOverlays, detectNvenc,
@@ -60,7 +59,7 @@ export async function exportVerticalVideo(
 			const { clip, cam, entry } = verticalClips[i];
 			const resolved = resolveClip(
 				clip, entry, streamMap.get(clip.streamId),
-				i, verticalClips.length, tempDir, 'vertical-export'
+				i, verticalClips.length, 'vertical-export'
 			);
 			if (!resolved) continue;
 
@@ -128,8 +127,7 @@ export async function exportVerticalVideo(
 			verticalFiles.push(outFile);
 		}
 
-		clearEffectRendererCache();
-		clearChatEffectCache();
+		clearChannelDataCache();
 
 		if (verticalFiles.length === 0) {
 			throw new Error('All clips failed to encode — nothing to export');
