@@ -19,14 +19,12 @@ export function registerVideoTools(server: ToolRegistrar): void {
 		{
 			clipIds: z.array(z.string()).min(1).describe('Ordered clip IDs for the video'),
 			title: z.string().describe('Video title'),
-			description: z.string().optional(),
-			format: z.enum(['standard', 'mobile_short']).optional().default('standard')
-				.describe('"standard" (16:9) or "mobile_short" (9:16)')
+			description: z.string().optional()
 		},
-		async ({ clipIds, title, description, format }) => {
+		async ({ clipIds, title, description }) => {
 			try {
 				const clipEntries = clipIds.map((clipId) => ({ clipId }));
-				const video = createVideo({ title, description, clipEntries, format });
+				const video = createVideo({ title, description, clipEntries });
 				return jsonResult({ success: true, video, message: `Video "${title}" created with ${clipIds.length} clip(s).` });
 			} catch (err) {
 				return textResult(`Failed to create video: ${err instanceof Error ? err.message : String(err)}`, true);
@@ -58,16 +56,14 @@ export function registerVideoTools(server: ToolRegistrar): void {
 			id: z.string(),
 			title: z.string().optional(),
 			description: z.string().optional(),
-			clipIds: z.array(z.string()).optional().describe('New ordered clip IDs (replaces all entries)'),
-			format: z.enum(['standard', 'mobile_short']).optional()
+			clipIds: z.array(z.string()).optional().describe('New ordered clip IDs (replaces all entries)')
 		},
-		async ({ id, title, description, clipIds, format }) => {
+		async ({ id, title, description, clipIds }) => {
 			try {
 				const updates: Parameters<typeof updateVideo>[1] = {};
 				if (title !== undefined) updates.title = title;
 				if (description !== undefined) updates.description = description;
 				if (clipIds !== undefined) updates.clipEntries = clipIds.map((clipId) => ({ clipId }));
-				if (format !== undefined) updates.format = format;
 				const video = updateVideo(id, updates);
 				return jsonResult({ success: true, video });
 			} catch (err) {

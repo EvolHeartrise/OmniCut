@@ -77,14 +77,12 @@
 
 	// --- Video & Export creation ---
 	let exportTitle = $state('');
-	let exportFormat = $state<'standard' | 'mobile_short'>('standard');
 	let exporting = $state(false);
 	let creatingVideo = $state(false);
 	let exportResult = $state<{ success: boolean; message: string } | null>(null);
 
-	// Count selected clips missing cam regions (relevant for mobile_short)
+	// Count selected clips missing cam regions
 	let missingCamCount = $derived.by(() => {
-		if (exportFormat !== 'mobile_short') return 0;
 		let count = 0;
 		for (const clip of filteredClips) {
 			if (selectedIds.has(clip.id) && !resolveClipCamBounds(clip)) count++;
@@ -246,7 +244,7 @@
 		creatingVideo = true;
 		exportResult = null;
 		try {
-			const video = await createVideoCmd({ clipIds: selectedClipIds, title, format: exportFormat });
+			const video = await createVideoCmd({ clipIds: selectedClipIds, title });
 			goto(`/videos/${video.id}`);
 		} catch (err) {
 			exportResult = { success: false, message: err instanceof Error ? err.message : 'Failed to create video' };
@@ -263,7 +261,7 @@
 		exporting = true;
 		exportResult = null;
 		try {
-			const data = await exportSelectedClipsCmd({ clipIds: selectedClipIds, title, format: exportFormat });
+			const data = await exportSelectedClipsCmd({ clipIds: selectedClipIds, title });
 			exportResult = { success: true, message: `Export "${title}" queued (ID: ${data.exportId})` };
 			exportTitle = '';
 		} catch (err) {
@@ -344,10 +342,6 @@
 								if (e.key === 'Enter') createVideo();
 							}}
 						/>
-						<select class="format-select" bind:value={exportFormat}>
-							<option value="standard">Standard (16:9)</option>
-							<option value="mobile_short">Mobile Short (9:16)</option>
-						</select>
 						<button class="btn-create-video" onclick={createVideo} disabled={creatingVideo || selectedIds.size === 0}>
 							{creatingVideo ? 'Creating...' : `Create Video`}
 						</button>
@@ -599,20 +593,6 @@
 	}
 
 	.export-title-input:focus {
-		border-color: #7c3aed;
-	}
-
-	.format-select {
-		background: #1a1a2e;
-		border: 1px solid #2a2a4a;
-		color: #e0e0ff;
-		font-size: 0.75rem;
-		padding: 4px 8px;
-		border-radius: 4px;
-		outline: none;
-	}
-
-	.format-select:focus {
 		border-color: #7c3aed;
 	}
 

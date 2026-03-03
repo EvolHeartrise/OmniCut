@@ -43,7 +43,6 @@
 	// Local editable state (initialized from video, auto-saved on change)
 	let title = $state('');
 	let description = $state('');
-	let format = $state<'standard' | 'mobile_short'>('standard');
 	let entries = $state<ClipEntry[]>([]);
 	let loaded = $state(false);
 
@@ -96,16 +95,6 @@
 	const VERT_OUT_H = 1920;
 	const VERT_CANVAS_W = 540; // half-res for perf, CSS-scaled
 	const VERT_CANVAS_H = 960;
-	const STD_CANVAS_W = 960;
-	const STD_CANVAS_H = 540;
-
-	// Detect whether any view effect uses a non-zero source track
-	let hasMultiTrackViews = $derived(
-		effectEntries.some((e) => e.type === 'view' && (e.viewSourceTrack ?? 0) !== 0)
-	);
-	// Need canvas compositing for standard format when multi-track views exist
-	let needsStdCanvas = $derived(format === 'standard' && hasMultiTrackViews);
-	let stdCanvasEl = $state<HTMLCanvasElement | null>(null);
 	let verticalCanvasEl = $state<HTMLCanvasElement | null>(null);
 	let verticalRafId: number | null = null;
 	let currentCamBounds = $state<CameraBoundsEntry | null>(null);
@@ -118,7 +107,6 @@
 		if (video && !initialized) {
 			title = video.title;
 			description = video.description || '';
-			format = video.format;
 			entries = structuredClone(video.clipEntries);
 			effectEntries = structuredClone(video.effectEntries ?? []);
 			initialized = true;
@@ -165,8 +153,7 @@
 				title: title.trim() || 'Untitled',
 				description: description.trim() || undefined,
 				clipEntries: entries,
-				effectEntries,
-				format
+				effectEntries
 			});
 			lastSavedAt = Date.now();
 		} catch (err) {
@@ -180,7 +167,6 @@
 	$effect(() => {
 		void title;
 		void description;
-		void format;
 		void JSON.stringify(entries);
 		void JSON.stringify(effectEntries);
 		if (initialized) scheduleSave();
@@ -941,34 +927,9 @@
 		if (!container) return;
 		const rect = container.getBoundingClientRect();
 
-		if (format === 'mobile_short') {
-			// Virtual 9:16 AR for vertical preview
-			const vw = 1080;
-			const vh = 1920;
-			const containerAR = rect.width / rect.height;
-			const videoAR = vw / vh;
-			let renderW: number, renderH: number, renderX: number, renderY: number;
-			if (videoAR > containerAR) {
-				renderW = rect.width;
-				renderH = rect.width / videoAR;
-				renderX = 0;
-				renderY = (rect.height - renderH) / 2;
-			} else {
-				renderH = rect.height;
-				renderW = rect.height * videoAR;
-				renderX = (rect.width - renderW) / 2;
-				renderY = 0;
-			}
-			videoBounds = { left: renderX, top: renderY, width: renderW, height: renderH };
-			sourceVideoSize = { w: vw, h: vh };
-			return;
-		}
-
-		const video = previewVideoEl;
-		if (!video) return;
-		const vw = video.videoWidth;
-		const vh = video.videoHeight;
-		if (!vw || !vh) return;
+		// Virtual 9:16 AR for vertical preview
+		const vw = 1080;
+		const vh = 1920;
 		const containerAR = rect.width / rect.height;
 		const videoAR = vw / vh;
 		let renderW: number, renderH: number, renderX: number, renderY: number;
@@ -987,10 +948,8 @@
 		sourceVideoSize = { w: vw, h: vh };
 	}
 
-	// Keep video bounds updated on resize and format change
+	// Keep video bounds updated on resize
 	$effect(() => {
-		// Re-run when format changes
-		void format;
 		const container = previewPlayerAreaEl;
 		const video = previewVideoEl;
 		if (!container || !video) return;
@@ -999,7 +958,6 @@
 		const onMeta = () => updateVideoBounds();
 		video.addEventListener('loadedmetadata', onMeta);
 		video.addEventListener('resize', onMeta);
-		// Also update immediately for format switch
 		updateVideoBounds();
 		return () => {
 			ro.disconnect();
@@ -1605,7 +1563,7 @@
 	// --- Resolve camera bounds for current clip (needed by view effects with camera source) ---
 	$effect(() => {
 		const hasCameraView = effectEntries.some((e) => e.type === 'view' && e.viewSourceType === 'camera');
-		if (!hasCameraView && format !== 'mobile_short') { currentCamBounds = null; return; }
+		if (!hasCameraView) { currentCamBounds = null; return; }
 		const clip = currentClipRegion;
 		if (!clip) return;
 		const stream = streamMap.get(clip.streamId);
@@ -1630,8 +1588,7 @@
 	}
 
 	function drawViewFrame() {
-		const isVertical = format === 'mobile_short';
-		const canvas = isVertical ? verticalCanvasEl : stdCanvasEl;
+		const canvas = verticalCanvasEl;
 		const video = previewVideoEl;
 		if (!canvas || !video || !video.videoWidth || !video.videoHeight) return;
 		const ctx = canvas.getContext('2d');
@@ -1699,11 +1656,9 @@
 		verticalRafId = requestAnimationFrame(viewRenderLoop);
 	}
 
-	// Start/stop canvas render loop for vertical format or standard multi-track views
+	// Start/stop canvas render loop for vertical preview
 	$effect(() => {
-		const useVertCanvas = format === 'mobile_short' && !!verticalCanvasEl;
-		const useStdCanvas = needsStdCanvas && !!stdCanvasEl;
-		if ((!useVertCanvas && !useStdCanvas) || !previewVideoEl) {
+		if (!verticalCanvasEl || !previewVideoEl) {
 			if (verticalRafId != null) { cancelAnimationFrame(verticalRafId); verticalRafId = null; }
 			return;
 		}
@@ -2010,7 +1965,7 @@
 	</div>
 {:else}
 	<div class="editor-page main-content">
-		<div class="nle-layout" class:nle-layout-vertical={format === 'mobile_short'}>
+		<div class="nle-layout nle-layout-vertical">
 			<!-- TOP ROW: Preview + Properties -->
 			<div class="preview-panel">
 				<div class="preview-main">
@@ -2020,24 +1975,14 @@
 						bind:this={previewVideoEl}
 						ontimeupdate={handlePreviewTimeUpdate}
 						playsinline
-						class="preview-video"
-						class:preview-video-hidden={format === 'mobile_short' || needsStdCanvas}
+						class="preview-video preview-video-hidden"
 					></video>
-					{#if format === 'mobile_short'}
-						<canvas
-							bind:this={verticalCanvasEl}
-							width={VERT_CANVAS_W}
-							height={VERT_CANVAS_H}
-							class="vertical-preview-canvas"
-						></canvas>
-					{:else if needsStdCanvas}
-						<canvas
-							bind:this={stdCanvasEl}
-							width={STD_CANVAS_W}
-							height={STD_CANVAS_H}
-							class="std-preview-canvas"
-						></canvas>
-					{/if}
+					<canvas
+						bind:this={verticalCanvasEl}
+						width={VERT_CANVAS_W}
+						height={VERT_CANVAS_H}
+						class="vertical-preview-canvas"
+					></canvas>
 					<!-- Effect overlays on video — positioned to match the video's actual rendered area -->
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<div
@@ -2896,22 +2841,13 @@
 							<textarea id="v-desc" class="prop-input prop-textarea" bind:value={description} placeholder="Description..." rows="3"></textarea>
 						</div>
 						<div class="prop-field">
-							<label class="prop-label" for="v-format">Format</label>
-							<select id="v-format" class="prop-select" bind:value={format}>
-								<option value="standard">Standard (16:9)</option>
-								<option value="mobile_short">Mobile Short (9:16)</option>
-							</select>
-						</div>
-						{#if format === 'mobile_short'}
-							<div class="prop-field">
-								<label class="prop-label">Layout Presets</label>
-								<div style="display:flex;gap:4px;flex-wrap:wrap">
-									<button class="btn-tl btn-tl-sm" onclick={() => addViewEffect('top-bottom')} title="Gameplay top, camera bottom">Top/Bottom</button>
-									<button class="btn-tl btn-tl-sm" onclick={() => addViewEffect('pip')} title="Full frame + camera PiP">PiP</button>
-									<button class="btn-tl btn-tl-sm" onclick={() => addViewEffect('full')} title="Single full-frame view">Full</button>
-								</div>
+							<label class="prop-label">Layout Presets</label>
+							<div style="display:flex;gap:4px;flex-wrap:wrap">
+								<button class="btn-tl btn-tl-sm" onclick={() => addViewEffect('top-bottom')} title="Gameplay top, camera bottom">Top/Bottom</button>
+								<button class="btn-tl btn-tl-sm" onclick={() => addViewEffect('pip')} title="Full frame + camera PiP">PiP</button>
+								<button class="btn-tl btn-tl-sm" onclick={() => addViewEffect('full')} title="Single full-frame view">Full</button>
 							</div>
-						{/if}
+						</div>
 					</div>
 
 					<div class="props-section">
@@ -3357,14 +3293,6 @@
 		max-width: 100%;
 		max-height: 100%;
 		aspect-ratio: 9 / 16;
-		display: block;
-		background: #000;
-	}
-
-	.std-preview-canvas {
-		max-width: 100%;
-		max-height: 100%;
-		aspect-ratio: 16 / 9;
 		display: block;
 		background: #000;
 	}

@@ -31,7 +31,6 @@ export function createVideo(data: {
 	description?: string;
 	clipEntries: ClipEntry[];
 	effectEntries?: EffectEntry[];
-	format?: VideoRecord['format'];
 }): VideoRecord {
 	validateClipIds(data.clipEntries.map((e) => e.clipId));
 
@@ -42,7 +41,6 @@ export function createVideo(data: {
 		...(data.description && { description: data.description }),
 		clipEntries: data.clipEntries,
 		...(data.effectEntries && data.effectEntries.length > 0 && { effectEntries: data.effectEntries }),
-		format: data.format ?? 'standard',
 		createdAt: now,
 		updatedAt: now
 	};
@@ -59,7 +57,7 @@ export function createVideo(data: {
  */
 export function updateVideo(
 	id: string,
-	updates: Partial<Pick<VideoRecord, 'title' | 'description' | 'clipEntries' | 'effectEntries' | 'format'>>
+	updates: Partial<Pick<VideoRecord, 'title' | 'description' | 'clipEntries' | 'effectEntries'>>
 ): VideoRecord {
 	const existing = videosStore.get(id);
 	if (!existing) {

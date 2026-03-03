@@ -173,7 +173,7 @@ export async function initDatabase(): Promise<void> {
 			title TEXT NOT NULL,
 			description TEXT,
 			clip_entries TEXT NOT NULL,
-			format TEXT NOT NULL DEFAULT 'standard',
+			format TEXT NOT NULL DEFAULT 'mobile_short',
 			created_at INTEGER NOT NULL DEFAULT (unixepoch()),
 			updated_at INTEGER NOT NULL DEFAULT (unixepoch())
 		);
@@ -273,7 +273,7 @@ export async function initDatabase(): Promise<void> {
 				const videoId = newVideoId();
 				const clipIds = parseJsonField<string[]>(exp.clip_ids, []);
 				const clipEntries: ClipEntry[] = clipIds.map((clipId) => ({ clipId }));
-				insertVideo.run(videoId, exp.title, exp.description, JSON.stringify(clipEntries), exp.format || 'standard', exp.created_at, exp.created_at);
+				insertVideo.run(videoId, exp.title, exp.description, JSON.stringify(clipEntries), 'mobile_short', exp.created_at, exp.created_at);
 				linkExport.run(videoId, exp.id);
 			}
 			console.log(`[persistence] Migrated ${unmigrated.length} exports to videos`);

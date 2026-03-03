@@ -393,14 +393,12 @@ export const createVideoCmd = command('unchecked', async (args: {
 	clipIds: string[];
 	title: string;
 	description?: string;
-	format?: 'standard' | 'mobile_short';
 }): Promise<VideoRecord> => {
 	const clipEntries: ClipEntry[] = args.clipIds.map((clipId) => ({ clipId }));
 	return smCreateVideo({
 		title: args.title,
 		description: args.description,
-		clipEntries,
-		format: args.format
+		clipEntries
 	});
 });
 
@@ -411,14 +409,12 @@ export const updateVideoCmd = command('unchecked', async (args: {
 	description?: string;
 	clipEntries?: ClipEntry[];
 	effectEntries?: EffectEntry[];
-	format?: 'standard' | 'mobile_short';
 }): Promise<VideoRecord> => {
-	const updates: Partial<Pick<VideoRecord, 'title' | 'description' | 'clipEntries' | 'effectEntries' | 'format'>> = {};
+	const updates: Partial<Pick<VideoRecord, 'title' | 'description' | 'clipEntries' | 'effectEntries'>> = {};
 	if (args.title !== undefined) updates.title = args.title;
 	if (args.description !== undefined) updates.description = args.description;
 	if (args.clipEntries !== undefined) updates.clipEntries = args.clipEntries;
 	if (args.effectEntries !== undefined) updates.effectEntries = args.effectEntries;
-	if (args.format !== undefined) updates.format = args.format;
 	return smUpdateVideo(args.id, updates);
 });
 
@@ -595,13 +591,13 @@ export const uploadOverlayAudioCmd = command('unchecked', async (args: { data: s
 });
 
 /** Export selected clips by IDs (in order). */
-export const exportSelectedClipsCmd = command('unchecked', async (args: { clipIds: string[]; title: string; format?: 'standard' | 'mobile_short' }) => {
+export const exportSelectedClipsCmd = command('unchecked', async (args: { clipIds: string[]; title: string }) => {
 	if (!args.clipIds || args.clipIds.length === 0) {
 		throw new Error('No clips selected');
 	}
 	if (!args.title?.trim()) {
 		throw new Error('Title is required');
 	}
-	const record = createAndQueueExport(args.clipIds, args.title.trim(), undefined, args.format);
+	const record = createAndQueueExport(args.clipIds, args.title.trim());
 	return { success: true, exportId: record.id };
 });

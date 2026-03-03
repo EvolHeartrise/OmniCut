@@ -21,7 +21,6 @@ function mapVideoRow(r: VideoRow): VideoRecord {
 		...(r.description && { description: r.description }),
 		clipEntries,
 		...(effectEntries && effectEntries.length > 0 && { effectEntries }),
-		format: (r.format || 'standard') as VideoRecord['format'],
 		createdAt: r.created_at,
 		updatedAt: r.updated_at
 	};
@@ -45,7 +44,7 @@ export function saveVideo(record: VideoRecord): void {
 			record.description ?? null,
 			JSON.stringify(record.clipEntries),
 			record.effectEntries ? JSON.stringify(record.effectEntries) : null,
-			record.format,
+			'mobile_short',
 			record.createdAt,
 			record.updatedAt
 		]
@@ -54,7 +53,7 @@ export function saveVideo(record: VideoRecord): void {
 
 export function updateVideoRecord(
 	id: string,
-	updates: Partial<Pick<VideoRecord, 'title' | 'description' | 'clipEntries' | 'effectEntries' | 'format'>>
+	updates: Partial<Pick<VideoRecord, 'title' | 'description' | 'clipEntries' | 'effectEntries'>>
 ): void {
 	const d = getDb();
 	const sets: string[] = ['updated_at = unixepoch()'];
@@ -63,7 +62,6 @@ export function updateVideoRecord(
 	if (updates.description !== undefined) { sets.push('description = ?'); params.push(updates.description); }
 	if (updates.clipEntries !== undefined) { sets.push('clip_entries = ?'); params.push(JSON.stringify(updates.clipEntries)); }
 	if (updates.effectEntries !== undefined) { sets.push('effect_entries = ?'); params.push(JSON.stringify(updates.effectEntries)); }
-	if (updates.format !== undefined) { sets.push('format = ?'); params.push(updates.format); }
 	if (sets.length === 1) return; // only updated_at, nothing to do
 	params.push(id);
 	d.run(`UPDATE videos SET ${sets.join(', ')} WHERE id = ?`, params);
@@ -84,6 +82,7 @@ export function loadAllVideos(): VideoRecord[] {
 
 export function deleteVideoRecord(id: string): void {
 	const d = getDb();
+	d.run('UPDATE exports SET video_id = NULL WHERE video_id = ?', [id]);
 	d.run('DELETE FROM videos WHERE id = ?', [id]);
 }
 

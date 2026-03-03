@@ -28,7 +28,6 @@ export interface ExportRecord {
 	error?: string;
 	createdAt: number;
 	completedAt?: number;
-	format: 'standard' | 'mobile_short';
 	videoId?: string;
 }
 
@@ -47,7 +46,6 @@ function mapExportRow(r: ExportRow): ExportRecord {
 		...(r.error && { error: r.error }),
 		createdAt: r.created_at,
 		...(r.completed_at != null && { completedAt: r.completed_at }),
-		format: (r.format || 'standard') as ExportRecord['format'],
 		...(r.video_id && { videoId: r.video_id })
 	};
 }
@@ -69,7 +67,7 @@ export function saveExport(record: ExportRecord): void {
 			record.error ?? null,
 			record.createdAt,
 			record.completedAt ?? null,
-			record.format ?? 'standard',
+			'mobile_short',
 			record.videoId ?? null
 		]
 	);
@@ -112,6 +110,7 @@ export function loadAllExports(): ExportRecord[] {
 
 export function deleteExport(id: string): void {
 	const d = getDb();
+	d.run('DELETE FROM youtube_uploads WHERE export_id = ?', [id]);
 	d.run('DELETE FROM exports WHERE id = ?', [id]);
 }
 

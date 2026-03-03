@@ -156,7 +156,6 @@ export interface VideoRecord {
 	title: string;
 	description?: string;
 	clipEntries: ClipEntry[];
-	format: 'standard' | 'mobile_short';
 	effectEntries?: EffectEntry[];
 	createdAt: number;
 	updatedAt: number;

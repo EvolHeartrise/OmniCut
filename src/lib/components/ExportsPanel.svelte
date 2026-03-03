@@ -17,7 +17,6 @@
 		error?: string;
 		createdAt: number;
 		completedAt?: number;
-		format?: 'standard' | 'mobile_short';
 	}
 
 	let exports = $state<ExportRecord[]>([]);
@@ -368,7 +367,6 @@
 								{@const linkedVideo = $videos.find((v) => v.id === exp.videoId)}
 								<a class="btn-video-link" href="/videos/{exp.videoId}" title={linkedVideo?.title ?? 'Video'}>{linkedVideo?.title ?? 'Video'}</a>
 							{/if}
-							<span class="format-badge">{exp.format === 'mobile_short' ? '9:16' : '16:9'}</span>
 							<div class="export-item-actions">
 								{#if exp.clipEntries.length > 0}
 									<button
@@ -647,17 +645,6 @@
 	.btn-video-link:hover {
 		background: rgba(59, 130, 246, 0.25);
 		color: #bfdbfe;
-	}
-
-	.format-badge {
-		font-size: 0.6rem;
-		font-weight: 600;
-		padding: 1px 6px;
-		border-radius: 3px;
-		background: rgba(168, 85, 247, 0.15);
-		color: #a855f7;
-		flex-shrink: 0;
-		font-variant-numeric: tabular-nums;
 	}
 
 	.export-status {

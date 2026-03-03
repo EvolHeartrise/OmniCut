@@ -8,7 +8,6 @@ import { newExportId } from '../ids.js';
 import { getClipRegion } from './clipManager.js';
 import { validateClipIds } from './clipValidation.js';
 import { getVideo } from './videoManager.js';
-import { exportVideo } from './exporter.js';
 import type { StreamLookup, OtherTrackClip } from './exporterTypes.js';
 import { exportVerticalVideo, type VerticalClip } from './verticalExporter.js';
 import type { ClipEntry } from '../types.js';
@@ -29,7 +28,7 @@ const sq = new SequentialQueue(runExport);
  * Create and enqueue a new export. Returns the ExportRecord.
  * Validates that all clip IDs exist before creating.
  */
-export function createAndQueueExport(clipIds: string[], title: string, description?: string, format?: 'standard' | 'mobile_short'): ExportRecord {
+export function createAndQueueExport(clipIds: string[], title: string, description?: string): ExportRecord {
 	validateClipIds(clipIds);
 
 	const id = newExportId();
@@ -39,8 +38,7 @@ export function createAndQueueExport(clipIds: string[], title: string, descripti
 		...(description && { description }),
 		clipEntries: clipIds.map((clipId) => ({ clipId })),
 		status: 'pending',
-		createdAt: Math.floor(Date.now() / 1000),
-		format: format ?? 'standard'
+		createdAt: Math.floor(Date.now() / 1000)
 	};
 
 	db.saveExport(record);
@@ -68,7 +66,6 @@ export function createAndQueueExportFromVideo(videoId: string): ExportRecord {
 		...(video.effectEntries && video.effectEntries.length > 0 && { effectEntries: video.effectEntries }),
 		status: 'pending',
 		createdAt: Math.floor(Date.now() / 1000),
-		format: video.format,
 		videoId
 	};
 
@@ -230,45 +227,40 @@ async function runExport(exportId: string): Promise<void> {
 			if (stream) channelMap.set(clip.streamId, stream.channel);
 		}
 
-		let outputPath: string;
-		if (record.format === 'mobile_short') {
-			// Check if any view effects use camera source — if so, we need camera bounds
-			const needsCamera = (record.effectEntries ?? []).some(
-				(e) => e.type === 'view' && e.viewSourceType === 'camera'
-			);
+		// Check if any view effects use camera source — if so, we need camera bounds
+		const needsCamera = (record.effectEntries ?? []).some(
+			(e) => e.type === 'view' && e.viewSourceType === 'camera'
+		);
 
-			// Resolve camera bounds from channel table for each clip
-			const verticalClips: VerticalClip[] = [];
-			for (let i = 0; i < clips.length; i++) {
-				const clip = clips[i];
-				const stream = getStream(clip.streamId);
-				if (!stream) {
-					console.warn(`[export-queue] Skipping clip ${clip.id} — stream not found`);
+		// Resolve camera bounds from channel table for each clip
+		const verticalClips: VerticalClip[] = [];
+		for (let i = 0; i < clips.length; i++) {
+			const clip = clips[i];
+			const stream = getStream(clip.streamId);
+			if (!stream) {
+				console.warn(`[export-queue] Skipping clip ${clip.id} — stream not found`);
+				continue;
+			}
+			let cam: import('../types.js').CameraBoundsEntry | null = null;
+			if (needsCamera) {
+				cam = db.resolveCameraBounds(stream.channel, clip.startTime);
+				if (!cam) {
+					console.warn(`[export-queue] Skipping clip ${clip.id} — no camera bounds for ${stream.channel}`);
 					continue;
 				}
-				let cam: import('../types.js').CameraBoundsEntry | null = null;
-				if (needsCamera) {
-					cam = db.resolveCameraBounds(stream.channel, clip.startTime);
-					if (!cam) {
-						console.warn(`[export-queue] Skipping clip ${clip.id} — no camera bounds for ${stream.channel}`);
-						continue;
-					}
-				}
-				verticalClips.push({ clip, cam, entry: clipEntries[i] });
 			}
-			if (verticalClips.length === 0) {
-				throw new Error(needsCamera
-					? 'No clips have camera bounds set — cannot create vertical export'
-					: 'No valid clips for vertical export');
-			}
-			({ outputPath } = await exportVerticalVideo(verticalClips, streamMap, exportId, () => {}, record.effectEntries, compOffsets, channelMap, otherTrackClips));
-		} else {
-			({ outputPath } = await exportVideo(clips, streamMap, exportId, () => {}, clipEntries, record.effectEntries, compOffsets, channelMap, otherTrackClips));
+			verticalClips.push({ clip, cam, entry: clipEntries[i] });
 		}
+		if (verticalClips.length === 0) {
+			throw new Error(needsCamera
+				? 'No clips have camera bounds set — cannot create vertical export'
+				: 'No valid clips for vertical export');
+		}
+		const { outputPath } = await exportVerticalVideo(verticalClips, streamMap, exportId, () => {}, record.effectEntries, compOffsets, channelMap, otherTrackClips);
 
 		db.updateExportStatus(exportId, 'ready', outputPath);
 		broadcastExportStatus(exportId, 'ready', outputPath);
-		console.log(`[export-queue] Export "${record.title}" (${record.format}) complete → ${outputPath}`);
+		console.log(`[export-queue] Export "${record.title}" complete → ${outputPath}`);
 	} catch (err: unknown) {
 		const message = err instanceof Error ? err.message : String(err);
 		db.updateExportStatus(exportId, 'error', undefined, message);

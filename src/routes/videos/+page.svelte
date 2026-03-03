@@ -39,13 +39,6 @@
 		return total;
 	}
 
-	function formatLabel(format: string): string {
-		switch (format) {
-			case 'mobile_short': return '9:16';
-			default: return '16:9';
-		}
-	}
-
 	function handleDelete(id: string) {
 		if (deleteConfirmId === id) {
 			if (deleteConfirmTimer) clearTimeout(deleteConfirmTimer);
@@ -110,7 +103,6 @@
 					<div class="video-item">
 						<div class="video-item-header">
 							<a class="video-item-title" href="/videos/{video.id}">{video.title}</a>
-							<span class="format-badge">{formatLabel(video.format)}</span>
 							<div class="video-item-actions">
 								<a class="btn-edit" href="/videos/{video.id}">Edit</a>
 								<button
@@ -242,17 +234,6 @@
 
 	.video-item-title:hover {
 		color: #a78bfa;
-	}
-
-	.format-badge {
-		font-size: 0.6rem;
-		font-weight: 600;
-		padding: 1px 6px;
-		border-radius: 3px;
-		background: rgba(168, 85, 247, 0.15);
-		color: #a855f7;
-		flex-shrink: 0;
-		font-variant-numeric: tabular-nums;
 	}
 
 	.video-item-actions {
