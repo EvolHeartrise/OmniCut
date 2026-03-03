@@ -35,6 +35,18 @@ export function buildViewFilter(
 
 	// General case: canvas composition
 	let filter = '';
+
+	// When multiple views reference the same source, we must split it —
+	// FFmpeg labels can only be consumed once.
+	const viewInputLabels: string[] = [];
+	if (views.length > 1) {
+		const splitLabels = views.map((_, vi) => `[bv${vi}]`).join('');
+		filter += `;[${inputLabel}]split=${views.length}${splitLabels}`;
+		for (let vi = 0; vi < views.length; vi++) viewInputLabels.push(`bv${vi}`);
+	} else {
+		viewInputLabels.push(inputLabel);
+	}
+
 	const canvasLabel = `vcanvas`;
 	filter += `;color=black:s=${outW}x${outH}:d=999:r=${fps}[${canvasLabel}]`;
 	let prevLabel = canvasLabel;
@@ -43,14 +55,17 @@ export function buildViewFilter(
 		const v = views[vi];
 		const nextLabel = vi === views.length - 1 ? outputLabel : `vw${vi}`;
 		const T0 = (trimStart + v.localStart).toFixed(3);
-		const T1 = (trimStart + v.localEnd).toFixed(3);
+		// Pad T1 by one frame to prevent the last output frame (after -ss seek
+		// misalignment) from falling outside the enable window and showing the
+		// black canvas as a single-frame flash between concatenated clips.
+		const T1 = (trimStart + v.localEnd + 1 / fps).toFixed(3);
 
 		const destPxW = Math.round(v.destW * outW);
 		const destPxH = Math.round(v.destH * outH);
 		const slotLabel = `vslot${vi}`;
 
 		// Build crop + cover-fit scale for this view's source
-		filter += buildViewCropScale(inputLabel, slotLabel, v, trimStart, srcW, srcH, destPxW, destPxH, camBounds);
+		filter += buildViewCropScale(viewInputLabels[vi], slotLabel, v, trimStart, srcW, srcH, destPxW, destPxH, camBounds);
 
 		const ox = Math.round(v.destX * outW);
 		const oy = Math.round(v.destY * outH);

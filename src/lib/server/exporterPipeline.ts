@@ -62,7 +62,11 @@ export async function encodeClip(opts: ClipEncodeOptions): Promise<string> {
 		extraOutputArgs, audioMapFallback, logTag
 	} = opts;
 
-	const { dur, clipDur, speed, trimStart, concatPath } = resolved;
+	const { dur, clipDur, speed, trimStart: seekOffset, concatPath } = resolved;
+	// Use input seeking (-ss before -i) so the filter graph PTS starts from ~0
+	// and the output file has PTS starting from 0. This prevents edit-list
+	// misalignment that causes black frames at concat boundaries.
+	const trimStart = 0;
 	const tag = logTag ?? 'export';
 	const outFile = path.join(tempDir, `clip_${clipIdx}.mp4`);
 
@@ -74,7 +78,7 @@ export async function encodeClip(opts: ClipEncodeOptions): Promise<string> {
 
 	if (hasOverlays || hasViews) {
 		if (allEffects.length > 0) {
-			console.log(`[${tag}] Clip ${clipIdx}: ${allEffects.length} overlay(s), ${clipViews.length} views, ss=${trimStart.toFixed(3)} t=${dur.toFixed(3)} speed=${speed}`);
+			console.log(`[${tag}] Clip ${clipIdx}: ${allEffects.length} overlay(s), ${clipViews.length} views, ss=${seekOffset.toFixed(3)} t=${dur.toFixed(3)} speed=${speed}`);
 			for (const eff of allEffects) {
 				console.log(`[${tag}]   overlay: pos=(${eff.x},${eff.y}) local=[${eff.localStart.toFixed(3)},${eff.localEnd.toFixed(3)}] raw=${!!eff.rawVideo} piped=${!!eff.deferredRender}`);
 			}
@@ -151,7 +155,7 @@ export async function encodeClip(opts: ClipEncodeOptions): Promise<string> {
 			const isLast = ei === allEffects.length - 1;
 			const nextLabel = isLast ? 'outv' : `v${ei}`;
 			const enableStart = (trimStart + eff.localStart).toFixed(3);
-			const enableEnd = (trimStart + eff.localEnd).toFixed(3);
+			const enableEnd = (trimStart + eff.localEnd + 1 / fps).toFixed(3);
 			const alphaFmt = 'format=yuva420p';
 			const ox = eff.x;
 			const oy = eff.y;
@@ -238,12 +242,16 @@ export async function encodeClip(opts: ClipEncodeOptions): Promise<string> {
 	const audioArgs = buildAudioArgs(speed);
 
 	const ffmpegArgs = [
+		// Input options: seek + limit reading on the concat source.
+		// Input seeking rebases PTS to ~0, avoiding edit-list issues during concat.
 		'-fflags', '+genpts',
+		'-ss', seekOffset.toFixed(3),
+		'-t', dur.toFixed(3),
 		'-f', 'concat', '-safe', '0', '-i', concatPath,
 		...extraInputs,
-		'-ss', trimStart.toFixed(3),
-		'-t', dur.toFixed(3),
 		...videoFilterArgs,
+		// Output -t prevents the color source (d=999) from extending past the clip.
+		'-t', clipDur.toFixed(3),
 		'-fps_mode', 'cfr',
 		...(extraOutputArgs ?? []),
 		...(hasAudioMix ? ['-c:a', 'aac', '-ar', '48000', '-b:a', '192k'] : audioArgs),
