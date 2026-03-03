@@ -37,10 +37,10 @@ export function buildChatFonts(fontWeight?: number): { font: string; boldFont: s
 		boldFont: `${Math.min(900, fontWeight + 300)} 13px Inter, Arial${EMOJI_FALLBACK}, sans-serif`
 	};
 }
-export const CHAT_LINE_HEIGHT = 1.4;
+const CHAT_LINE_HEIGHT = 1.4;
 export const CHAT_TEXT_COLOR = '#efeff1';
 export const CHAT_BADGE_SIZE = 11;
-export const CHAT_BADGE_MARGIN = 3;
+const CHAT_BADGE_MARGIN = 3;
 export const CHAT_EMOTE_HEIGHT = 23; // ~1.75em at 13px
 export const CHAT_PAD_X = 12;
 export const CHAT_PAD_Y = 2;
@@ -57,7 +57,7 @@ export interface AnimatedImage {
 
 export type CachedImage = Image | AnimatedImage | null;
 
-export function isAnimated(img: CachedImage): img is AnimatedImage {
+function isAnimated(img: CachedImage): img is AnimatedImage {
 	return img !== null && 'frames' in img;
 }
 
@@ -89,7 +89,7 @@ export interface LineSegment {
 // Image prefetching (with animated frame extraction via sharp)
 // ---------------------------------------------------------------------------
 
-export async function decodeImage(buf: Buffer): Promise<CachedImage> {
+async function decodeImage(buf: Buffer): Promise<CachedImage> {
 	try {
 		// Probe with animated mode to get page count and per-frame delays
 		const meta = await sharp(buf, { animated: true, pages: -1 }).metadata();
@@ -163,7 +163,7 @@ function escapeRegex(s: string): string {
 	return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-export function applyCensoring(
+function applyCensoring(
 	segments: LineSegment[],
 	censorTerms: string[],
 	measureCtx: SKRSContext2D,

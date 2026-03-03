@@ -1,4 +1,4 @@
-import { getDb } from './persistenceBase.js';
+import { getDb, parseJsonField } from './persistenceBase.js';
 
 // --- YouTube Accounts ---
 
@@ -161,14 +161,7 @@ export interface YouTubeUploadRecord {
 }
 
 function mapYouTubeUploadRow(r: YouTubeUploadRow): YouTubeUploadRecord {
-	let tags: string[] | undefined;
-	if (r.tags) {
-		try {
-			tags = JSON.parse(r.tags);
-		} catch {
-			tags = undefined;
-		}
-	}
+	const tags = parseJsonField<string[] | undefined>(r.tags, undefined);
 	return {
 		id: r.id,
 		exportId: r.export_id,

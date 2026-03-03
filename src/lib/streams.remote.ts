@@ -51,6 +51,7 @@ import {
 	type VideoEdge
 } from '$lib/server/twitchApi.js';
 import type { ChannelInfo, VodInfo, CameraBoundsEntry, ClipEntry, EffectEntry, VideoRecord } from '$lib/types.js';
+import { OVERLAYS_DIR, AUDIO_DIR } from '$lib/server/paths.js';
 
 // ---------------------------------------------------------------------------
 // Queries — Stream & Media Data
@@ -547,7 +548,6 @@ export const uploadOverlayImageCmd = command('unchecked', async (args: { data: s
 	const path = await import('node:path');
 	const fs = await import('node:fs');
 
-	const OVERLAYS_DIR = path.resolve(process.cwd(), 'data', 'overlays');
 	if (!fs.existsSync(OVERLAYS_DIR)) fs.mkdirSync(OVERLAYS_DIR, { recursive: true });
 
 	const ext = path.extname(args.filename).toLowerCase() || '.png';
@@ -567,7 +567,6 @@ export const uploadOverlayAudioCmd = command('unchecked', async (args: { data: s
 	const path = await import('node:path');
 	const fs = await import('node:fs');
 
-	const AUDIO_DIR = path.resolve(process.cwd(), 'data', 'audio');
 	if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 
 	const ext = path.extname(args.filename).toLowerCase() || '.mp3';

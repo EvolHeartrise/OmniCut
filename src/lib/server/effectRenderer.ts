@@ -25,6 +25,7 @@ import {
 	CHAT_PAD_Y,
 } from './chatRenderer.js';
 import type { ShadowConfig } from './exporterTypes.js';
+import { shadowPadding } from './exporterCommon.js';
 
 // Default max width for effect overlays (pixels at 1920-wide resolution)
 const DEFAULT_MAX_WIDTH = 400;
@@ -160,7 +161,7 @@ export async function renderEffectOverlay(opts: {
 
 	// If shadow, two-pass: draw content canvas onto padded canvas with shadow
 	if (shadow) {
-		const sp = shadowPad(shadow);
+		const sp = shadowPadding(shadow);
 		const finalW = canvasWidth + sp.left + sp.right;
 		const finalH = canvasHeight + sp.top + sp.bottom;
 		const finalCanvas = createCanvas(finalW, finalH);
@@ -184,16 +185,6 @@ export async function renderEffectOverlay(opts: {
 /** Clear the channel data cache (call between exports if needed). */
 export function clearEffectRendererCache(): void {
 	channelCache.clear();
-}
-
-function shadowPad(shadow: ShadowConfig): { top: number; right: number; bottom: number; left: number } {
-	const b = shadow.blur;
-	return {
-		top:    Math.max(0, b - shadow.offsetY),
-		bottom: Math.max(0, b + shadow.offsetY),
-		left:   Math.max(0, b - shadow.offsetX),
-		right:  Math.max(0, b + shadow.offsetX),
-	};
 }
 
 function drawRoundedRect(

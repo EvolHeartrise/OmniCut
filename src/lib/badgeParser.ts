@@ -8,7 +8,7 @@
  * Legacy format without versions is also supported: "subscriber,vip"
  */
 
-const TWITCH_CLIENT_ID = 'ue6666qo983tsx6so1t0vnawi233wa';
+import { TWITCH_CLIENT_ID } from './constants.js';
 
 export interface BadgeInfo {
 	setID: string;

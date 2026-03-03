@@ -1,5 +1,5 @@
 import type { ClipEntry, EffectEntry, VideoRecord } from '../../types.js';
-import { getDb } from './persistenceBase.js';
+import { getDb, parseJsonField } from './persistenceBase.js';
 
 interface VideoRow {
 	id: string;
@@ -7,29 +7,14 @@ interface VideoRow {
 	description: string | null;
 	clip_entries: string;
 	effect_entries: string | null;
-	vertical_layout: string | null;
 	format: string;
 	created_at: number;
 	updated_at: number;
 }
 
 function mapVideoRow(r: VideoRow): VideoRecord {
-	let clipEntries: ClipEntry[];
-	try {
-		clipEntries = JSON.parse(r.clip_entries) as ClipEntry[];
-	} catch {
-		console.error(`[persistence] Corrupt clip_entries JSON for video ${r.id}, treating as empty`);
-		clipEntries = [];
-	}
-	let effectEntries: EffectEntry[] | undefined;
-	if (r.effect_entries) {
-		try {
-			effectEntries = JSON.parse(r.effect_entries) as EffectEntry[];
-		} catch {
-			console.error(`[persistence] Corrupt effect_entries JSON for video ${r.id}, treating as empty`);
-			effectEntries = [];
-		}
-	}
+	const clipEntries = parseJsonField<ClipEntry[]>(r.clip_entries, [], `clip_entries for video ${r.id}`);
+	const effectEntries = parseJsonField<EffectEntry[] | undefined>(r.effect_entries, undefined, `effect_entries for video ${r.id}`);
 	return {
 		id: r.id,
 		title: r.title,
@@ -45,14 +30,13 @@ function mapVideoRow(r: VideoRow): VideoRecord {
 export function saveVideo(record: VideoRecord): void {
 	const d = getDb();
 	d.run(
-		`INSERT INTO videos (id, title, description, clip_entries, effect_entries, vertical_layout, format, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO videos (id, title, description, clip_entries, effect_entries, format, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			title = excluded.title,
 			description = excluded.description,
 			clip_entries = excluded.clip_entries,
 			effect_entries = excluded.effect_entries,
-			vertical_layout = excluded.vertical_layout,
 			format = excluded.format,
 			updated_at = excluded.updated_at`,
 		[
@@ -61,7 +45,6 @@ export function saveVideo(record: VideoRecord): void {
 			record.description ?? null,
 			JSON.stringify(record.clipEntries),
 			record.effectEntries ? JSON.stringify(record.effectEntries) : null,
-			null,
 			record.format,
 			record.createdAt,
 			record.updatedAt

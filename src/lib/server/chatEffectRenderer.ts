@@ -18,6 +18,7 @@ import {
 	type PreparedMessage
 } from './chatRenderer.js';
 import type { ShadowConfig } from './exporterTypes.js';
+import { shadowPadding } from './exporterCommon.js';
 
 const MAX_VISIBLE = 200;
 const FPS = 30;
@@ -266,7 +267,9 @@ export async function prepareChatEffect(opts: {
 	// 5. Compute pixel dimensions
 	const pixelW = Math.round(panelWidth * chatScale) & ~1;
 	const pixelH = Math.round(panelHeight * chatScale) & ~1;
-	const sp = shadow ? shadowPad(shadow, chatScale) : { top: 0, right: 0, bottom: 0, left: 0 };
+	const sp = shadow
+		? shadowPadding({ ...shadow, blur: Math.round(shadow.blur * chatScale), offsetX: Math.round(shadow.offsetX * chatScale), offsetY: Math.round(shadow.offsetY * chatScale) })
+		: { top: 0, right: 0, bottom: 0, left: 0 };
 	const outW = (pixelW + sp.left + sp.right) & ~1;
 	const outH = (pixelH + sp.top + sp.bottom) & ~1;
 	const totalFrames = Math.ceil(targetDur * FPS) + SAFETY_FRAMES;
@@ -382,14 +385,3 @@ export async function renderChatEffectVideo(opts: {
 	return { videoPath: rawPath, width: prepared.width, height: prepared.height, raw: true as const, fps: prepared.fps };
 }
 
-function shadowPad(shadow: ShadowConfig, scale: number): { top: number; right: number; bottom: number; left: number } {
-	const b = Math.round(shadow.blur * scale);
-	const ox = Math.round(shadow.offsetX * scale);
-	const oy = Math.round(shadow.offsetY * scale);
-	return {
-		top:    Math.max(0, b - oy),
-		bottom: Math.max(0, b + oy),
-		left:   Math.max(0, b - ox),
-		right:  Math.max(0, b + ox),
-	};
-}

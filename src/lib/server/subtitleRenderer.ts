@@ -6,6 +6,7 @@
 import * as fs from 'node:fs';
 import { createCanvas, type SKRSContext2D } from '@napi-rs/canvas';
 import type { ShadowConfig } from './exporterTypes.js';
+import { shadowPadding } from './exporterCommon.js';
 
 const DEFAULT_FONT_SIZE = 48;
 const DEFAULT_FONT_COLOR = '#FFFFFF';
@@ -104,7 +105,7 @@ export async function renderSubtitleOverlay(opts: {
 
 	// If shadow, use two-pass: draw content canvas onto padded canvas with shadow
 	if (shadow) {
-		const sp = shadowPad(shadow);
+		const sp = shadowPadding(shadow);
 		const finalW = canvasWidth + sp.left + sp.right;
 		const finalH = canvasHeight + sp.top + sp.bottom;
 		const finalCanvas = createCanvas(finalW, finalH);
@@ -123,16 +124,6 @@ export async function renderSubtitleOverlay(opts: {
 	fs.writeFileSync(outputPath, pngBuffer);
 
 	return { pngPath: outputPath, width: canvasWidth, height: canvasHeight };
-}
-
-function shadowPad(shadow: ShadowConfig): { top: number; right: number; bottom: number; left: number } {
-	const b = shadow.blur;
-	return {
-		top:    Math.max(0, b - shadow.offsetY),
-		bottom: Math.max(0, b + shadow.offsetY),
-		left:   Math.max(0, b - shadow.offsetX),
-		right:  Math.max(0, b + shadow.offsetX),
-	};
 }
 
 /** Word-wrap text to fit within maxWidth pixels. */

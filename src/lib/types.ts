@@ -139,9 +139,6 @@ export type EasingFunction =
 	| 'ease-in-out'
 	| 'bounce';
 
-/** @deprecated Use OverlayAnimation instead. */
-export type SubtitleAnimation = OverlayAnimation;
-
 /** Per-clip entry in a video composition. */
 export interface ClipEntry {
 	clipId: string;

@@ -45,8 +45,7 @@ import {
 	loadAllExports
 } from './exportQueue.js';
 import { restoreUploadQueue, shutdownUploadQueue } from './youtubeUploadQueue.js';
-
-const RECORDINGS_DIR = path.resolve(process.env.RECORDINGS_DIR || path.join(process.cwd(), 'recordings'));
+import { RECORDINGS_DIR } from './paths.js';
 
 // ---------------------------------------------------------------------------
 // Shared callback builder for capture status changes.

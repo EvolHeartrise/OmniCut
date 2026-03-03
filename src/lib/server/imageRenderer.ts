@@ -6,6 +6,8 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import type { ShadowConfig } from './exporterTypes.js';
+import { shadowPadding } from './exporterCommon.js';
+import { OVERLAYS_DIR } from './paths.js';
 
 /**
  * Render an image overlay to a PNG file with optional scale, opacity, and shadow.
@@ -21,8 +23,7 @@ export async function renderImageOverlay(opts: {
 	naturalHeight?: number;
 	shadow?: ShadowConfig;
 }): Promise<{ pngPath: string; width: number; height: number; padLeft: number; padTop: number } | null> {
-	const imgDir = path.resolve(process.cwd(), 'data', 'overlays');
-	const imgFilePath = path.join(imgDir, opts.imageId);
+	const imgFilePath = path.join(OVERLAYS_DIR, opts.imageId);
 	if (!fs.existsSync(imgFilePath)) {
 		console.warn(`[exporter] Image overlay file not found: ${imgFilePath}`);
 		return null;
@@ -63,13 +64,3 @@ export async function renderImageOverlay(opts: {
 	return { pngPath: opts.outputPath, width: scaledW, height: scaledH, padLeft: 0, padTop: 0 };
 }
 
-function shadowPadding(shadow?: ShadowConfig): { top: number; right: number; bottom: number; left: number } {
-	if (!shadow) return { top: 0, right: 0, bottom: 0, left: 0 };
-	const b = shadow.blur;
-	return {
-		top:    Math.max(0, b - shadow.offsetY),
-		bottom: Math.max(0, b + shadow.offsetY),
-		left:   Math.max(0, b - shadow.offsetX),
-		right:  Math.max(0, b + shadow.offsetX),
-	};
-}

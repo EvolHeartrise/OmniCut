@@ -215,9 +215,6 @@ const sevenTV = createCachedProvider({
 	}
 });
 
-export const fetchSevenTVGlobalEmotes = () => sevenTV.fetchGlobal();
-export const fetchSevenTVChannelEmotes = (id: string) => sevenTV.fetchChannel(id);
-
 // ---------------------------------------------------------------------------
 // BTTV
 // ---------------------------------------------------------------------------
@@ -300,7 +297,8 @@ const ffz = createCachedProvider({
 // Uses the same public GQL client ID as the rest of the app.
 // ---------------------------------------------------------------------------
 
-const TWITCH_CLIENT_ID = 'ue6666qo983tsx6so1t0vnawi233wa';
+import { TWITCH_CLIENT_ID } from './constants.js';
+
 const userIdCache = new Map<string, string | null>();
 
 async function resolveTwitchUserId(login: string): Promise<string | null> {
@@ -358,6 +356,3 @@ export async function getThirdPartyEmotes(channelLogin: string | null): Promise<
 	}
 	return merged;
 }
-
-/** @deprecated Use getThirdPartyEmotes instead. */
-export const getSevenTVEmotes = getThirdPartyEmotes;

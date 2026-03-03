@@ -6,12 +6,13 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import type { ClipRegion, ClipEntry, EffectEntry } from '../types.js';
-import type { StreamLookup, OtherTrackClip } from './exporterTypes.js';
+import type { StreamLookup, OtherTrackClip, ShadowConfig } from './exporterTypes.js';
 import type { ExtraTrackInput } from './exporterPipeline.js';
 import { getRecordingMp4 } from './remuxer.js';
 import { runFfmpeg, ffmpegConcatEscape, probeMedia } from './ffmpeg.js';
+import { EXPORTS_DIR, AUDIO_DIR } from './paths.js';
 
-export const EXPORTS_DIR = path.resolve(process.env.EXPORTS_DIR || path.join(process.cwd(), 'exports'));
+export { EXPORTS_DIR };
 
 /**
  * Resolved clip info after applying trim offsets and computing local times.
@@ -156,8 +157,6 @@ export function buildOutputPath(filename: string, extension: string): string {
 	const safeName = path.basename(filename).replace(/[<>:"/\\|?*]/g, '_');
 	return path.join(EXPORTS_DIR, `${safeName}.${extension}`);
 }
-
-const AUDIO_DIR = path.resolve(process.cwd(), 'data', 'audio');
 
 /** Resolved audio overlay for a single clip. */
 export interface ResolvedAudioOverlay {
@@ -318,6 +317,18 @@ export function resolveExtraTrackInputs(
 	}
 
 	return results.length > 0 ? results : undefined;
+}
+
+/** Compute padding needed around a canvas to accommodate a drop shadow. */
+export function shadowPadding(shadow?: ShadowConfig): { top: number; right: number; bottom: number; left: number } {
+	if (!shadow) return { top: 0, right: 0, bottom: 0, left: 0 };
+	const b = shadow.blur;
+	return {
+		top:    Math.max(0, b - shadow.offsetY),
+		bottom: Math.max(0, b + shadow.offsetY),
+		left:   Math.max(0, b - shadow.offsetX),
+		right:  Math.max(0, b + shadow.offsetX),
+	};
 }
 
 let nvencCached: boolean | null = null;

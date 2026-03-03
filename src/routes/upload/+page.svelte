@@ -26,7 +26,7 @@
 		id: string;
 		title: string;
 		description?: string;
-		clipIds: string[];
+		clipEntries: { clipId: string }[];
 		videoId?: string;
 		status: 'pending' | 'exporting' | 'ready' | 'error';
 		outputPath?: string;
@@ -344,7 +344,7 @@ YOUTUBE_REDIRECT_URI=http://localhost:5173/api/youtube/callback</pre>
 							>
 								<span class="export-option-title">{exp.title}</span>
 								<span class="export-option-meta">
-									{exp.clipIds.length} clip{exp.clipIds.length !== 1 ? 's' : ''} &middot; {formatDate(exp.createdAt)}
+									{exp.clipEntries.length} clip{exp.clipEntries.length !== 1 ? 's' : ''} &middot; {formatDate(exp.createdAt)}
 								</span>
 							</button>
 						{/each}

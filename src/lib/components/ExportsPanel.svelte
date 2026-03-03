@@ -10,7 +10,7 @@
 		id: string;
 		title: string;
 		description?: string;
-		clipIds: string[];
+		clipEntries: { clipId: string }[];
 		videoId?: string;
 		status: 'pending' | 'exporting' | 'ready' | 'error';
 		outputPath?: string;
@@ -40,7 +40,7 @@
 		const exp = exports.find((e) => e.id === previewExportId);
 		if (!exp) return [];
 		const clips: ClipRegion[] = [];
-		for (const id of exp.clipIds) {
+		for (const { clipId: id } of exp.clipEntries) {
 			const clip = $clipRegions.find((c) => c.id === id);
 			if (clip) clips.push(clip);
 		}
@@ -168,7 +168,7 @@
 
 		// Compute total duration from resolved clips (need to read store now)
 		const clips: ClipRegion[] = [];
-		for (const id of exp.clipIds) {
+		for (const { clipId: id } of exp.clipEntries) {
 			const clip = $clipRegions.find((c) => c.id === id);
 			if (clip) clips.push(clip);
 		}
@@ -370,7 +370,7 @@
 							{/if}
 							<span class="format-badge">{exp.format === 'mobile_short' ? '9:16' : '16:9'}</span>
 							<div class="export-item-actions">
-								{#if exp.clipIds.length > 0}
+								{#if exp.clipEntries.length > 0}
 									<button
 										class="btn-preview"
 										onclick={() => openPreview(exp)}
@@ -393,7 +393,7 @@
 							<div class="export-description">{exp.description}</div>
 						{/if}
 						<div class="export-details">
-							<span class="export-clips">{exp.clipIds.length} clip{exp.clipIds.length !== 1 ? 's' : ''}</span>
+							<span class="export-clips">{exp.clipEntries.length} clip{exp.clipEntries.length !== 1 ? 's' : ''}</span>
 							<span class="export-date">{formatEpochDate(exp.createdAt)}</span>
 							{#if exp.completedAt}
 								<span class="export-completed">Completed {formatEpochDate(exp.completedAt)}</span>

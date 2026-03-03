@@ -1,5 +1,5 @@
 import type { ClipEntry, EffectEntry } from '../../types.js';
-import { getDb } from './persistenceBase.js';
+import { getDb, parseJsonField } from './persistenceBase.js';
 
 interface ExportRow {
 	id: string;
@@ -8,7 +8,6 @@ interface ExportRow {
 	clip_ids: string;
 	clip_entries: string | null;
 	effect_entries: string | null;
-	vertical_layout: string | null;
 	status: string;
 	output_path: string | null;
 	error: string | null;
@@ -22,8 +21,7 @@ export interface ExportRecord {
 	id: string;
 	title: string;
 	description?: string;
-	clipIds: string[];
-	clipEntries?: ClipEntry[];
+	clipEntries: ClipEntry[];
 	effectEntries?: EffectEntry[];
 	status: 'pending' | 'exporting' | 'ready' | 'error';
 	outputPath?: string;
@@ -35,27 +33,14 @@ export interface ExportRecord {
 }
 
 function mapExportRow(r: ExportRow): ExportRecord {
-	let clipIds: string[];
-	try {
-		clipIds = JSON.parse(r.clip_ids) as string[];
-	} catch {
-		console.error(`[persistence] Corrupt clip_ids JSON for export ${r.id}, treating as empty`);
-		clipIds = [];
-	}
-	let clipEntries: ClipEntry[] | undefined;
-	if (r.clip_entries) {
-		try { clipEntries = JSON.parse(r.clip_entries) as ClipEntry[]; } catch { /* ignore */ }
-	}
-	let effectEntries: EffectEntry[] | undefined;
-	if (r.effect_entries) {
-		try { effectEntries = JSON.parse(r.effect_entries) as EffectEntry[]; } catch { /* ignore */ }
-	}
+	const clipEntries = parseJsonField<ClipEntry[] | undefined>(r.clip_entries, undefined)
+		?? parseJsonField<string[]>(r.clip_ids, [], `clip_ids for export ${r.id}`).map((clipId) => ({ clipId }));
+	const effectEntries = parseJsonField<EffectEntry[] | undefined>(r.effect_entries, undefined);
 	return {
 		id: r.id,
 		title: r.title,
 		...(r.description && { description: r.description }),
-		clipIds,
-		...(clipEntries && { clipEntries }),
+		clipEntries,
 		...(effectEntries && { effectEntries }),
 		status: r.status as ExportRecord['status'],
 		...(r.output_path && { outputPath: r.output_path }),
@@ -70,16 +55,15 @@ function mapExportRow(r: ExportRow): ExportRecord {
 export function saveExport(record: ExportRecord): void {
 	const d = getDb();
 	d.run(
-		`INSERT INTO exports (id, title, description, clip_ids, clip_entries, effect_entries, vertical_layout, status, output_path, error, created_at, completed_at, format, video_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO exports (id, title, description, clip_ids, clip_entries, effect_entries, status, output_path, error, created_at, completed_at, format, video_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		[
 			record.id,
 			record.title,
 			record.description ?? null,
-			JSON.stringify(record.clipIds),
-			record.clipEntries ? JSON.stringify(record.clipEntries) : null,
+			JSON.stringify(record.clipEntries.map((e) => e.clipId)),
+			JSON.stringify(record.clipEntries),
 			record.effectEntries ? JSON.stringify(record.effectEntries) : null,
-			null,
 			record.status,
 			record.outputPath ?? null,
 			record.error ?? null,

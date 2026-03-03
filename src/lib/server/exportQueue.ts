@@ -37,7 +37,7 @@ export function createAndQueueExport(clipIds: string[], title: string, descripti
 		id,
 		title,
 		...(description && { description }),
-		clipIds,
+		clipEntries: clipIds.map((clipId) => ({ clipId })),
 		status: 'pending',
 		createdAt: Math.floor(Date.now() / 1000),
 		format: format ?? 'standard'
@@ -57,15 +57,13 @@ export function createAndQueueExportFromVideo(videoId: string): ExportRecord {
 	const video = getVideo(videoId);
 	if (!video) throw new Error(`Video not found: ${videoId}`);
 
-	const clipIds = video.clipEntries.map((e) => e.clipId);
-	validateClipIds(clipIds);
+	validateClipIds(video.clipEntries.map((e) => e.clipId));
 
 	const id = newExportId();
 	const record: ExportRecord = {
 		id,
 		title: video.title,
 		...(video.description && { description: video.description }),
-		clipIds,
 		clipEntries: video.clipEntries,
 		...(video.effectEntries && video.effectEntries.length > 0 && { effectEntries: video.effectEntries }),
 		status: 'pending',
@@ -147,10 +145,9 @@ async function runExport(exportId: string): Promise<void> {
 	const record = db.loadExport(exportId);
 	if (!record) return;
 
-	// Resolve clip IDs → ClipRegion objects paired with their entries by index,
-	// so duplicate clipIds each keep their own ClipEntry.
-	const allResolved = record.clipIds
-		.map((id, i) => ({ clip: getClipRegion(id), entry: record.clipEntries?.[i] }))
+	// Resolve clip entries → ClipRegion objects paired with their entries.
+	const allResolved = record.clipEntries
+		.map((entry) => ({ clip: getClipRegion(entry.clipId), entry }))
 		.filter((p) => p.clip !== undefined);
 
 	if (allResolved.length === 0) {

@@ -1,6 +1,7 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
+import { DATA_DIR } from '../paths.js';
 import type { ClipEntry } from '../../types.js';
 import { newVideoId } from '../../ids.js';
 import { initStreamStatements } from './persistenceStreams.js';
@@ -14,7 +15,6 @@ import { initChatStatements } from './persistenceChat.js';
 type Database = import('bun:sqlite').Database;
 let Database: typeof import('bun:sqlite').Database;
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
 const DB_PATH = path.join(DATA_DIR, 'omnicut.db');
 const EXTENSIONS_DIR = path.join(DATA_DIR, 'extensions');
 
@@ -155,11 +155,6 @@ export async function initDatabase(): Promise<void> {
 
 		CREATE INDEX IF NOT EXISTS idx_clip_stream ON clip_regions(stream_id);
 
-		CREATE TABLE IF NOT EXISTS ignored_channels (
-			login TEXT PRIMARY KEY,
-			ignored_at INTEGER NOT NULL DEFAULT (unixepoch())
-		);
-
 		CREATE TABLE IF NOT EXISTS channel_settings (
 			login TEXT PRIMARY KEY,
 			language TEXT,
@@ -251,10 +246,6 @@ export async function initDatabase(): Promise<void> {
 
 	// Idempotent schema migrations — add columns if they don't exist
 	const migrations = [
-		'ALTER TABLE clip_regions ADD COLUMN cam_x REAL',
-		'ALTER TABLE clip_regions ADD COLUMN cam_y REAL',
-		'ALTER TABLE clip_regions ADD COLUMN cam_w REAL',
-		'ALTER TABLE clip_regions ADD COLUMN cam_h REAL',
 		"ALTER TABLE exports ADD COLUMN format TEXT NOT NULL DEFAULT 'standard'",
 		'ALTER TABLE chat_messages ADD COLUMN emotes TEXT',
 		'ALTER TABLE exports ADD COLUMN video_id TEXT REFERENCES videos(id)',
@@ -262,35 +253,10 @@ export async function initDatabase(): Promise<void> {
 		'ALTER TABLE clip_regions ADD COLUMN favourite INTEGER NOT NULL DEFAULT 0',
 		'ALTER TABLE videos ADD COLUMN effect_entries TEXT',
 		'ALTER TABLE exports ADD COLUMN effect_entries TEXT',
-		'ALTER TABLE videos ADD COLUMN vertical_layout TEXT',
-		'ALTER TABLE exports ADD COLUMN vertical_layout TEXT',
 		'ALTER TABLE streams ADD COLUMN remuxed INTEGER NOT NULL DEFAULT 0'
 	];
 	for (const sql of migrations) {
 		try { db.exec(sql); } catch { /* column already exists */ }
-	}
-
-	// Migrate existing clip cam fields into channel_camera_bounds (one-time)
-	try {
-		const migrated = db.query(
-			`SELECT COUNT(*) as cnt FROM channel_camera_bounds`
-		).get() as { cnt: number };
-		if (migrated.cnt === 0) {
-			// Copy cam fields from clip_regions (join with streams to get channel)
-			db.exec(`
-				INSERT OR IGNORE INTO channel_camera_bounds (channel, timestamp, cam_x, cam_y, cam_w, cam_h)
-				SELECT s.channel, cr.start_time, cr.cam_x, cr.cam_y, cr.cam_w, cr.cam_h
-				FROM clip_regions cr
-				JOIN streams s ON s.id = cr.stream_id
-				WHERE cr.cam_x IS NOT NULL AND cr.cam_y IS NOT NULL AND cr.cam_w IS NOT NULL AND cr.cam_h IS NOT NULL
-			`);
-			const count = (db.query('SELECT changes() as n').get() as { n: number }).n;
-			if (count > 0) {
-				console.log(`[persistence] Migrated ${count} clip camera bounds to channel_camera_bounds table`);
-			}
-		}
-	} catch (err) {
-		console.warn('[persistence] Camera bounds migration error:', err instanceof Error ? err.message : String(err));
 	}
 
 	// Migrate existing exports to videos (one-time)
@@ -305,8 +271,7 @@ export async function initDatabase(): Promise<void> {
 			const linkExport = db.prepare(`UPDATE exports SET video_id = ? WHERE id = ?`);
 			for (const exp of unmigrated) {
 				const videoId = newVideoId();
-				let clipIds: string[];
-				try { clipIds = JSON.parse(exp.clip_ids); } catch { clipIds = []; }
+				const clipIds = parseJsonField<string[]>(exp.clip_ids, []);
 				const clipEntries: ClipEntry[] = clipIds.map((clipId) => ({ clipId }));
 				insertVideo.run(videoId, exp.title, exp.description, JSON.stringify(clipEntries), exp.format || 'standard', exp.created_at, exp.created_at);
 				linkExport.run(videoId, exp.id);
@@ -315,6 +280,18 @@ export async function initDatabase(): Promise<void> {
 		}
 	} catch (err) {
 		console.warn('[persistence] Export→Video migration error:', err instanceof Error ? err.message : String(err));
+	}
+
+	// Drop deprecated columns (idempotent — fails silently if already dropped)
+	for (const sql of [
+		'ALTER TABLE clip_regions DROP COLUMN cam_x',
+		'ALTER TABLE clip_regions DROP COLUMN cam_y',
+		'ALTER TABLE clip_regions DROP COLUMN cam_w',
+		'ALTER TABLE clip_regions DROP COLUMN cam_h',
+		'ALTER TABLE exports DROP COLUMN vertical_layout',
+		'ALTER TABLE videos DROP COLUMN vertical_layout',
+	]) {
+		try { db.exec(sql); } catch { /* column already dropped or never existed */ }
 	}
 
 	// Initialize prepared statements in domain modules
@@ -341,6 +318,17 @@ export function closeDatabase(): void {
 }
 
 // --- Shared query helpers ---
+
+/** Parse a JSON string from a DB column, returning a fallback on failure. */
+export function parseJsonField<T>(json: string | null | undefined, fallback: T, label?: string): T {
+	if (!json) return fallback;
+	try {
+		return JSON.parse(json) as T;
+	} catch {
+		if (label) console.error(`[persistence] Corrupt JSON in ${label}, using fallback`);
+		return fallback;
+	}
+}
 
 /** Build an optional text filter clause for SQL queries using LIKE or REGEXP. */
 export function buildTextFilter(query?: string, regex?: string): { clause: string; params: string[] } {

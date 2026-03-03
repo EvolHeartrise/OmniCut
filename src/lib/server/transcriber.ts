@@ -452,61 +452,6 @@ async function extractAudio(recordingDir: string, segmentFiles: string[]): Promi
 	return wavPath;
 }
 
-/**
- * Extract audio as raw PCM bytes in memory (for VOD pipelining).
- * Returns a Uint8Array of s16le samples at 16kHz mono, or null on failure.
- */
-async function extractAudioBuffer(recordingDir: string, segmentFiles: string[]): Promise<Uint8Array | null> {
-	// Unique concat list filename to avoid races during pipelining
-	const listPath = path.join(
-		recordingDir,
-		'_concat_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6) + '.txt'
-	);
-
-	const listContent = segmentFiles.map((s) => `file '${s}'`).join('\n');
-	fs.writeFileSync(listPath, listContent);
-
-	const proc = Bun.spawn(
-		[
-			'ffmpeg',
-			'-y',
-			'-f',
-			'concat',
-			'-safe',
-			'0',
-			'-i',
-			listPath,
-			'-vn',
-			'-ar',
-			'16000',
-			'-ac',
-			'1',
-			'-f',
-			's16le',
-			'pipe:1'
-		],
-		{
-			cwd: recordingDir,
-			stdin: 'ignore',
-			stdout: 'pipe',
-			stderr: 'pipe'
-		}
-	);
-
-	const [output, code] = await Promise.all([
-		new Response(proc.stdout).arrayBuffer(),
-		proc.exited
-	]);
-
-	cleanupFiles(listPath);
-
-	if (code !== 0) {
-		console.warn(`[transcriber] PCM extraction failed (code ${code}) for ${recordingDir}`);
-		return null;
-	}
-	return new Uint8Array(output);
-}
-
 // --- Per-stream transcription tracking ---
 
 /** Build the expected filename for a segment index. */

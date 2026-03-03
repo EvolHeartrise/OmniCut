@@ -161,7 +161,7 @@ export function buildAnimatedOverlay(
  * Build a position expression for a single axis during an animation phase.
  * Returns null if this animation type doesn't affect the given axis.
  */
-export function buildPositionAnim(
+function buildPositionAnim(
 	animType: OverlayAnimation,
 	phase: 'in' | 'out',
 	axis: 'x' | 'y',
