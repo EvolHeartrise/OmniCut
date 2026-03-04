@@ -4,9 +4,17 @@
  */
 
 import * as fs from 'node:fs';
-import { createCanvas, type SKRSContext2D } from '@napi-rs/canvas';
+import { createCanvas, GlobalFonts, type SKRSContext2D } from '@napi-rs/canvas';
 import type { ShadowConfig } from './exporterTypes.js';
 import { shadowPadding } from './exporterCommon.js';
+
+// Register system emoji/symbol font so @napi-rs/canvas can render extended Unicode glyphs.
+const EMOJI_FONT_PATH = 'C:/Windows/Fonts/seguiemj.ttf';
+try {
+	GlobalFonts.registerFromPath(EMOJI_FONT_PATH, 'Segoe UI Emoji');
+} catch {
+	console.warn('[subtitleRenderer] Could not register emoji font — some symbols may not render');
+}
 
 const DEFAULT_FONT_SIZE = 48;
 const DEFAULT_FONT_COLOR = '#FFFFFF';
@@ -46,7 +54,7 @@ export async function renderSubtitleOverlay(opts: {
 		shadow,
 	} = opts;
 
-	const fontFamilyFull = `${fontFamily}, sans-serif`;
+	const fontFamilyFull = `${fontFamily}, 'Segoe UI Emoji', sans-serif`;
 	const font = `${fontWeight} ${fontSize}px ${fontFamilyFull}`;
 	const lineHeight = Math.ceil(fontSize * LINE_HEIGHT_FACTOR);
 	// Account for outline bleed in content width
