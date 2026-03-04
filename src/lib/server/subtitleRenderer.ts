@@ -90,13 +90,17 @@ export async function renderSubtitleOverlay(opts: {
 		}
 		const y = topPad + i * lineHeight;
 
-		// Draw outline (stroke) first, then fill on top
+		// Draw outline via multi-offset fill at concentric radii to avoid
+		// anti-aliasing seam gaps and ensure full coverage on small glyphs
 		if (outlineWidth > 0) {
-			ctx.strokeStyle = outlineColor;
-			ctx.lineWidth = outlineWidth * 2; // doubled because strokeText straddles the path
-			ctx.lineJoin = 'round';
-			ctx.miterLimit = 2;
-			ctx.strokeText(lines[i], x, y);
+			ctx.fillStyle = outlineColor;
+			for (let r = 1; r <= outlineWidth; r++) {
+				const steps = Math.ceil(2 * Math.PI * r);
+				for (let s = 0; s < steps; s++) {
+					const angle = (s / steps) * 2 * Math.PI;
+					ctx.fillText(lines[i], x + Math.cos(angle) * r, y + Math.sin(angle) * r);
+				}
+			}
 		}
 
 		ctx.fillStyle = fontColor;
