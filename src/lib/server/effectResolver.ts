@@ -73,6 +73,7 @@ export async function resolveOverlappingEffects(
 					fontWeight: effect.chatFontWeight,
 					chatScale: (effect.chatScale ?? 1) * chatScaleBoost,
 					shadow: effect.shadow,
+					ignoredIds: effect.chatIgnoredIds,
 				});
 
 				const sp = shadowPadding(effect.shadow);

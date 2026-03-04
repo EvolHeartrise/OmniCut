@@ -44,6 +44,8 @@ export interface EffectEntry {
 	chatScale?: number;
 	/** For twitch-chat type: CSS font-weight for chat text (default 400). */
 	chatFontWeight?: number;
+	/** For twitch-chat type: DB IDs of chat messages to hide from the panel. */
+	chatIgnoredIds?: number[];
 	/** Effects track index (0-based, default 0). Higher tracks render on top. */
 	track?: number;
 	/** For view type: preset source region ('full' = entire frame, 'camera' = webcam bounds). Omit for custom/animated. */

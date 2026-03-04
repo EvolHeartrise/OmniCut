@@ -2128,6 +2128,11 @@
 												chatOffset={entry.chatOffset ?? 0}
 												fontWeight={entry.chatFontWeight ?? 400}
 												{censorTerms}
+												ignoredIds={entry.chatIgnoredIds ?? []}
+												onignore={selectedEffectId === entry.id ? (msgId) => {
+													const cur = entry.chatIgnoredIds ?? [];
+													updateEffectEntry(entry.id, { chatIgnoredIds: [...cur, msgId] });
+												} : undefined}
 											/>
 										{:else}
 											<span class="chat-panel-label">Chat Panel</span>
@@ -2621,6 +2626,19 @@
 										value={selEffect.chatFontWeight ?? 400}
 										onchange={(e) => updateEffectEntry(selEffect.id, { chatFontWeight: +(e.target as HTMLInputElement).value })}
 									/>
+								</div>
+								{@const ignoredCount = selEffect.chatIgnoredIds?.length ?? 0}
+								<div class="prop-field">
+									<label class="prop-label">Hidden Messages</label>
+									<div style="display:flex;align-items:center;gap:6px">
+										<span class="props-value">{ignoredCount}</span>
+										{#if ignoredCount > 0}
+											<button class="btn-tl btn-tl-sm" onclick={() => updateEffectEntry(selEffect.id, { chatIgnoredIds: [] })}>Clear</button>
+										{/if}
+									</div>
+									{#if ignoredCount === 0}
+										<span class="props-hint">Click a message in the preview to hide it</span>
+									{/if}
 								</div>
 							{:else if isSubtitle}
 								<div class="prop-field">
@@ -3626,6 +3644,12 @@
 	.props-value {
 		color: #ccc;
 		text-align: right;
+	}
+
+	.props-hint {
+		color: #777;
+		font-size: 0.55rem;
+		margin-top: 2px;
 	}
 
 	.props-missing {

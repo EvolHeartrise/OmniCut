@@ -186,6 +186,7 @@ export async function prepareChatEffect(opts: {
 	fontWeight?: number;
 	chatScale?: number;
 	shadow?: ShadowConfig;
+	ignoredIds?: number[];
 }): Promise<PreparedChatEffect> {
 	const {
 		streamId, channel,
@@ -211,7 +212,11 @@ export async function prepareChatEffect(opts: {
 	const chatStart = localStart + chatOffset;
 	const chatEnd = localEnd + chatOffset;
 	const fetchStart = Math.max(0, chatStart - BACKFILL_SECONDS);
-	const chatMessages = loadChatMessagesInRange(streamId, fetchStart, chatEnd);
+	let chatMessages = loadChatMessagesInRange(streamId, fetchStart, chatEnd);
+	if (opts.ignoredIds?.length) {
+		const ignored = new Set(opts.ignoredIds);
+		chatMessages = chatMessages.filter(m => !ignored.has(m.id));
+	}
 	for (const msg of chatMessages) {
 		msg.timestamp -= chatOffset;
 	}

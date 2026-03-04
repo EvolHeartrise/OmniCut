@@ -35,7 +35,9 @@
 		currentTime,
 		chatOffset = 0,
 		fontWeight = 400,
-		censorTerms = []
+		censorTerms = [],
+		ignoredIds = [],
+		onignore
 	}: {
 		streamId: string;
 		localStart: number;
@@ -44,6 +46,8 @@
 		chatOffset?: number;
 		fontWeight?: number;
 		censorTerms?: string[];
+		ignoredIds?: number[];
+		onignore?: (id: number) => void;
 	} = $props();
 
 	let thirdPartyEmotes = $state<EmoteMap>(new Map());
@@ -100,18 +104,22 @@
 			.catch(() => { rawMessages = []; });
 	});
 
-	// Derive parsed entries from raw + emote state
+	// Derive parsed entries from raw + emote state, filtering out ignored messages
+	let ignoredSet = $derived(new Set(ignoredIds));
 	let entries = $derived.by((): ChatEntry[] => {
 		const _emotes = thirdPartyEmotes;
 		const _badges = badgeMap;
-		return rawMessages.map((m) => ({
-			id: m.id,
-			username: m.username,
-			userColor: m.color || usernameColor(m.username),
-			time: m.timestamp,
-			segments: parseEmotes(m.text, m.emotes, _emotes),
-			badges: resolveBadges(m.badges, _badges)
-		}));
+		const _ignored = ignoredSet;
+		return rawMessages
+			.filter((m) => !_ignored.has(m.id))
+			.map((m) => ({
+				id: m.id,
+				username: m.username,
+				userColor: m.color || usernameColor(m.username),
+				time: m.timestamp,
+				segments: parseEmotes(m.text, m.emotes, _emotes),
+				badges: resolveBadges(m.badges, _badges)
+			}));
 	});
 
 	// Filter entries to those up to currentTime (MAX_VISIBLE matches chatEffectRenderer.ts)
@@ -157,7 +165,8 @@
 
 <div class="preview-chat-log" bind:this={listEl} style="font-weight:{fontWeight}">
 	{#each displayEntries as entry (entry.id)}
-		<div class="pc-line">
+		<!-- svelte-ignore a11y_no_static_element_interactions -->
+		<div class="pc-line" class:pc-clickable={!!onignore} onpointerdown={onignore ? (e) => { e.stopPropagation(); } : undefined} onclick={onignore ? () => onignore(entry.id) : undefined}>
 			{#each entry.badges as badge}<img class="pc-badge" src={badge.imageUrl} alt={badge.title} />{/each}<span class="pc-user" style="color:{entry.userColor};font-weight:{Math.min(900, fontWeight + 300)}">{entry.username}</span><span class="pc-sep">: </span><span class="pc-msg">{#each entry.segments as seg}{#if seg.type === 'emote' && seg.emoteUrl}<img class="pc-emote" src={seg.emoteUrl} alt={seg.text} />{:else}{#each censorSplit(seg.text, censorTerms) as part}{#if part.censored}<span class="pc-censored">{part.text}</span>{:else}{part.text}{/if}{/each}{/if}{/each}</span>
 		</div>
 	{/each}
@@ -227,5 +236,12 @@
 		filter: blur(2.5px);
 		display: inline;
 		user-select: none;
+	}
+
+	.pc-clickable {
+		cursor: pointer;
+	}
+	.pc-clickable:hover {
+		background: rgba(255, 255, 255, 0.08);
 	}
 </style>
