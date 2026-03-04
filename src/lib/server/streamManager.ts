@@ -667,8 +667,10 @@ export function listStreams(): ReturnType<typeof serializeStreamInfo>[] {
  */
 export function getStream(id: string): ReturnType<typeof serializeStreamInfo> | null {
 	const handle = captures.get(id);
-	if (!handle) return null;
-	return serializeStreamInfo(handle.info);
+	if (handle) return serializeStreamInfo(handle.info);
+	// Fall back to DB for inactive/historical streams
+	const info = db.loadStream(id);
+	return info ? serializeStreamInfo(info) : null;
 }
 
 /**
@@ -733,8 +735,9 @@ export function getChatHeatmap(
  */
 export function getStreamRecordingDir(id: string): string | null {
 	const handle = captures.get(id);
-	if (!handle) return null;
-	return handle.info.recordingDir;
+	if (handle) return handle.info.recordingDir;
+	// Fall back to DB for inactive/historical streams
+	return db.loadStream(id)?.recordingDir ?? null;
 }
 
 // --- Video compositions ---

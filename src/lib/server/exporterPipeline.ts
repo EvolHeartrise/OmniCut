@@ -11,7 +11,6 @@ import { buildVideoEncoderArgs, buildAudioMixFilter } from './exporterCommon.js'
 import { buildViewFilter } from './viewFilter.js';
 import { buildAnimatedOverlay } from './overlayAnimation.js';
 import { runFfmpeg, spawnFfmpegWithPipe } from './ffmpeg.js';
-import type { FrameSink } from './chatEffectRenderer.js';
 
 /** Extra video track input for multi-track compositing. */
 export interface ExtraTrackInput {
@@ -315,24 +314,22 @@ export async function encodeClip(opts: ClipEncodeOptions): Promise<string> {
 	];
 
 	if (pipeEffect?.deferredRender) {
-		// Stream raw RGBA frames directly to FFmpeg stdin
+		// Stream raw RGBA frames to FFmpeg via ReadableStream-backed stdin.
+		// This avoids Bun's FileSink which triggers uncatchable EPIPE crashes
+		// when FFmpeg closes its stdin after receiving enough frames.
 		const handle = spawnFfmpegWithPipe(ffmpegArgs);
-		const pipeSink: FrameSink = {
-			write(buf: Buffer) { handle.stdin.write(buf); },
-			async flush() { await handle.stdin.flush(); },
-		};
 
 		let renderError: Error | null = null;
 		try {
-			await pipeEffect.deferredRender(pipeSink);
+			await pipeEffect.deferredRender(handle.sink);
 		} catch (err) {
 			renderError = err instanceof Error ? err : new Error(String(err));
 		}
 
-		try { handle.stdin.end(); } catch { /* pipe may already be closed */ }
+		await handle.closeStdin();
 
 		try {
-			await handle.waitForExit(2000);
+			await handle.waitForExit(4000);
 		} catch (ffmpegErr) {
 			if (renderError) console.warn(`[${tag}] Render also failed:`, renderError.message);
 			throw ffmpegErr;

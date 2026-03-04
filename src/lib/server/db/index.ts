@@ -1,6 +1,6 @@
 // Barrel file — re-exports everything from domain modules
 export { initDatabase, getDb, closeDatabase } from './persistenceBase.js';
-export { saveStream, deleteStream, loadAllStreams, updateStreamOffset } from './persistenceStreams.js';
+export { saveStream, deleteStream, loadStream, loadAllStreams, updateStreamOffset } from './persistenceStreams.js';
 export { saveTranscription, loadTranscriptionsInRange, countTranscriptions, loadWordTimestamps, deleteTranscriptions } from './persistenceTranscriptions.js';
 export { saveChatMessage, saveChatMessagesBatch, countChatMessages, loadChatMessagesInRange, loadChatHeatmap, loadChatMessageByTwitchId } from './persistenceChat.js';
 export { insertClipRegion, saveClipRegion, deleteClipRegion, loadAllClipRegions } from './persistenceClips.js';

@@ -3,7 +3,7 @@
  * Centralizes the pattern of running ffmpeg, collecting stderr, and throwing on failure.
  */
 
-import type { FileSink } from 'bun';
+import type { FrameSink } from './chatEffectRenderer.js';
 
 /** Spawn and await ffmpeg in one call. */
 export async function runFfmpeg(args: string[], maxStderrChars = 500): Promise<void> {
@@ -17,11 +17,13 @@ export async function runFfmpeg(args: string[], maxStderrChars = 500): Promise<v
 	if (code !== 0) throw new Error(`ffmpeg failed (code ${code}): ${stderrText.slice(-maxStderrChars)}`);
 }
 
-/** Handle for an FFmpeg process that accepts piped stdin data. */
+/** Handle for an FFmpeg process that accepts piped stdin data via ReadableStream. */
 export interface FfmpegPipeHandle {
-	/** The writable stdin pipe. Write raw data here, flush for backpressure, end when done. */
-	stdin: FileSink;
-	/** Await FFmpeg exit. Caller must close stdin first or FFmpeg will hang. */
+	/** FrameSink backed by a TransformStream writer — avoids Bun FileSink EPIPE crashes. */
+	sink: FrameSink;
+	/** Close the input stream (signals EOF to FFmpeg). Safe even if pipe is already broken. */
+	closeStdin(): Promise<void>;
+	/** Await FFmpeg exit. Throws on non-zero exit with stderr tail. */
 	waitForExit(maxStderrChars?: number): Promise<void>;
 }
 
@@ -92,8 +94,16 @@ export async function probeMedia(filePath: string): Promise<ProbeResult> {
 }
 
 export function spawnFfmpegWithPipe(args: string[]): FfmpegPipeHandle {
+	// Use a TransformStream instead of Bun's FileSink ("pipe") to avoid
+	// uncatchable async EPIPE crashes. When FFmpeg closes its stdin early
+	// (e.g. after receiving enough frames for -t duration), FileSink
+	// triggers a process-level EPIPE that can't be caught with try/catch.
+	// ReadableStream-based stdin handles pipe cleanup internally.
+	const { readable, writable } = new TransformStream<Uint8Array>();
+	const writer = writable.getWriter();
+
 	const proc = Bun.spawn(['ffmpeg', ...args], {
-		stdin: 'pipe',
+		stdin: readable,
 		stdout: 'pipe',
 		stderr: 'pipe'
 	});
@@ -101,8 +111,29 @@ export function spawnFfmpegWithPipe(args: string[]): FfmpegPipeHandle {
 	// Start consuming stderr immediately to prevent FFmpeg from blocking on a full buffer
 	const stderrPromise = new Response(proc.stderr).text();
 
+	let broken = false;
+	const sink: FrameSink = {
+		write(buf: Buffer) {
+			// Buffer for the next flush — can't await here (sync interface)
+			if (!broken) sinkPending = buf;
+		},
+		async flush() {
+			if (broken || !sinkPending) return;
+			try {
+				await writer.write(new Uint8Array(sinkPending));
+			} catch {
+				broken = true;
+			}
+			sinkPending = null;
+		}
+	};
+	let sinkPending: Buffer | null = null;
+
 	return {
-		stdin: proc.stdin,
+		sink,
+		async closeStdin() {
+			try { await writer.close(); } catch { /* pipe may already be closed */ }
+		},
 		async waitForExit(maxStderrChars = 500): Promise<void> {
 			const stderrText = await stderrPromise;
 			const code = await proc.exited;

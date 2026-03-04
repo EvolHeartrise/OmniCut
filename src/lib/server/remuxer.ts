@@ -77,9 +77,13 @@ export async function remuxRecording(recordingDir: string): Promise<RemuxResult>
 			'-y', mp4Path
 		], 2000);
 
-		const { duration: durationSeconds } = await probeMedia(mp4Path);
+		const probe = await probeMedia(mp4Path);
+		if (probe.width === 0 || probe.height === 0) {
+			cleanupFiles(mp4Path);
+			throw new Error(`Remux produced invalid mp4 (probe failed, likely missing moov atom): ${mp4Path}`);
+		}
 
-		return { mp4Path, durationSeconds };
+		return { mp4Path, durationSeconds: probe.duration };
 	} finally {
 		cleanupFiles(concatPath);
 	}

@@ -114,6 +114,33 @@ export function deleteStream(id: string): void {
 	d.run('DELETE FROM streams WHERE id = ?', [id]);
 }
 
+export function loadStream(id: string): StreamInfo | null {
+	const d = getDb();
+	const r = d.query('SELECT * FROM streams WHERE id = ?').get(id) as StreamRow | null;
+	if (!r) return null;
+	return {
+		id: r.id,
+		channel: r.channel,
+		status: r.status as StreamInfo['status'],
+		startedAt: r.started_at,
+		error: r.error || undefined,
+		segmentCount: r.segment_count,
+		diskUsageBytes: r.disk_usage_bytes,
+		viewerCount: r.viewer_count,
+		streamTitle: r.stream_title,
+		gameName: r.game_name ?? null,
+		recordingDir: r.recording_dir,
+		offset: r.offset,
+		sourceType: r.source_type as StreamInfo['sourceType'],
+		parentStreamId: r.parent_stream_id,
+		platform: (r.platform || 'twitch') as StreamInfo['platform'],
+		sourceUrl: r.source_url || null,
+		chatComplete: !!r.chat_complete,
+		durationSeconds: r.duration_seconds ?? null,
+		remuxed: !!r.remuxed
+	};
+}
+
 export function loadAllStreams(): StreamInfo[] {
 	const d = getDb();
 	const rows = d.query('SELECT * FROM streams').all() as StreamRow[];
