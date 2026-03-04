@@ -24,7 +24,7 @@ export interface CameraBoundsEntry {
 /** An effect placed on the composition timeline. */
 export interface EffectEntry {
 	id: string;               // unique ID (nanoid)
-	type: 'chat-message' | 'twitch-chat' | 'subtitle' | 'image' | 'audio' | 'view';
+	type: 'chat-message' | 'twitch-chat' | 'subtitle' | 'image' | 'audio' | 'view' | 'zoom-pan' | 'silence';
 	/** Composition-time start (seconds from composition start). */
 	startTime: number;
 	/** Duration the effect is visible (seconds). */
@@ -103,6 +103,22 @@ export interface EffectEntry {
 	audioDuration?: number;
 	/** For audio type: start offset into the audio file in seconds (default 0). */
 	audioOffset?: number;
+	/** For zoom-pan type: start zoom level (1 = no zoom, >1 = zoom in). Default 1. */
+	zoomStartScale?: number;
+	/** For zoom-pan type: end zoom level. Default 1.5. */
+	zoomEndScale?: number;
+	/** For zoom-pan type: start pan center X (0-1, 0.5 = center). Default 0.5. */
+	zoomStartX?: number;
+	/** For zoom-pan type: start pan center Y. Default 0.5. */
+	zoomStartY?: number;
+	/** For zoom-pan type: end pan center X. Default 0.5. */
+	zoomEndX?: number;
+	/** For zoom-pan type: end pan center Y. Default 0.5. */
+	zoomEndY?: number;
+	/** For zoom-pan type: easing for zoom/pan interpolation. Default 'linear'. */
+	zoomEasing?: EasingFunction;
+	/** When true, overlay is composited AFTER zoom-pan (stays fixed on screen). Default false (zooms with video). */
+	drawAfterZoom?: boolean;
 	/** Entrance animation for overlay effects (default 'none'). */
 	animIn?: OverlayAnimation;
 	/** Exit animation for overlay effects (default 'none'). */

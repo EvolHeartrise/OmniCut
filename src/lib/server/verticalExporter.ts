@@ -4,15 +4,17 @@
  * Encodes directly from raw HLS segments — no pre-encoded intermediates.
  */
 
+import * as path from 'node:path';
 import type { ClipRegion, CameraBoundsEntry, ClipEntry, EffectEntry } from '../types.js';
 import { clearChannelDataCache } from './channelDataCache.js';
 import {
 	resolveClip, buildOutputPath, createTempDir, cleanupTempDir,
-	concatClipFiles, resolveAudioOverlays, detectNvenc,
-	resolveExtraTrackInputs
+	concatClipFiles, detectNvenc,
+	resolveExtraTrackInputs, resolveCompositionAudioOverlays,
+	mixAudioOverlaysPostConcat
 } from './exporterCommon.js';
 import { probeMedia } from './ffmpeg.js';
-import { resolveOverlappingEffects, resolveViewEffects } from './effectResolver.js';
+import { resolveOverlappingEffects, resolveViewEffects, resolveZoomPanEffects, resolveSilenceWindows } from './effectResolver.js';
 import { encodeClip } from './exporterPipeline.js';
 import type { StreamLookup, ClipContext, OtherTrackClip } from './exporterTypes.js';
 
@@ -54,6 +56,7 @@ export async function exportVerticalVideo(
 
 	try {
 		const verticalFiles: string[] = [];
+		const clipTimings: { compStart: number; dur: number }[] = [];
 
 		for (let i = 0; i < verticalClips.length; i++) {
 			const { clip, cam, entry } = verticalClips[i];
@@ -80,11 +83,14 @@ export async function exportVerticalVideo(
 			// Resolve view effects
 			const clipViews = resolveViewEffects(effectEntries, clipCompStart, clipCompEnd, dur);
 
+			// Resolve zoom-pan effects
+			const clipZoomPans = resolveZoomPanEffects(effectEntries, clipCompStart, clipCompEnd, dur);
+
+			// Resolve silence windows
+			const silenceWindows = resolveSilenceWindows(effectEntries, clipCompStart, clipCompEnd, dur);
+
 			// Resolve camera bounds for view effects with 'camera' source type
 			const camBounds = cam ? { camX: cam.camX, camY: cam.camY, camW: cam.camW, camH: cam.camH } : null;
-
-			// Resolve audio overlays for this clip
-			const audioOverlays = resolveAudioOverlays(effectEntries, clipCompStart, clipCompEnd);
 
 			const clipCtx: ClipContext | undefined = channelMap?.get(clip.streamId) ? {
 				streamId: clip.streamId,
@@ -115,16 +121,18 @@ export async function exportVerticalVideo(
 				resolved, clipIdx: i,
 				outW: OUT_W, outH: OUT_H,
 				srcW: probe.width, srcH: probe.height, fps,
-				allEffects, clipViews, audioOverlays, camBounds,
+				allEffects, clipViews, clipZoomPans, audioOverlays: [], camBounds,
 				useNvenc, tempDir, baseVideoFilter,
 				gop: Math.round(fps * 2),
 				extraOutputArgs: ['-r', `${fps}`],
 				audioMapFallback: '0:a?',
 				logTag: 'vertical-export',
-				extraTrackInputs
+				extraTrackInputs,
+				silenceWindows
 			});
 
 			verticalFiles.push(outFile);
+			clipTimings.push({ compStart: clipCompStart, dur });
 		}
 
 		clearChannelDataCache();
@@ -135,7 +143,19 @@ export async function exportVerticalVideo(
 
 		onProgress(`Concatenating ${verticalFiles.length} vertical clips`, verticalClips.length, totalSteps);
 		const outputPath = buildOutputPath(filename, 'mp4');
-		await concatClipFiles(verticalFiles, tempDir, outputPath);
+
+		// Resolve audio overlays for the full output timeline (post-concat)
+		const compositionAudio = resolveCompositionAudioOverlays(effectEntries, clipTimings);
+
+		if (compositionAudio.length > 0) {
+			// Concat to temp file, then mix audio overlays into final output
+			const concatPath = path.join(tempDir, 'concat_pre_audio.mp4');
+			await concatClipFiles(verticalFiles, tempDir, concatPath);
+			onProgress(`Mixing ${compositionAudio.length} audio overlay(s)`, verticalClips.length, totalSteps);
+			await mixAudioOverlaysPostConcat(concatPath, compositionAudio, outputPath);
+		} else {
+			await concatClipFiles(verticalFiles, tempDir, outputPath);
+		}
 
 		onProgress(`Done — saved to ${outputPath}`, totalSteps, totalSteps);
 		return { outputPath };

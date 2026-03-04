@@ -5,11 +5,12 @@
 
 import * as path from 'node:path';
 import * as fs from 'node:fs';
-import type { ResolvedEffect, ResolvedView } from './exporterTypes.js';
+import type { ResolvedEffect, ResolvedView, ResolvedZoomPan } from './exporterTypes.js';
 import type { ResolvedClip, ResolvedAudioOverlay } from './exporterCommon.js';
 import { buildVideoEncoderArgs, buildAudioMixFilter } from './exporterCommon.js';
 import { buildViewFilter } from './viewFilter.js';
 import { buildAnimatedOverlay } from './overlayAnimation.js';
+import { buildZoomPanFilter } from './zoomPanFilter.js';
 import { runFfmpeg, spawnFfmpegWithPipe } from './ffmpeg.js';
 
 /** Extra video track input for multi-track compositing. */
@@ -39,6 +40,8 @@ export interface ClipEncodeOptions {
 	allEffects: ResolvedEffect[];
 	/** Resolved view effects */
 	clipViews: ResolvedView[];
+	/** Resolved zoom-pan effects */
+	clipZoomPans?: ResolvedZoomPan[];
 	/** Resolved audio overlays */
 	audioOverlays: ResolvedAudioOverlay[];
 	/** Camera bounds for view effects (vertical only) */
@@ -59,6 +62,21 @@ export interface ClipEncodeOptions {
 	logTag?: string;
 	/** Extra track inputs for multi-track compositing */
 	extraTrackInputs?: ExtraTrackInput[];
+	/** Silence windows: time ranges where source audio should be muted */
+	silenceWindows?: { localStart: number; localEnd: number }[];
+}
+
+/**
+ * Build FFmpeg volume filter expressions that mute audio during silence windows.
+ * Each window produces a volume=enable='between(t,T0,T1)':volume=0 segment.
+ */
+function buildSilenceFilter(
+	windows: { localStart: number; localEnd: number }[],
+	trimStart: number
+): string {
+	return windows
+		.map(w => `volume=enable='between(t,${(trimStart + w.localStart).toFixed(3)},${(trimStart + w.localEnd).toFixed(3)})':volume=0`)
+		.join(',');
 }
 
 /**
@@ -68,10 +86,10 @@ export interface ClipEncodeOptions {
 export async function encodeClip(opts: ClipEncodeOptions): Promise<string> {
 	const {
 		resolved, clipIdx, outW, outH, srcW, srcH, fps,
-		allEffects, clipViews, audioOverlays, camBounds,
+		allEffects, clipViews, clipZoomPans, audioOverlays, camBounds,
 		useNvenc, tempDir, baseVideoFilter, gop,
 		extraOutputArgs, audioMapFallback, logTag,
-		extraTrackInputs
+		extraTrackInputs, silenceWindows
 	} = opts;
 
 	const { dur, seekOffset, mp4Path } = resolved;
@@ -86,6 +104,7 @@ export async function encodeClip(opts: ClipEncodeOptions): Promise<string> {
 	let videoFilterArgs: string[];
 	const hasOverlays = allEffects.length > 0;
 	const hasViews = clipViews.length > 0;
+	const hasZoomPans = clipZoomPans && clipZoomPans.length > 0;
 	const hasExtraTracks = extraTrackInputs && extraTrackInputs.length > 0;
 	let pipeEffect: ResolvedEffect | null = null;
 
@@ -108,7 +127,7 @@ export async function encodeClip(opts: ClipEncodeOptions): Promise<string> {
 		}
 	}
 
-	if (hasOverlays || hasViews || hasExtraTracks) {
+	if (hasOverlays || hasViews || hasZoomPans || hasExtraTracks) {
 		if (allEffects.length > 0) {
 			console.log(`[${tag}] Clip ${clipIdx}: ${allEffects.length} overlay(s), ${clipViews.length} views, ${trackCount} extra tracks, ss=${seekOffset.toFixed(3)} t=${dur.toFixed(3)}`);
 			for (const eff of allEffects) {
@@ -196,50 +215,108 @@ export async function encodeClip(opts: ClipEncodeOptions): Promise<string> {
 			prevLabel = 'viewed';
 		}
 
-		// 2. Overlay chain (all overlays composited after views)
-		// Overlay input indices: after track 0 (idx 0) + extra tracks + overlay inputs
+		// 2. Overlay chain — split around zoom-pan if needed
 		const overlayInputOffset = 1 + trackCount;
+		const hasZoomPan = clipZoomPans && clipZoomPans.length > 0;
+
+		// Split overlays into pre-zoom (default) and post-zoom groups
+		const preZoomEffects: { eff: ResolvedEffect; idx: number }[] = [];
+		const postZoomEffects: { eff: ResolvedEffect; idx: number }[] = [];
 		for (let ei = 0; ei < allEffects.length; ei++) {
-			const eff = allEffects[ei];
-			const inputIdx = overlayInputOffset + ei;
-			const isLast = ei === allEffects.length - 1;
-			const nextLabel = isLast ? 'outv' : `v${ei}`;
-			const enableStart = (trimStart + eff.localStart).toFixed(3);
-			const enableEnd = (trimStart + eff.localEnd + 1 / fps).toFixed(3);
-			const alphaFmt = 'format=yuva420p';
-			const ox = eff.x;
-			const oy = eff.y;
-			let overlayInput: string;
-			const effScale = (eff.scale && eff.scale !== 1) ? eff.scale : 1;
-			if (effScale !== 1) {
-				const scaledLabel = `s${ei}`;
-				filterGraph += `;[${inputIdx}:v]scale=iw*${effScale}:ih*${effScale},${alphaFmt}[${scaledLabel}]`;
-				overlayInput = scaledLabel;
+			if (hasZoomPan && allEffects[ei].drawAfterZoom) {
+				postZoomEffects.push({ eff: allEffects[ei], idx: ei });
 			} else {
-				const prepLabel = `p${ei}`;
-				filterGraph += `;[${inputIdx}:v]${alphaFmt}[${prepLabel}]`;
-				overlayInput = prepLabel;
+				preZoomEffects.push({ eff: allEffects[ei], idx: ei });
+			}
+		}
+
+		// Helper to build overlay chain for a group of effects
+		const buildOverlayChain = (
+			effects: { eff: ResolvedEffect; idx: number }[],
+			startLabel: string,
+			endLabel: string,
+			labelPrefix: string
+		) => {
+			let prev = startLabel;
+			for (let i = 0; i < effects.length; i++) {
+				const { eff, idx: ei } = effects[i];
+				const inputIdx = overlayInputOffset + ei;
+				const isLast = i === effects.length - 1;
+				const nextLabel = isLast ? endLabel : `${labelPrefix}${i}`;
+				const enableStart = (trimStart + eff.localStart).toFixed(3);
+				const enableEnd = (trimStart + eff.localEnd + 1 / fps).toFixed(3);
+				const alphaFmt = 'format=yuva420p';
+				const ox = eff.x;
+				const oy = eff.y;
+				let overlayInput: string;
+				const effScale = (eff.scale && eff.scale !== 1) ? eff.scale : 1;
+				if (effScale !== 1) {
+					const scaledLabel = `s${ei}`;
+					filterGraph += `;[${inputIdx}:v]scale=iw*${effScale}:ih*${effScale},${alphaFmt}[${scaledLabel}]`;
+					overlayInput = scaledLabel;
+				} else {
+					const prepLabel = `p${ei}`;
+					filterGraph += `;[${inputIdx}:v]${alphaFmt}[${prepLabel}]`;
+					overlayInput = prepLabel;
+				}
+
+				if (eff.animation) {
+					const overlayExpr = buildAnimatedOverlay(
+						overlayInput, prev, nextLabel,
+						ox, oy, parseFloat(enableStart), parseFloat(enableEnd),
+						eff.animation, 1
+					);
+					filterGraph += overlayExpr;
+				} else {
+					filterGraph += `;[${prev}][${overlayInput}]overlay=${ox}:${oy}:enable='between(t,${enableStart},${enableEnd})'[${nextLabel}]`;
+				}
+				prev = nextLabel;
+			}
+			return prev;
+		};
+
+		if (hasZoomPan) {
+			// Pre-zoom overlays → zoom-pan → post-zoom overlays
+			const preLabel = preZoomEffects.length > 0 ? 'prezp' : prevLabel;
+			if (preZoomEffects.length > 0) {
+				buildOverlayChain(preZoomEffects, prevLabel, preLabel, 'pv');
 			}
 
-			if (eff.animation) {
-				const overlayExpr = buildAnimatedOverlay(
-					overlayInput, prevLabel, nextLabel,
-					ox, oy, parseFloat(enableStart), parseFloat(enableEnd),
-					eff.animation, 1
-				);
-				filterGraph += overlayExpr;
+			// Zoom-pan filter
+			const zpOutLabel = postZoomEffects.length > 0 ? 'zp' : 'outv';
+			const zpFilter = buildZoomPanFilter(preLabel, zpOutLabel, clipZoomPans!, outW, outH, trimStart);
+			if (zpFilter) {
+				filterGraph += zpFilter;
 			} else {
-				filterGraph += `;[${prevLabel}][${overlayInput}]overlay=${ox}:${oy}:enable='between(t,${enableStart},${enableEnd})'[${nextLabel}]`;
+				// No actual zoom-pan filters generated (all no-ops) — rename
+				if (zpOutLabel !== preLabel) {
+					filterGraph += `;[${preLabel}]null[${zpOutLabel}]`;
+				}
 			}
-			prevLabel = nextLabel;
+			prevLabel = zpOutLabel;
+
+			// Post-zoom overlays
+			if (postZoomEffects.length > 0) {
+				prevLabel = buildOverlayChain(postZoomEffects, zpOutLabel, 'outv', 'pzv');
+			}
+		} else {
+			// No zoom-pan: single overlay chain (original behavior)
+			const allFx = allEffects.map((eff, idx) => ({ eff, idx }));
+			if (allFx.length > 0) {
+				prevLabel = buildOverlayChain(allFx, prevLabel, 'outv', 'v');
+			}
 		}
 
 		// If nothing produced outv, rename
-		if (prevLabel === 'base' || prevLabel === 'viewed') {
-			filterGraph = filterGraph.replace(`[${prevLabel}]`, '[outv]');
+		if (prevLabel !== 'outv') {
+			// Replace last occurrence of [prevLabel] at the end of a filter segment
+			const lastIdx = filterGraph.lastIndexOf(`[${prevLabel}]`);
+			if (lastIdx >= 0) {
+				filterGraph = filterGraph.substring(0, lastIdx) + '[outv]' + filterGraph.substring(lastIdx + prevLabel.length + 2);
+			}
 		}
 
-		if (allEffects.length > 0 || hasViews || hasExtraTracks) {
+		if (allEffects.length > 0 || hasViews || hasZoomPans || hasExtraTracks) {
 			console.log(`[${tag}]   filter_complex: ${filterGraph}`);
 		}
 
@@ -255,17 +332,36 @@ export async function encodeClip(opts: ClipEncodeOptions): Promise<string> {
 		// Extra track inputs provide video for view compositing; their audio
 		// would overlap/echo track 0's audio since they often come from the
 		// same or overlapping source streams.
+		const hasSilence = silenceWindows && silenceWindows.length > 0;
+
+		// Inject silence filters into source audio before mix
+		if (hasSilence && audioMix.totalAudioInputs > 0) {
+			const sf = buildSilenceFilter(silenceWindows, trimStart);
+			audioMix.audioFilterGraph = audioMix.audioFilterGraph.replace(
+				'asetpts=PTS-STARTPTS[asrc]',
+				`asetpts=PTS-STARTPTS,${sf}[asrc]`
+			);
+		}
+
 		let audioMap: string[];
 		if (audioMix.totalAudioInputs > 0) {
 			audioMap = ['-map', `[${audioMix.audioOutLabel}]`];
 		} else if (audioMapFallback === '0:a?') {
-			// Optional audio (vertical exporter) — use direct mapping since
-			// the stream may not have audio and filter_complex can't handle '?'.
-			audioMap = ['-map', '0:a?'];
+			if (hasSilence) {
+				// Silence needs filter_complex — route audio through it
+				const sf = buildSilenceFilter(silenceWindows, trimStart);
+				filterGraph += `;[0:a]asetpts=PTS-STARTPTS,${sf}[aout0]`;
+				audioMap = ['-map', '[aout0]'];
+			} else {
+				// Optional audio (vertical exporter) — use direct mapping since
+				// the stream may not have audio and filter_complex can't handle '?'.
+				audioMap = ['-map', '0:a?'];
+			}
 		} else {
 			// Route audio through filter_complex with PTS reset to match
 			// video PTS-STARTPTS (no audio overlays, no extra tracks).
-			filterGraph += `;[0:a]asetpts=PTS-STARTPTS[aout0]`;
+			const sf = hasSilence ? `,${buildSilenceFilter(silenceWindows, trimStart)}` : '';
+			filterGraph += `;[0:a]asetpts=PTS-STARTPTS${sf}[aout0]`;
 			audioMap = ['-map', '[aout0]'];
 		}
 
@@ -277,14 +373,32 @@ export async function encodeClip(opts: ClipEncodeOptions): Promise<string> {
 		];
 	} else {
 		// No overlays or views
+		const hasSilence = silenceWindows && silenceWindows.length > 0;
+
 		if (audioOverlays.length > 0) {
 			// Need filter_complex for audio mixing even without video overlays
 			const audioMix = buildAudioMixFilter(audioOverlays, 1, dur, trimStart);
+			if (hasSilence) {
+				const sf = buildSilenceFilter(silenceWindows, trimStart);
+				audioMix.audioFilterGraph = audioMix.audioFilterGraph.replace(
+					'asetpts=PTS-STARTPTS[asrc]',
+					`asetpts=PTS-STARTPTS,${sf}[asrc]`
+				);
+			}
 			extraInputs.push(...audioMix.extraInputs);
 			const fullFilter = `[0:v]format=yuv420p[outv];${audioMix.audioFilterGraph}`;
 			videoFilterArgs = [
 				'-filter_complex', fullFilter,
 				'-map', '[outv]', '-map', `[${audioMix.audioOutLabel}]`,
+				...buildVideoEncoderArgs(useNvenc, gop)
+			];
+		} else if (hasSilence) {
+			// Need filter_complex for silence even without overlays
+			const sf = buildSilenceFilter(silenceWindows, trimStart);
+			const fullFilter = `[0:v]format=yuv420p[outv];[0:a]asetpts=PTS-STARTPTS,${sf}[aout0]`;
+			videoFilterArgs = [
+				'-filter_complex', fullFilter,
+				'-map', '[outv]', '-map', '[aout0]',
 				...buildVideoEncoderArgs(useNvenc, gop)
 			];
 		} else {

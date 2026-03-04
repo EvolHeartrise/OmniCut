@@ -53,6 +53,7 @@
 	let addEffectTwitchId = $state('');
 	let draggingOverlay = $state<string | null>(null);
 	let dragOffset = $state({ x: 0, y: 0 });
+	let clipboardEffect = $state<EffectEntry | null>(null);
 
 	interface ResolvedChatMessage {
 		username: string;
@@ -98,6 +99,18 @@
 	let verticalCanvasEl = $state<HTMLCanvasElement | null>(null);
 	let verticalRafId: number | null = null;
 	let currentCamBounds = $state<CameraBoundsEntry | null>(null);
+
+	// Zoom-pan preview state (updated by drawViewFrame)
+	let currentZoomScale = $state(1);
+	let currentZoomPanX = $state(0.5);
+	let currentZoomPanY = $state(0.5);
+	let zoomOverlayTransform = $derived.by(() => {
+		if (currentZoomScale <= 1) return '';
+		// Match the canvas crop: viewport center at (panX, panY), clamped to bounds
+		const cropFracX = Math.max(0, Math.min(1 - 1/currentZoomScale, currentZoomPanX - 0.5/currentZoomScale));
+		const cropFracY = Math.max(0, Math.min(1 - 1/currentZoomScale, currentZoomPanY - 0.5/currentZoomScale));
+		return `transform-origin: 0 0; transform: scale(${currentZoomScale}) translate(${-cropFracX * 100}%, ${-cropFracY * 100}%)`;
+	});
 
 	// Track whether we've initialized local state from the video
 	let initialized = $state(false);
@@ -508,6 +521,40 @@
 		selectedEffectId = id;
 	}
 
+	function addZoomPanEffect(preset?: 'ken-burns' | 'pan-left' | 'pan-right') {
+		const id = nanoid(12);
+		const dur = totalDuration || 10;
+		const base: EffectEntry = {
+			id, type: 'zoom-pan', startTime: compositionTime, duration: dur,
+			x: 0, y: 0,
+			zoomStartScale: 1, zoomEndScale: 1.5,
+			zoomStartX: 0.5, zoomStartY: 0.5,
+			zoomEndX: 0.5, zoomEndY: 0.5,
+			zoomEasing: 'ease-in-out',
+		};
+		if (preset === 'ken-burns') {
+			base.zoomStartScale = 1; base.zoomEndScale = 1.3;
+		} else if (preset === 'pan-left') {
+			base.zoomStartScale = 1.5; base.zoomEndScale = 1.5;
+			base.zoomStartX = 0.8; base.zoomEndX = 0.2;
+		} else if (preset === 'pan-right') {
+			base.zoomStartScale = 1.5; base.zoomEndScale = 1.5;
+			base.zoomStartX = 0.2; base.zoomEndX = 0.8;
+		}
+		effectEntries = [...effectEntries, base];
+		selectedEffectId = id;
+	}
+
+	function addSilenceEffect() {
+		const id = nanoid(12);
+		const entry: EffectEntry = {
+			id, type: 'silence', startTime: compositionTime, duration: 1,
+			x: 0, y: 0,
+		};
+		effectEntries = [...effectEntries, entry];
+		selectedEffectId = id;
+	}
+
 	function addSubtitleEffect() {
 		const id = nanoid(12);
 		const entry: EffectEntry = {
@@ -731,7 +778,7 @@
 	// Effects visible at current composition time (sorted by track: lower tracks first = rendered behind)
 	let visibleEffects = $derived(
 		effectEntries
-			.filter((e) => e.type !== 'audio' && compositionTime >= e.startTime && compositionTime < e.startTime + e.duration)
+			.filter((e) => e.type !== 'audio' && e.type !== 'zoom-pan' && e.type !== 'silence' && compositionTime >= e.startTime && compositionTime < e.startTime + e.duration)
 			.sort((a, b) => (a.track ?? 0) - (b.track ?? 0))
 	);
 
@@ -907,6 +954,14 @@
 				el.pause();
 				audioPreviewEls.delete(id);
 			}
+		}
+
+		// Mute source video during active silence effects
+		if (previewVideoEl) {
+			const inSilence = effectEntries.some(e =>
+				e.type === 'silence' && ct >= e.startTime && ct < e.startTime + e.duration
+			);
+			previewVideoEl.volume = inSilence ? 0 : 1;
 		}
 	}
 
@@ -1649,6 +1704,44 @@
 
 			verticalCoverDraw(ctx, trackEl, srcX, srcY, srcW, srcH, dstX, dstY, dstW, dstH);
 		}
+
+		// Apply zoom-pan effect (post-composition virtual camera)
+		const activeZoomPan = effectEntries.find(
+			(e) => e.type === 'zoom-pan' && t >= e.startTime && t < e.startTime + e.duration
+		);
+		if (activeZoomPan) {
+			const progress = (t - activeZoomPan.startTime) / Math.max(0.001, activeZoomPan.duration);
+			const eased = applyEasing(Math.max(0, Math.min(1, progress)), activeZoomPan.zoomEasing ?? 'linear');
+			const scale = (activeZoomPan.zoomStartScale ?? 1) +
+				((activeZoomPan.zoomEndScale ?? 1.5) - (activeZoomPan.zoomStartScale ?? 1)) * eased;
+			const panX = (activeZoomPan.zoomStartX ?? 0.5) +
+				((activeZoomPan.zoomEndX ?? 0.5) - (activeZoomPan.zoomStartX ?? 0.5)) * eased;
+			const panY = (activeZoomPan.zoomStartY ?? 0.5) +
+				((activeZoomPan.zoomEndY ?? 0.5) - (activeZoomPan.zoomStartY ?? 0.5)) * eased;
+
+			if (scale > 1) {
+				const imgData = ctx.getImageData(0, 0, cw, ch);
+				const offscreen = new OffscreenCanvas(cw, ch);
+				const octx = offscreen.getContext('2d')!;
+				octx.putImageData(imgData, 0, 0);
+				ctx.fillStyle = '#000';
+				ctx.fillRect(0, 0, cw, ch);
+				const cropW = cw / scale;
+				const cropH = ch / scale;
+				// panX/panY = viewport center in [0,1] of original frame
+				const cropX = Math.max(0, Math.min(cw - cropW, panX * cw - cropW / 2));
+				const cropY = Math.max(0, Math.min(ch - cropH, panY * ch - cropH / 2));
+				ctx.drawImage(offscreen, cropX, cropY, cropW, cropH, 0, 0, cw, ch);
+			}
+
+			currentZoomScale = scale;
+			currentZoomPanX = panX;
+			currentZoomPanY = panY;
+		} else {
+			currentZoomScale = 1;
+			currentZoomPanX = 0.5;
+			currentZoomPanY = 0.5;
+		}
 	}
 
 	function viewRenderLoop() {
@@ -1923,6 +2016,25 @@
 			selectedEffectId = null;
 			showClipPicker = false;
 			addingEffect = false;
+		} else if (e.key === 'c' && (e.ctrlKey || e.metaKey)) {
+			if (selectedEffectId) {
+				const eff = effectEntries.find((e) => e.id === selectedEffectId);
+				if (eff) clipboardEffect = $state.snapshot(eff);
+			}
+		} else if (e.key === 'v' && (e.ctrlKey || e.metaKey)) {
+			if (clipboardEffect) {
+				const pasted = $state.snapshot(clipboardEffect);
+				pasted.id = nanoid();
+				pasted.startTime = compositionTime;
+				const pastedEnd = pasted.startTime + pasted.duration;
+				let track = pasted.track ?? 0;
+				while (effectEntries.some((e) => (e.track ?? 0) === track && e.startTime < pastedEnd && e.startTime + e.duration > pasted.startTime)) {
+					track++;
+				}
+				pasted.track = track;
+				effectEntries = [...effectEntries, pasted];
+				selectedEffectId = pasted.id;
+			}
 		} else if ((e.key === 's' || e.key === 'S') && !e.repeat) {
 			e.preventDefault();
 			splitAtPlayhead();
@@ -1990,7 +2102,9 @@
 						bind:this={overlayContainerEl}
 						style="left:{videoBounds.left}px;top:{videoBounds.top}px;width:{videoBounds.width}px;height:{videoBounds.height}px;right:auto;bottom:auto"
 					>
-						{#each visibleEffects as entry (entry.id)}
+						<!-- Zoomed overlays: zoom with the video -->
+						<div class="zoom-overlay-layer" style="{zoomOverlayTransform}; overflow: hidden; position: absolute; inset: 0; pointer-events: none">
+						{#each visibleEffects.filter(e => !e.drawAfterZoom) as entry (entry.id)}
 							{#if entry.type === 'twitch-chat'}
 								{@const pw = entry.panelWidth ?? 340}
 								{@const ph = entry.panelHeight ?? 1080}
@@ -2097,6 +2211,41 @@
 								{/if}
 							{/if}
 						{/each}
+						</div>
+						<!-- Fixed overlays: stay in place regardless of zoom -->
+						{#each visibleEffects.filter(e => e.drawAfterZoom) as entry (entry.id)}
+							{#if entry.type === 'subtitle'}
+								<!-- svelte-ignore a11y_no_static_element_interactions -->
+								<div
+									class="subtitle-overlay"
+									class:bubble-selected={selectedEffectId === entry.id}
+									style="left: {entry.x * 100}%; top: {entry.y * 100}%; max-width: {(entry.subtitleMaxWidth ?? 900) * videoScale}px; font-size: {(entry.subtitleFontSize ?? 48) * videoScale}px; font-weight: {entry.subtitleFontWeight ?? 700}; font-family: '{entry.subtitleFontFamily ?? 'Inter'}', sans-serif; color: {entry.subtitleFontColor ?? '#FFFFFF'}; -webkit-text-stroke: {(entry.subtitleOutlineWidth ?? 4) * videoScale}px {entry.subtitleOutlineColor ?? '#000000'}; paint-order: stroke fill; text-align: {entry.subtitleTextAlign ?? 'center'}; {overlayAnimStyle(entry, compositionTime, true)}; {overlayShadowStyle(entry)}"
+									onpointerdown={(e) => handleOverlayPointerDown(e, entry.id)}
+									onpointermove={handleOverlayPointerMove}
+									onpointerup={handleOverlayPointerUp}
+								>{entry.subtitleText ?? 'Subtitle'}</div>
+							{:else if entry.type === 'image'}
+								<!-- svelte-ignore a11y_no_static_element_interactions -->
+								<div
+									class="image-overlay"
+									class:bubble-selected={selectedEffectId === entry.id}
+									style="left: {entry.x * 100}%; top: {entry.y * 100}%; {overlayAnimStyle(entry, compositionTime)}; {overlayShadowStyle(entry)}"
+									onpointerdown={(e) => handleOverlayPointerDown(e, entry.id)}
+									onpointermove={handleOverlayPointerMove}
+									onpointerup={handleOverlayPointerUp}
+								>
+									{#if entry.imageId}
+										{@const imgScale = videoScale * (entry.imageScale ?? 1)}
+										<img
+											src="/api/overlay-image/{entry.imageId}"
+											alt="overlay"
+											style="{entry.imageWidth ? `width: ${entry.imageWidth * imgScale}px; height: ${(entry.imageHeight ?? entry.imageWidth) * imgScale}px;` : `transform: scale(${imgScale}); transform-origin: 0 0;`} opacity: {entry.imageOpacity ?? 1}; display: block;"
+											draggable="false"
+										/>
+									{/if}
+								</div>
+							{/if}
+						{/each}
 					</div>
 				</div>
 				<div class="video-controls"></div>
@@ -2120,6 +2269,8 @@
 						{@const isSubtitle = selEffect.type === 'subtitle'}
 						{@const isImage = selEffect.type === 'image'}
 						{@const isAudio = selEffect.type === 'audio'}
+						{@const isZoomPan = selEffect.type === 'zoom-pan'}
+						{@const isSilence = selEffect.type === 'silence'}
 						<div class="props-header">
 							<h3 class="props-title">Effect Properties</h3>
 							<button class="btn-deselect" onclick={() => selectedEffectId = null} title="Deselect">&times;</button>
@@ -2128,7 +2279,7 @@
 						<div class="props-info">
 							<div class="props-row">
 								<span class="props-label">Type</span>
-								<span class="props-value">{isView ? 'View' : isChatPanel ? 'Chat Panel' : isSubtitle ? 'Subtitle' : isImage ? 'Image' : isAudio ? 'Audio' : 'Chat Message'}</span>
+								<span class="props-value">{isSilence ? 'Silence' : isZoomPan ? 'Zoom & Pan' : isView ? 'View' : isChatPanel ? 'Chat Panel' : isSubtitle ? 'Subtitle' : isImage ? 'Image' : isAudio ? 'Audio' : 'Chat Message'}</span>
 							</div>
 							{#if selEffect.type === 'chat-message'}
 								<div class="props-row">
@@ -2172,7 +2323,7 @@
 									onchange={(e) => updateEffectEntry(selEffect.id, { duration: +(e.target as HTMLInputElement).value })}
 								/>
 							</div>
-							{#if !isView && !isAudio}
+							{#if !isView && !isAudio && !isZoomPan && !isSilence}
 							<div class="prop-field">
 								<label class="prop-label">X Position (0-1)</label>
 								<input
@@ -2196,6 +2347,17 @@
 									value={selEffect.y}
 									onchange={(e) => updateEffectEntry(selEffect.id, { y: +(e.target as HTMLInputElement).value })}
 								/>
+							</div>
+							{/if}
+							{#if !isView && !isAudio && !isZoomPan && !isSilence}
+							<div class="prop-field">
+								<label class="prop-label">
+									<input type="checkbox"
+										checked={selEffect.drawAfterZoom ?? false}
+										onchange={(e) => updateEffectEntry(selEffect.id, { drawAfterZoom: (e.target as HTMLInputElement).checked || undefined })}
+									/>
+									Draw after zoom (fixed on screen)
+								</label>
 							</div>
 							{/if}
 							{#if isView}
@@ -2334,6 +2496,72 @@
 										value={selEffect.viewZOrder ?? 0}
 										onchange={(e) => updateEffectEntry(selEffect.id, { viewZOrder: +(e.target as HTMLInputElement).value })}
 									/>
+								</div>
+							{:else if isSilence}
+								<p style="font-size: 0.65rem; color: #94a3b8; margin: 4px 0">Mutes source audio during this window. Audio overlays are not affected.</p>
+							{:else if isZoomPan}
+								<div class="prop-field">
+									<label class="prop-label">Start Scale</label>
+									<input type="number" class="prop-input" min="1" step="0.1"
+										value={selEffect.zoomStartScale ?? 1}
+										onchange={(e) => updateEffectEntry(selEffect.id, { zoomStartScale: Math.max(1, +(e.target as HTMLInputElement).value) })}
+									/>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">End Scale</label>
+									<input type="number" class="prop-input" min="1" step="0.1"
+										value={selEffect.zoomEndScale ?? 1.5}
+										onchange={(e) => updateEffectEntry(selEffect.id, { zoomEndScale: Math.max(1, +(e.target as HTMLInputElement).value) })}
+									/>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Pan Start X</label>
+									<input type="number" class="prop-input" min="0" max="1" step="0.01"
+										value={selEffect.zoomStartX ?? 0.5}
+										onchange={(e) => updateEffectEntry(selEffect.id, { zoomStartX: +(e.target as HTMLInputElement).value })}
+									/>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Pan Start Y</label>
+									<input type="number" class="prop-input" min="0" max="1" step="0.01"
+										value={selEffect.zoomStartY ?? 0.5}
+										onchange={(e) => updateEffectEntry(selEffect.id, { zoomStartY: +(e.target as HTMLInputElement).value })}
+									/>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Pan End X</label>
+									<input type="number" class="prop-input" min="0" max="1" step="0.01"
+										value={selEffect.zoomEndX ?? 0.5}
+										onchange={(e) => updateEffectEntry(selEffect.id, { zoomEndX: +(e.target as HTMLInputElement).value })}
+									/>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Pan End Y</label>
+									<input type="number" class="prop-input" min="0" max="1" step="0.01"
+										value={selEffect.zoomEndY ?? 0.5}
+										onchange={(e) => updateEffectEntry(selEffect.id, { zoomEndY: +(e.target as HTMLInputElement).value })}
+									/>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Easing</label>
+									<select class="prop-input"
+										value={selEffect.zoomEasing ?? 'linear'}
+										onchange={(e) => updateEffectEntry(selEffect.id, { zoomEasing: (e.target as HTMLSelectElement).value as any })}
+									>
+										<option value="linear">Linear</option>
+										<option value="ease-in">Ease In</option>
+										<option value="ease-out">Ease Out</option>
+										<option value="ease-in-out">Ease In-Out</option>
+										<option value="bounce">Bounce</option>
+									</select>
+								</div>
+								<div class="prop-field">
+									<label class="prop-label">Presets</label>
+									<div style="display:flex;gap:3px;flex-wrap:wrap">
+										<button class="btn-tl btn-tl-sm" onclick={() => updateEffectEntry(selEffect.id, { zoomStartScale: 1, zoomEndScale: 1.3, zoomStartX: 0.5, zoomStartY: 0.5, zoomEndX: 0.5, zoomEndY: 0.5, zoomEasing: 'ease-in-out' })}>Ken Burns</button>
+										<button class="btn-tl btn-tl-sm" onclick={() => updateEffectEntry(selEffect.id, { zoomStartScale: 1.5, zoomEndScale: 1.5, zoomStartX: 0.2, zoomEndX: 0.8, zoomStartY: 0.5, zoomEndY: 0.5, zoomEasing: 'ease-in-out' })}>Pan L→R</button>
+										<button class="btn-tl btn-tl-sm" onclick={() => updateEffectEntry(selEffect.id, { zoomStartScale: 1.5, zoomEndScale: 1.5, zoomStartX: 0.8, zoomEndX: 0.2, zoomStartY: 0.5, zoomEndY: 0.5, zoomEasing: 'ease-in-out' })}>Pan R→L</button>
+									</div>
 								</div>
 							{:else if isChatPanel}
 								<div class="prop-field">
@@ -2573,7 +2801,7 @@
 							{/if}
 						</div>
 
-						{#if !isAudio}
+						{#if !isAudio && !isZoomPan && !isSilence}
 						<div class="props-section">
 							<div class="prop-field" style="margin-top: 4px">
 								<label class="prop-label" style="font-weight:600;color:#94a3b8">Animation</label>
@@ -2659,6 +2887,7 @@
 						</div>
 						{/if}
 
+						{#if !isSilence}
 						<div class="props-section">
 							<div class="prop-field" style="margin-top: 4px">
 								<label class="prop-label" style="font-weight:600;color:#94a3b8">Shadow</label>
@@ -2751,6 +2980,7 @@
 								</div>
 							{/if}
 						</div>
+						{/if}
 
 						{#if !isChatPanel && !isView && !isSubtitle && !isImage && msg}
 							<div class="props-section">
@@ -2946,6 +3176,12 @@
 					<button class="btn-tl btn-tl-sm btn-fx-zoom" onclick={() => addViewEffect()} title="Add view effect">
 						+ View
 					</button>
+					<button class="btn-tl btn-tl-sm btn-fx-zoompan" onclick={() => addZoomPanEffect()} title="Add zoom & pan effect">
+						+ Zoom
+					</button>
+					<button class="btn-tl btn-tl-sm btn-fx-silence" onclick={addSilenceEffect} title="Mute source audio during this window">
+						+ Silence
+					</button>
 					<button class="btn-tl btn-tl-sm btn-fx-subtitle" onclick={addSubtitleEffect} title="Add subtitle text overlay">
 						+ Subtitle
 					</button>
@@ -3063,6 +3299,8 @@
 												class:effect-subtitle={entry.type === 'subtitle'}
 												class:effect-image={entry.type === 'image'}
 												class:effect-audio={entry.type === 'audio'}
+												class:effect-zoom-pan={entry.type === 'zoom-pan'}
+												class:effect-silence={entry.type === 'silence'}
 												style="left: {leftPx}px; width: {widthPx}px"
 												onclick={(e) => handleEffectClick(e, entry.id)}
 												onmousedown={(e) => handleEffectMoveStart(e, entry.id)}
@@ -3080,6 +3318,10 @@
 														Image
 													{:else if entry.type === 'audio'}
 														Audio
+													{:else if entry.type === 'zoom-pan'}
+														Zoom
+													{:else if entry.type === 'silence'}
+														Silence
 													{:else}
 														{emsg?.username ?? entry.twitchId?.slice(0, 8) ?? '?'}
 													{/if}
@@ -4171,6 +4413,38 @@
 	.effect-audio {
 		background: rgba(6, 182, 212, 0.3);
 		border-color: rgba(6, 182, 212, 0.4);
+	}
+
+	.effect-zoom-pan {
+		background: rgba(168, 85, 247, 0.3);
+		border-color: rgba(168, 85, 247, 0.4);
+	}
+
+	.effect-silence {
+		background: rgba(239, 68, 68, 0.3);
+		border-color: rgba(239, 68, 68, 0.4);
+	}
+
+	.btn-fx-silence {
+		color: #f87171;
+		border: 1px solid rgba(239, 68, 68, 0.3);
+		background: rgba(239, 68, 68, 0.1);
+	}
+
+	.btn-fx-silence:hover {
+		background: rgba(239, 68, 68, 0.2);
+		color: #f87171;
+	}
+
+	.btn-fx-zoompan {
+		color: #c084fc;
+		border: 1px solid rgba(168, 85, 247, 0.3);
+		background: rgba(168, 85, 247, 0.1);
+	}
+
+	.btn-fx-zoompan:hover {
+		background: rgba(168, 85, 247, 0.2);
+		color: #d8b4fe;
 	}
 
 	.btn-fx-image {

@@ -54,6 +54,8 @@ export interface ResolvedEffect {
 	};
 	/** Deferred frame renderer — streams raw RGBA to a pipe instead of reading from a file. */
 	deferredRender?: (sink: FrameSink) => Promise<void>;
+	/** When true, overlay is composited AFTER zoom-pan (stays fixed on screen). */
+	drawAfterZoom?: boolean;
 }
 
 /** Info about a clip needed for resolving twitch-chat effects. */
@@ -80,4 +82,16 @@ export interface ResolvedView {
 	zOrder: number;
 	/** Which video track to source from (default 0 = primary track) */
 	sourceTrack: number;
+}
+
+export interface ResolvedZoomPan {
+	localStart: number;
+	localEnd: number;
+	startScale: number;
+	endScale: number;
+	startX: number;
+	startY: number;
+	endX: number;
+	endY: number;
+	easing: EasingFunction;
 }

@@ -272,6 +272,141 @@ export function buildAudioMixFilter(
 	};
 }
 
+/** Audio overlay resolved for the full output timeline (post-concat mixing). */
+export interface CompositionAudioOverlay {
+	filePath: string;
+	/** Seek into the audio file (seconds). */
+	seekInAudio: number;
+	/** Duration to use from the audio (seconds). */
+	audioDur: number;
+	/** Offset from the start of the concatenated output (seconds). */
+	outputOffset: number;
+	volume: number;
+}
+
+/**
+ * Resolve audio overlays for the full concatenated output timeline.
+ * Unlike `resolveAudioOverlays` (per-clip), this computes timing against
+ * the output, merging contiguous segments so audio effects spanning clip
+ * boundaries produce a single continuous overlay — no AAC splice artifacts.
+ */
+export function resolveCompositionAudioOverlays(
+	effectEntries: EffectEntry[] | undefined,
+	clipTimings: { compStart: number; dur: number }[]
+): CompositionAudioOverlay[] {
+	if (!effectEntries || clipTimings.length === 0) return [];
+
+	// Compute output-time offset for each clip (sequential, no gaps)
+	const outputOffsets: number[] = [];
+	let acc = 0;
+	for (const ct of clipTimings) {
+		outputOffsets.push(acc);
+		acc += ct.dur;
+	}
+
+	// Build per-clip segments for each audio effect
+	const segments: CompositionAudioOverlay[] = [];
+	for (const eff of effectEntries) {
+		if (eff.type !== 'audio' || !eff.audioId) continue;
+		const filePath = path.join(AUDIO_DIR, eff.audioId);
+		if (!fs.existsSync(filePath)) {
+			console.warn(`[export] Audio overlay file not found: ${filePath}`);
+			continue;
+		}
+		const effEnd = eff.startTime + eff.duration;
+
+		for (let i = 0; i < clipTimings.length; i++) {
+			const { compStart, dur } = clipTimings[i];
+			const compEnd = compStart + dur;
+			if (eff.startTime >= compEnd || effEnd <= compStart) continue;
+
+			const overlapStart = Math.max(eff.startTime, compStart);
+			const overlapEnd = Math.min(effEnd, compEnd);
+			segments.push({
+				filePath,
+				seekInAudio: (overlapStart - eff.startTime) + (eff.audioOffset ?? 0),
+				audioDur: overlapEnd - overlapStart,
+				outputOffset: outputOffsets[i] + (overlapStart - compStart),
+				volume: eff.audioVolume ?? 1,
+			});
+		}
+	}
+
+	// Merge contiguous segments from the same audio file (same effect spanning clips)
+	const merged: CompositionAudioOverlay[] = [];
+	for (const seg of segments) {
+		const prev = merged.length > 0 ? merged[merged.length - 1] : null;
+		if (prev && prev.filePath === seg.filePath && prev.volume === seg.volume) {
+			const prevOutputEnd = prev.outputOffset + prev.audioDur;
+			const prevAudioEnd = prev.seekInAudio + prev.audioDur;
+			if (Math.abs(prevOutputEnd - seg.outputOffset) < 0.01 &&
+				Math.abs(prevAudioEnd - seg.seekInAudio) < 0.01) {
+				prev.audioDur += seg.audioDur;
+				continue;
+			}
+		}
+		merged.push({ ...seg });
+	}
+	return merged;
+}
+
+/**
+ * Mix audio overlays into the concatenated output as a post-processing step.
+ * Copies video (`-c:v copy`) and only re-encodes audio with overlays mixed in.
+ * If no overlays, renames the concat file to the output path.
+ */
+export async function mixAudioOverlaysPostConcat(
+	concatFile: string,
+	audioOverlays: CompositionAudioOverlay[],
+	outputPath: string
+): Promise<void> {
+	if (audioOverlays.length === 0) {
+		fs.renameSync(concatFile, outputPath);
+		return;
+	}
+
+	const extraInputs: string[] = [];
+	const filters: string[] = [];
+	const mixLabels: string[] = [];
+
+	// Source audio from concatenated video
+	filters.push(`[0:a]asetpts=PTS-STARTPTS[asrc]`);
+	mixLabels.push('[asrc]');
+
+	for (let i = 0; i < audioOverlays.length; i++) {
+		const ao = audioOverlays[i];
+		extraInputs.push(
+			'-ss', ao.seekInAudio.toFixed(3),
+			'-t', ao.audioDur.toFixed(3),
+			'-i', ao.filePath
+		);
+
+		const label = `aov${i}`;
+		const delayMs = Math.round(ao.outputOffset * 1000);
+		const volFilter = `volume=${ao.volume.toFixed(3)}`;
+		const delayFilter = delayMs > 0 ? `,adelay=${delayMs}|${delayMs}` : '';
+		filters.push(`[${1 + i}:a]${volFilter}${delayFilter}[${label}]`);
+		mixLabels.push(`[${label}]`);
+	}
+
+	const inputCount = mixLabels.length;
+	filters.push(`${mixLabels.join('')}amix=inputs=${inputCount}:duration=first:dropout_transition=0[aout]`);
+
+	await runFfmpeg([
+		'-i', concatFile,
+		...extraInputs,
+		'-filter_complex', filters.join(';'),
+		'-map', '0:v', '-map', '[aout]',
+		'-c:v', 'copy',
+		'-c:a', 'aac', '-ar', '48000', '-b:a', '192k',
+		'-movflags', '+faststart',
+		'-y', outputPath
+	], 1000);
+
+	// Clean up intermediate concat file
+	try { fs.unlinkSync(concatFile); } catch { /* best effort */ }
+}
+
 /**
  * Find other-track clips that overlap a track 0 clip's composition window
  * and resolve them into ExtraTrackInput entries for FFmpeg.

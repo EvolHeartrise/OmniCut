@@ -5,7 +5,7 @@
 
 import * as path from 'node:path';
 import type { EffectEntry } from '../types.js';
-import type { ShadowConfig, ResolvedEffect, ClipContext, ResolvedView } from './exporterTypes.js';
+import type { ShadowConfig, ResolvedEffect, ClipContext, ResolvedView, ResolvedZoomPan } from './exporterTypes.js';
 import { renderEffectOverlay } from './effectRenderer.js';
 import { prepareChatEffect } from './chatEffectRenderer.js';
 import { renderSubtitleOverlay } from './subtitleRenderer.js';
@@ -156,6 +156,9 @@ export async function resolveOverlappingEffects(
 
 		if (!resolved) continue;
 
+		// Propagate drawAfterZoom flag
+		resolved.drawAfterZoom = effect.drawAfterZoom;
+
 		// Attach animation if the effect has in/out animations (works for all overlay types)
 		const animIn = effect.animIn ?? 'none';
 		const animOut = effect.animOut ?? 'none';
@@ -210,4 +213,58 @@ export function resolveViewEffects(
 		});
 	}
 	return results.sort((a, b) => a.zOrder - b.zOrder);
+}
+
+/**
+ * Find zoom-pan effects that overlap a clip's composition window.
+ */
+export function resolveZoomPanEffects(
+	effectEntries: EffectEntry[] | undefined,
+	clipCompStart: number,
+	clipCompEnd: number,
+	clipDur: number
+): ResolvedZoomPan[] {
+	if (!effectEntries) return [];
+	const results: ResolvedZoomPan[] = [];
+	for (const effect of effectEntries) {
+		if (effect.type !== 'zoom-pan') continue;
+		const effectEnd = effect.startTime + effect.duration;
+		if (effect.startTime >= clipCompEnd || effectEnd <= clipCompStart) continue;
+		const localStart = Math.max(0, effect.startTime - clipCompStart);
+		const localEnd = Math.min(clipDur, effectEnd - clipCompStart);
+		results.push({
+			localStart, localEnd,
+			startScale: effect.zoomStartScale ?? 1,
+			endScale: effect.zoomEndScale ?? 1.5,
+			startX: effect.zoomStartX ?? 0.5,
+			startY: effect.zoomStartY ?? 0.5,
+			endX: effect.zoomEndX ?? 0.5,
+			endY: effect.zoomEndY ?? 0.5,
+			easing: effect.zoomEasing ?? 'linear',
+		});
+	}
+	return results;
+}
+
+/**
+ * Find silence effects that overlap a clip's composition window.
+ * Returns local time windows (relative to clip start) where source audio should be muted.
+ */
+export function resolveSilenceWindows(
+	effectEntries: EffectEntry[] | undefined,
+	clipCompStart: number,
+	clipCompEnd: number,
+	clipDur: number
+): { localStart: number; localEnd: number }[] {
+	if (!effectEntries) return [];
+	const results: { localStart: number; localEnd: number }[] = [];
+	for (const effect of effectEntries) {
+		if (effect.type !== 'silence') continue;
+		const effectEnd = effect.startTime + effect.duration;
+		if (effect.startTime >= clipCompEnd || effectEnd <= clipCompStart) continue;
+		const localStart = Math.max(0, effect.startTime - clipCompStart);
+		const localEnd = Math.min(clipDur, effectEnd - clipCompStart);
+		results.push({ localStart, localEnd });
+	}
+	return results;
 }
