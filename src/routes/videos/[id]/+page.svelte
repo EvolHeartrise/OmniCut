@@ -209,7 +209,7 @@
 
 	// --- Timeline state ---
 	const MIN_PPS = 1;
-	const MAX_PPS = 200;
+	const MAX_PPS = 1000;
 	let pixelsPerSecond = $state(50);
 	let compositionTime = $state(0);
 	let selectedIndex = $state<number | null>(null);
