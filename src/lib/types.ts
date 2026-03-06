@@ -85,7 +85,7 @@ export interface EffectEntry {
 	subtitleMaxWidth?: number;
 	/** For subtitle type: text alignment (default 'center'). */
 	subtitleTextAlign?: 'left' | 'center' | 'right';
-	/** For subtitle type: font family (default 'Inter'). */
+	/** For subtitle type: font family (default 'Carlito'). */
 	subtitleFontFamily?: string;
 	/** For image type: ID of the uploaded image (filename in data/overlays/). */
 	imageId?: string;

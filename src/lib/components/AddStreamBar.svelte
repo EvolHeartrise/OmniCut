@@ -543,6 +543,8 @@
 		flex-direction: column;
 		gap: 12px;
 		max-width: 560px;
+		flex: 1;
+		min-height: 0;
 	}
 
 	.input-group {
@@ -614,6 +616,8 @@
 		display: flex;
 		flex-direction: column;
 		gap: 2px;
+		overflow-y: auto;
+		min-height: 0;
 	}
 
 	.channel-row {

@@ -572,6 +572,7 @@
 			subtitleFontWeight: 700,
 			subtitleMaxWidth: 900,
 			subtitleTextAlign: 'center',
+			subtitleFontFamily: 'Carlito',
 			animIn: 'grow',
 			animOut: 'shrink',
 			animDuration: 0.3,
@@ -2196,7 +2197,7 @@
 								<div
 									class="subtitle-overlay"
 									class:bubble-selected={selectedEffectId === entry.id}
-									style="left: {entry.x * 100}%; top: {entry.y * 100}%; max-width: {(entry.subtitleMaxWidth ?? 900) * videoScale}px; font-size: {(entry.subtitleFontSize ?? 48) * videoScale}px; font-weight: {entry.subtitleFontWeight ?? 700}; font-family: '{entry.subtitleFontFamily ?? 'Inter'}', sans-serif; color: {entry.subtitleFontColor ?? '#FFFFFF'}; -webkit-text-stroke: {(entry.subtitleOutlineWidth ?? 4) * videoScale}px {entry.subtitleOutlineColor ?? '#000000'}; paint-order: stroke fill; text-align: {entry.subtitleTextAlign ?? 'center'}; {overlayAnimStyle(entry, compositionTime, true)}; {overlayShadowStyle(entry)}"
+									style="left: {entry.x * 100}%; top: {entry.y * 100}%; max-width: {(entry.subtitleMaxWidth ?? 900) * videoScale}px; font-size: {(entry.subtitleFontSize ?? 48) * videoScale}px; font-weight: {entry.subtitleFontWeight ?? 700}; font-family: '{entry.subtitleFontFamily ?? 'Carlito'}', sans-serif; color: {entry.subtitleFontColor ?? '#FFFFFF'}; -webkit-text-stroke: {(entry.subtitleOutlineWidth ?? 4) * videoScale}px {entry.subtitleOutlineColor ?? '#000000'}; paint-order: stroke fill; text-align: {entry.subtitleTextAlign ?? 'center'}; {overlayAnimStyle(entry, compositionTime, true)}; {overlayShadowStyle(entry)}"
 									onpointerdown={(e) => handleOverlayPointerDown(e, entry.id)}
 									onpointermove={handleOverlayPointerMove}
 									onpointerup={handleOverlayPointerUp}
@@ -2224,7 +2225,7 @@
 								<div
 									class="subtitle-overlay"
 									class:bubble-selected={selectedEffectId === entry.id}
-									style="left: {entry.x * 100}%; top: {entry.y * 100}%; max-width: {(entry.subtitleMaxWidth ?? 900) * videoScale}px; font-size: {(entry.subtitleFontSize ?? 48) * videoScale}px; font-weight: {entry.subtitleFontWeight ?? 700}; font-family: '{entry.subtitleFontFamily ?? 'Inter'}', sans-serif; color: {entry.subtitleFontColor ?? '#FFFFFF'}; -webkit-text-stroke: {(entry.subtitleOutlineWidth ?? 4) * videoScale}px {entry.subtitleOutlineColor ?? '#000000'}; paint-order: stroke fill; text-align: {entry.subtitleTextAlign ?? 'center'}; {overlayAnimStyle(entry, compositionTime, true)}; {overlayShadowStyle(entry)}"
+									style="left: {entry.x * 100}%; top: {entry.y * 100}%; max-width: {(entry.subtitleMaxWidth ?? 900) * videoScale}px; font-size: {(entry.subtitleFontSize ?? 48) * videoScale}px; font-weight: {entry.subtitleFontWeight ?? 700}; font-family: '{entry.subtitleFontFamily ?? 'Carlito'}', sans-serif; color: {entry.subtitleFontColor ?? '#FFFFFF'}; -webkit-text-stroke: {(entry.subtitleOutlineWidth ?? 4) * videoScale}px {entry.subtitleOutlineColor ?? '#000000'}; paint-order: stroke fill; text-align: {entry.subtitleTextAlign ?? 'center'}; {overlayAnimStyle(entry, compositionTime, true)}; {overlayShadowStyle(entry)}"
 									onpointerdown={(e) => handleOverlayPointerDown(e, entry.id)}
 									onpointermove={handleOverlayPointerMove}
 									onpointerup={handleOverlayPointerUp}
@@ -2654,9 +2655,10 @@
 									<label class="prop-label">Font Family</label>
 									<select
 										class="prop-input"
-										value={selEffect.subtitleFontFamily ?? 'Inter'}
+										value={selEffect.subtitleFontFamily ?? 'Carlito'}
 										onchange={(e) => updateEffectEntry(selEffect.id, { subtitleFontFamily: (e.target as HTMLSelectElement).value })}
 									>
+										<option value="Carlito">Carlito</option>
 										<option value="Inter">Inter</option>
 										<option value="Arial">Arial</option>
 										<option value="Impact">Impact</option>

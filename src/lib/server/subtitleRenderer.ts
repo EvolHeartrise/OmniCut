@@ -16,6 +16,16 @@ try {
 	console.warn('[subtitleRenderer] Could not register emoji font — some symbols may not render');
 }
 
+// Register bundled Carlito font family.
+const CARLITO_DIR = new URL('../../../static/fonts/', import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1');
+for (const variant of ['Carlito-Regular', 'Carlito-Bold', 'Carlito-Italic', 'Carlito-BoldItalic']) {
+	try {
+		GlobalFonts.registerFromPath(`${CARLITO_DIR}${variant}.ttf`, 'Carlito');
+	} catch {
+		console.warn(`[subtitleRenderer] Could not register ${variant} font`);
+	}
+}
+
 const DEFAULT_FONT_SIZE = 48;
 const DEFAULT_FONT_COLOR = '#FFFFFF';
 const DEFAULT_OUTLINE_COLOR = '#000000';
@@ -50,7 +60,7 @@ export async function renderSubtitleOverlay(opts: {
 		fontWeight = DEFAULT_FONT_WEIGHT,
 		maxWidth = DEFAULT_MAX_WIDTH,
 		textAlign = DEFAULT_TEXT_ALIGN,
-		fontFamily = 'Inter',
+		fontFamily = 'Carlito',
 		shadow,
 	} = opts;
 
