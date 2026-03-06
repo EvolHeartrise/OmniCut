@@ -284,7 +284,7 @@ export async function encodeClip(opts: ClipEncodeOptions): Promise<string> {
 
 			// Zoom-pan filter
 			const zpOutLabel = postZoomEffects.length > 0 ? 'zp' : 'outv';
-			const zpFilter = buildZoomPanFilter(preLabel, zpOutLabel, clipZoomPans!, outW, outH, trimStart);
+			const zpFilter = buildZoomPanFilter(preLabel, zpOutLabel, clipZoomPans!, outW, outH, trimStart, fps);
 			if (zpFilter) {
 				filterGraph += zpFilter;
 			} else {

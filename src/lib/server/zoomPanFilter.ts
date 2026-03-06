@@ -25,7 +25,8 @@ export function buildZoomPanFilter(
 	zoomPans: ResolvedZoomPan[],
 	outW: number,
 	outH: number,
-	trimStart: number
+	trimStart: number,
+	fps = 30
 ): string {
 	if (zoomPans.length === 0) return '';
 
@@ -37,7 +38,9 @@ export function buildZoomPanFilter(
 		const isLast = i === zoomPans.length - 1;
 		const nextLabel = isLast ? outputLabel : `zp${i}`;
 		const T0 = (trimStart + zp.localStart).toFixed(3);
-		const T1 = (trimStart + zp.localEnd).toFixed(3);
+		// Pad T1 by one frame (matching viewFilter) to prevent the last output
+		// frame from falling outside the enable window due to seek misalignment.
+		const T1 = (trimStart + zp.localEnd + 1 / fps).toFixed(3);
 		const dur = zp.localEnd - zp.localStart;
 
 		const isStatic = zp.startScale === zp.endScale &&

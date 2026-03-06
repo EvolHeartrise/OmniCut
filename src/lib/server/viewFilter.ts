@@ -135,11 +135,11 @@ export function buildViewCropScale(
 		&& view.srcStartX === view.srcEndX && view.srcStartY === view.srcEndY;
 
 	if (isStatic) {
-		// Static crop — simple integer crop
-		const cw = Math.max(2, Math.round(view.srcStartW * srcW));
-		const ch = Math.max(2, Math.round(view.srcStartH * srcH));
+		// Static crop — simple integer crop (clamp so region doesn't exceed source)
 		const cx = Math.round(view.srcStartX * srcW);
 		const cy = Math.round(view.srcStartY * srcH);
+		const cw = Math.max(2, Math.min(Math.round(view.srcStartW * srcW), srcW - cx));
+		const ch = Math.max(2, Math.min(Math.round(view.srcStartH * srcH), srcH - cy));
 		return `;[${inputLabel}]crop=${cw}:${ch}:${cx}:${cy},${coverFit}[${outputLabel}]`;
 	}
 
@@ -156,10 +156,11 @@ export function buildViewCropScale(
 		return `if(between(t,${T0},${T1}),${s.toFixed(1)}+(${(e - s).toFixed(1)})*${frac},${(fallback * dim).toFixed(1)})`;
 	}
 
-	const wExpr = lerp(view.srcStartW, view.srcEndW, srcW, view.srcEndW);
-	const hExpr = lerp(view.srcStartH, view.srcEndH, srcH, view.srcEndH);
 	const xExpr = lerp(view.srcStartX, view.srcEndX, srcW, view.srcEndX);
 	const yExpr = lerp(view.srcStartY, view.srcEndY, srcH, view.srcEndY);
+	// Clamp width/height so crop region doesn't exceed source dimensions
+	const wExpr = `min(${lerp(view.srcStartW, view.srcEndW, srcW, view.srcEndW)},${srcW}-(${xExpr}))`;
+	const hExpr = `min(${lerp(view.srcStartH, view.srcEndH, srcH, view.srcEndH)},${srcH}-(${yExpr}))`;
 
 	return `;[${inputLabel}]crop=w='${wExpr}':h='${hExpr}':x='${xExpr}':y='${yExpr}':exact=1,${coverFit}[${outputLabel}]`;
 }

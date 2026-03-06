@@ -13,6 +13,19 @@ import { renderImageOverlay } from './imageRenderer.js';
 import { shadowPadding } from './exporterCommon.js';
 
 /**
+ * Snap effect boundaries to clip edges when within a tiny margin.
+ * Prevents sub-frame timing misalignment (from UI positioning precision)
+ * from causing single-frame artifacts at clip transitions.
+ */
+const SNAP_EPS = 0.01; // 10ms — well under one frame at any standard fps
+function snapLocal(rawStart: number, rawEnd: number, clipDur: number): [number, number] {
+	return [
+		rawStart > 0 && rawStart < SNAP_EPS ? 0 : rawStart,
+		rawEnd < clipDur && (clipDur - rawEnd) < SNAP_EPS ? clipDur : rawEnd,
+	];
+}
+
+/**
  * Find effects that overlap a clip's composition time window,
  * render them as PNGs or WebMs, and return overlay parameters.
  * Assumes 1920x1080 source resolution for pixel position calculation.
@@ -42,9 +55,12 @@ export async function resolveOverlappingEffects(
 		// Check overlap
 		if (effect.startTime >= clipCompEnd || effectEnd <= clipCompStart) continue;
 
-		// Compute local time window within the clip
-		const localStart = Math.max(0, effect.startTime - clipCompStart);
-		const localEnd = Math.min(clipDur, effectEnd - clipCompStart);
+		// Compute local time window within the clip (snap sub-frame gaps to edges)
+		const [localStart, localEnd] = snapLocal(
+			Math.max(0, effect.startTime - clipCompStart),
+			Math.min(clipDur, effectEnd - clipCompStart),
+			clipDur
+		);
 
 		// Resolve the overlay for this effect type
 		let resolved: ResolvedEffect | null = null;
@@ -192,8 +208,11 @@ export function resolveViewEffects(
 		const effectEnd = effect.startTime + effect.duration;
 		if (effect.startTime >= clipCompEnd || effectEnd <= clipCompStart) continue;
 
-		const localStart = Math.max(0, effect.startTime - clipCompStart);
-		const localEnd = Math.min(clipDur, effectEnd - clipCompStart);
+		const [localStart, localEnd] = snapLocal(
+			Math.max(0, effect.startTime - clipCompStart),
+			Math.min(clipDur, effectEnd - clipCompStart),
+			clipDur
+		);
 		results.push({
 			localStart, localEnd,
 			sourceType: effect.viewSourceType,
@@ -231,8 +250,11 @@ export function resolveZoomPanEffects(
 		if (effect.type !== 'zoom-pan') continue;
 		const effectEnd = effect.startTime + effect.duration;
 		if (effect.startTime >= clipCompEnd || effectEnd <= clipCompStart) continue;
-		const localStart = Math.max(0, effect.startTime - clipCompStart);
-		const localEnd = Math.min(clipDur, effectEnd - clipCompStart);
+		const [localStart, localEnd] = snapLocal(
+			Math.max(0, effect.startTime - clipCompStart),
+			Math.min(clipDur, effectEnd - clipCompStart),
+			clipDur
+		);
 		results.push({
 			localStart, localEnd,
 			startScale: effect.zoomStartScale ?? 1,
@@ -263,8 +285,11 @@ export function resolveSilenceWindows(
 		if (effect.type !== 'silence') continue;
 		const effectEnd = effect.startTime + effect.duration;
 		if (effect.startTime >= clipCompEnd || effectEnd <= clipCompStart) continue;
-		const localStart = Math.max(0, effect.startTime - clipCompStart);
-		const localEnd = Math.min(clipDur, effectEnd - clipCompStart);
+		const [localStart, localEnd] = snapLocal(
+			Math.max(0, effect.startTime - clipCompStart),
+			Math.min(clipDur, effectEnd - clipCompStart),
+			clipDur
+		);
 		results.push({ localStart, localEnd });
 	}
 	return results;
