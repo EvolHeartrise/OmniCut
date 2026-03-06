@@ -2140,32 +2140,6 @@
 										{/if}
 									</div>
 								</div>
-							{:else if entry.type === 'view' && !entry.viewSourceType}
-								{@const progress = Math.max(0, Math.min(1, (compositionTime - entry.startTime) / Math.max(0.001, entry.duration)))}
-								{@const sx = entry.viewSourceStartX ?? 0}
-								{@const sy = entry.viewSourceStartY ?? 0}
-								{@const sw = entry.viewSourceStartW ?? 1}
-								{@const sh = entry.viewSourceStartH ?? 1}
-								{@const ex = entry.viewSourceEndX ?? sx}
-								{@const ey = entry.viewSourceEndY ?? sy}
-								{@const ew = entry.viewSourceEndW ?? sw}
-								{@const eh = entry.viewSourceEndH ?? sh}
-								{@const cx = sx + (ex - sx) * progress}
-								{@const cy = sy + (ey - sy) * progress}
-								{@const cw = sw + (ew - sw) * progress}
-								{@const ch2 = sh + (eh - sh) * progress}
-								<!-- svelte-ignore a11y_no_static_element_interactions -->
-								<div
-									class="zoom-overlay"
-									class:zoom-selected={selectedEffectId === entry.id}
-									onclick={() => selectedEffectId = entry.id}
-								>
-									<div class="zoom-dim zoom-dim-top" style="height: {cy * 100}%"></div>
-									<div class="zoom-dim zoom-dim-bottom" style="height: {Math.max(0, (1 - cy - ch2)) * 100}%"></div>
-									<div class="zoom-dim zoom-dim-left" style="top: {cy * 100}%; height: {ch2 * 100}%; width: {cx * 100}%"></div>
-									<div class="zoom-dim zoom-dim-right" style="top: {cy * 100}%; height: {ch2 * 100}%; width: {Math.max(0, (1 - cx - cw)) * 100}%"></div>
-									<div class="zoom-region" style="left: {cx * 100}%; top: {cy * 100}%; width: {cw * 100}%; height: {ch2 * 100}%"></div>
-								</div>
 							{:else if entry.type === 'image'}
 								<!-- svelte-ignore a11y_no_static_element_interactions -->
 								<div
@@ -4505,55 +4479,10 @@
 		background: rgba(245, 158, 11, 0.1);
 	}
 
-	/* Zoom preview overlay */
-	.zoom-overlay {
-		position: absolute;
-		inset: 0;
-		pointer-events: auto;
-		cursor: pointer;
-	}
-
-	.zoom-dim {
-		position: absolute;
-		background: rgba(0, 0, 0, 0.5);
-	}
-
-	.zoom-dim-top {
-		top: 0;
-		left: 0;
-		width: 100%;
-	}
-
-	.zoom-dim-bottom {
-		bottom: 0;
-		left: 0;
-		width: 100%;
-	}
-
-	.zoom-dim-left {
-		left: 0;
-	}
-
-	.zoom-dim-right {
-		right: 0;
-	}
-
-	.zoom-region {
-		position: absolute;
-		border: 2px solid #fbbf24;
-		border-radius: 2px;
-		box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.3);
-	}
-
-	.zoom-selected .zoom-region {
-		border-color: #fff;
-		box-shadow: 0 0 8px rgba(251, 191, 36, 0.6), 0 0 0 1px rgba(0, 0, 0, 0.3);
-	}
-
 	.chat-panel-placeholder {
 		position: absolute;
-		background: rgba(168, 85, 247, 0.2);
-		border: 2px dashed rgba(168, 85, 247, 0.6);
+		background: transparent;
+		border: 2px solid transparent;
 		border-radius: 4px;
 		overflow: hidden;
 		cursor: move;
@@ -4569,8 +4498,7 @@
 	}
 
 	.chat-panel-placeholder.bubble-selected {
-		border-color: #fff;
-		box-shadow: 0 0 8px rgba(168, 85, 247, 0.5);
+		border: 2px solid rgba(255, 255, 255, 0.7);
 	}
 
 	.chat-panel-label {
