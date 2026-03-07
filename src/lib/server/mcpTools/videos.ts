@@ -1,5 +1,5 @@
 /**
- * MCP tools: create_video, get_videos, update_video, delete_video, get_exports
+ * MCP tools: get_videos, update_video, delete_video, get_exports, create_export
  */
 
 import { z } from 'zod';
@@ -8,30 +8,11 @@ import { textResult, jsonResult } from './types.js';
 import {
 	loadAllExports as smLoadAllExports,
 	loadExport as smLoadExport,
-	createVideo, updateVideo, deleteVideo, getVideo, getAllVideos
+	updateVideo, deleteVideo, getVideo, getAllVideos
 } from '../streamManager.js';
+import { createAndQueueExportFromVideo } from '../exportQueue.js';
 
 export function registerVideoTools(server: ToolRegistrar): void {
-	// --- create_video ---
-	server.tool(
-		'create_video',
-		'Create a video composition from clips. Returns the video record.',
-		{
-			clipIds: z.array(z.string()).min(1).describe('Ordered clip IDs for the video'),
-			title: z.string().describe('Video title'),
-			description: z.string().optional()
-		},
-		async ({ clipIds, title, description }) => {
-			try {
-				const clipEntries = clipIds.map((clipId) => ({ clipId }));
-				const video = createVideo({ title, description, clipEntries });
-				return jsonResult({ success: true, video, message: `Video "${title}" created with ${clipIds.length} clip(s).` });
-			} catch (err) {
-				return textResult(`Failed to create video: ${err instanceof Error ? err.message : String(err)}`, true);
-			}
-		}
-	);
-
 	// --- get_videos ---
 	server.tool(
 		'get_videos',
@@ -97,6 +78,21 @@ export function registerVideoTools(server: ToolRegistrar): void {
 			}
 			const exports = smLoadAllExports();
 			return jsonResult({ count: exports.length, exports });
+		}
+	);
+
+	// --- create_export ---
+	server.tool(
+		'create_export',
+		'Export a video composition to an MP4 file. Queues the export and returns the export record with its ID.',
+		{ videoId: z.string().describe('ID of the video to export') },
+		async ({ videoId }) => {
+			try {
+				const record = createAndQueueExportFromVideo(videoId);
+				return jsonResult({ success: true, exportId: record.id, status: record.status, message: `Export queued for video "${videoId}".` });
+			} catch (err) {
+				return textResult(`Failed to create export: ${err instanceof Error ? err.message : String(err)}`, true);
+			}
 		}
 	);
 }

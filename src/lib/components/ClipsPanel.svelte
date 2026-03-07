@@ -81,15 +81,6 @@
 	let creatingVideo = $state(false);
 	let exportResult = $state<{ success: boolean; message: string } | null>(null);
 
-	// Count selected clips missing cam regions
-	let missingCamCount = $derived.by(() => {
-		let count = 0;
-		for (const clip of filteredClips) {
-			if (selectedIds.has(clip.id) && !resolveClipCamBounds(clip)) count++;
-		}
-		return count;
-	});
-
 	// Unique channels for the filter dropdown
 	let uniqueChannels = $derived.by(() => {
 		const channels = new Set<string>();
@@ -135,6 +126,15 @@
 
 		clips.sort((a, b) => a.startTime - b.startTime);
 		return clips;
+	});
+
+	// Count selected clips missing cam regions
+	let missingCamCount = $derived.by(() => {
+		let count = 0;
+		for (const clip of filteredClips) {
+			if (selectedIds.has(clip.id) && !resolveClipCamBounds(clip)) count++;
+		}
+		return count;
 	});
 
 	let totalSelectedDuration = $derived.by(() => {
