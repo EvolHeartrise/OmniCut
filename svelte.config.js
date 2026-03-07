@@ -11,7 +11,9 @@ const config = {
 	compilerOptions: {
 		experimental: {
 			async: true
-		}
+		},
+		warningFilter: (warning) =>
+			!warning.code.startsWith('a11y') && warning.code !== 'state_referenced_locally'
 	}
 };
 
