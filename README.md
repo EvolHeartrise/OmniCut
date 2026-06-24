@@ -1,20 +1,20 @@
 # OmniCut
 
-Multi-stream Twitch DVR director tool - capture, seek, and switch between multiple live perspectives in real-time.
+Multi-stream Twitch DVR director tool for capturing, seeking, and switching between multiple live perspectives in real-time.
 
 ## What It Does
 
-OmniCut lets you pull in multiple Twitch live streams simultaneously, recording them all to disk as HLS segments. You can then seek backwards through any stream's history, scrub the timeline, and snap back to live - like a DVR for multi-perspective Twitch events.
+OmniCut lets you pull in multiple Twitch live streams simultaneously, recording them all to disk as HLS segments. You can then seek backwards through any stream's history, scrub the timeline, and snap back to live, just like a DVR for multi-perspective Twitch events.
 
 ## Features
 
-- **Capture any Twitch stream** - Just enter a channel name to start recording
-- **Up to 6+ simultaneous streams** - All recording independently to disk
-- **DVR-style seeking** - Scrub backwards through the full recording history of any stream
-- **Frame-accurate seeking** - 1-second keyframe intervals for precise navigation
-- **Snap to LIVE** - One click to jump back to real-time
-- **Focus mode** - Click or press 1-6 to enlarge a specific stream
-- **Real-time updates** - SSE-powered live segment count and status updates
+- **Capture any Twitch stream**: Just enter a channel name to start recording
+- **Up to 6+ simultaneous streams**: All recording independently to disk
+- **DVR-style seeking**: Scrub backwards through the full recording history of any stream
+- **Frame-accurate seeking**: 1-second keyframe intervals for precise navigation
+- **Snap to LIVE**: One click to jump back to real-time
+- **Focus mode**: Click or press 1-6 to enlarge a specific stream
+- **Real-time updates**: SSE-powered live segment count and status updates
 
 ## Prerequisites
 
